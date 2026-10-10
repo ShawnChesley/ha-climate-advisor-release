@@ -124,10 +124,11 @@ class TestSetpointOverride:
         assert coord.automation_engine.handle_manual_override.call_count == 0
         assert coord._today_record.manual_overrides == 0
 
-    def test_missing_prior_setpoint_without_unavailable_is_not_an_override(self):
+    def test_missing_prior_setpoint_without_unavailable_keeps_its_original_override_semantics(self):
+        """Only an availability recovery is exempt (the broader ``old_temp is not None`` guard was removed)."""
         coord = _make_coordinator_stub()
         _run(coord, _make_event(old_hvac_mode="cool", new_hvac_mode="cool", new_temp=72.0))
-        assert coord.automation_engine.handle_manual_override.call_count == 0
+        assert coord.automation_engine.handle_manual_override.call_count == 1
 
     def test_real_setpoint_change_still_overrides(self):
         coord = _make_coordinator_stub()

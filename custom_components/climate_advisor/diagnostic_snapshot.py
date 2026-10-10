@@ -44,6 +44,10 @@ _SENSITIVE_KEYS = frozenset(
         "identifier",
         "id",
         "entity_picture",
+        "name",
+        "owner",
+        "devicename",
+        "device_name",
     }
 )
 # Key tokens (split on non-alphanumerics) that mark a value as identifying or secret.
@@ -81,7 +85,7 @@ _SENSITIVE_TOKENS = frozenset(
 # Substrings that identify a sensitive key even when glued together (``serialnumber``).
 _SENSITIVE_SUBSTRINGS = ("serial", "latitude", "longitude", "password", "secret", "api_key", "macaddress", "token")
 _MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
-_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
 _VERSION_KEY_RE = re.compile(r"version|firmware|fw", re.IGNORECASE)
 
 # ClimateEntityFeature bit values (HA core; stable). Hard-coded so this module stays
@@ -121,12 +125,22 @@ def _key_is_sensitive(key: Any) -> bool:
     return any(tok in _SENSITIVE_TOKENS for tok in re.split(r"[^a-z0-9]+", lowered))
 
 
-def _value_is_sensitive(key: Any, value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    if _MAC_RE.search(value):
-        return True
-    return bool(_IPV4_RE.match(value)) and not (isinstance(key, str) and _VERSION_KEY_RE.search(key))
+def _redact_ipv4(match: re.Match[str]) -> str:
+    """Replace a dotted quad (optionally ``:port``) only when every octet is a real IPv4 octet."""
+    octets = match.group(0).split(":")[0].split(".")
+    return REDACTED if all(int(o) <= 255 for o in octets) else match.group(0)
+
+
+def _redact_string(key: Any, value: str) -> str:
+    """Redact MAC/IPv4 addresses found ANYWHERE in ``value`` (error strings, URLs, host:port).
+
+    Version-named keys (``firmware_version`` ...) keep dotted quads -- ``1.2.3.4`` is a
+    version there, not an address -- but a MAC is never a version, so it is always redacted.
+    """
+    value = _MAC_RE.sub(REDACTED, value)
+    if isinstance(key, str) and _VERSION_KEY_RE.search(key):
+        return value
+    return _IPV4_RE.sub(_redact_ipv4, value)
 
 
 def redact_sensitive(value: Any, _key: Any = None) -> Any:
@@ -140,8 +154,8 @@ def redact_sensitive(value: Any, _key: Any = None) -> Any:
         return {k: (REDACTED if _key_is_sensitive(k) else redact_sensitive(v, k)) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [redact_sensitive(item, _key) for item in value]
-    if _value_is_sensitive(_key, value):
-        return REDACTED
+    if isinstance(value, str):
+        return _redact_string(_key, value)
     return value
 
 
@@ -217,7 +231,7 @@ def _build_last_command(coordinator: Any, live_state: str | None, unit: str) -> 
         "mode_mismatch_since": _iso(getattr(record, "mismatch_since", None)),
         "mode_mismatch_episode_mode": _str_or_none(getattr(record, "episode_reason", None)),
         "command_failure_since": _iso(getattr(engine, "_hvac_cmd_fail_since", None)),
-        "command_failure_mode": _str_or_none(getattr(engine, "_hvac_cmd_fail_announced", None)),
+        "command_failure_mode": _str_or_none(getattr(engine, "_hvac_cmd_fail_mode", None)),
     }
 
 

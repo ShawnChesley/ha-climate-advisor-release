@@ -217,6 +217,17 @@ class ProductionDecision:
 # ---------------------------------------------------------------------------
 
 
+def _band_event_was_sent(payload: Any) -> bool:
+    """True when a ``comfort_band_applied`` payload represents a setpoint that reached the thermostat.
+
+    ``outcome`` is ``sent`` for a delivered write; events with NO ``outcome`` field are legacy
+    (pre-Issue #1049) and keep their original meaning. Anything else (blocked / dry_run / failed /
+    superseded / not_sent) is not an armed band. See the rule-8 note at ``comfort_band_armed``.
+    """
+    outcome = payload.get("outcome") if isinstance(payload, dict) else None
+    return outcome in (None, "sent")
+
+
 def _naive_iso(ts: Any) -> str:
     """Format a timestamp as a NAIVE ISO string (no tz offset).
 
@@ -878,10 +889,24 @@ def check_assertion(
     # assertion time.  Used by scenarios that want to verify the band was armed without
     # asserting specific floor/ceiling values.  Reads from event_log directly (the
     # outcome is not in the decisions list).
+    #
+    # Issue #1049 semantic change (CLAUDE.md rule 8). WHY THE OLD SEMANTICS WERE WRONG: this
+    # counted any comfort_band_applied event as "armed". Before #1049 the event was emitted even
+    # when the setpoint write was blocked (whole-house fan owns the thermostat), a dry run, or
+    # failed -- so the assertion passed while NO band was on the thermostat, exactly how #1048's
+    # week of "heat applied" with a cold house went unnoticed. A blocked/failed/superseded arm is
+    # not an armed band. Events now carry ``outcome``; only ``sent`` (or no outcome at all --
+    # legacy/pre-#1049 events) count. "Could this let a real failure pass silently?" -- the old
+    # form could; the new form cannot (it is strictly stricter, and all goldens were re-run).
     if expect == "comfort_band_armed":
         at_str = assertion["at"]
-        for ev_type, _ev_payload, ev_ts in result.event_log:
-            if ev_type == "comfort_band_applied" and ev_ts is not None and _naive_iso(ev_ts) <= at_str:
+        for ev_type, ev_payload, ev_ts in result.event_log:
+            if (
+                ev_type == "comfort_band_applied"
+                and ev_ts is not None
+                and _naive_iso(ev_ts) <= at_str
+                and _band_event_was_sent(ev_payload)
+            ):
                 return "comfort_band_armed"
         return False
 
@@ -903,6 +928,8 @@ def check_assertion(
         for ev_type, ev_payload, ev_ts in result.event_log:
             if ev_type != "comfort_band_applied" or ev_ts is None:
                 continue
+            if not _band_event_was_sent(ev_payload):
+                continue  # Issue #1049 (rule 8): a blocked/failed arm is not the band on the thermostat
             ts_naive = _naive_iso(ev_ts)
             if ts_naive <= at_str and ts_naive >= last_band_ts:
                 last_band_payload = ev_payload
@@ -1176,6 +1203,24 @@ def check_assertion(
             if _naive_iso(ev_ts) >= since:
                 return False
         return expect
+
+    # --- event_emitted (Issue #1049) ---
+    # Asserts an event of ``event`` type was emitted at or before the assertion time whose
+    # payload contains every key/value in ``payload_subset`` (omitted = any payload). Reads
+    # result.event_log directly, so it can assert on observational events that are deliberately
+    # NOT mapped to decisions (e.g. grace_cancelled). Rule-8 note: purely additive -- a brand-new
+    # assertion type no existing scenario uses, so it cannot change any existing result; it is
+    # strictly an existence check (it cannot pass without the event having been emitted).
+    if expect == "event_emitted":
+        wanted = assertion.get("event")
+        subset = assertion.get("payload_subset", {})
+        at_str = assertion["at"]
+        for ev_type, ev_payload, ev_ts in result.event_log:
+            if ev_type != wanted or ev_ts is None or _naive_iso(ev_ts) > at_str:
+                continue
+            if isinstance(ev_payload, dict) and all(ev_payload.get(k) == v for k, v in subset.items()):
+                return expect
+        return False
 
     # --- field_equals (Issue #587, Part 3.6 groundwork) ---
     # Single-zone dotted-path field check — reuses the multi-zone

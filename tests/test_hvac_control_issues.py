@@ -7,12 +7,12 @@ stayed cold. The coordinator now lists open mode-alignment / command-failure epi
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 if "homeassistant" not in sys.modules:
@@ -20,19 +20,17 @@ if "homeassistant" not in sys.modules:
 
     _install_ha_stubs()
 
+from tests.test_hvac_mode_alignment import NOW, _engine, _patched, _Timers  # noqa: E402
+
 _PKG = Path(__file__).parent.parent / "custom_components" / "climate_advisor"
 
 
-def _coord(*, episode_reason=None, mismatch_since=None, fail_announced=None, fail_since=None, live="off"):
+def _coord(engine, *, live=None):
+    """Coordinator stub bound to a REAL AutomationEngine (no hand-set episode state)."""
     mod = importlib.import_module("custom_components.climate_advisor.coordinator")
     coord = MagicMock()
-    ae = MagicMock()
-    ae.climate_entity = "climate.test"
-    ae._hvac_write_record = SimpleNamespace(episode_reason=episode_reason, mismatch_since=mismatch_since)
-    ae._hvac_cmd_fail_announced = fail_announced
-    ae._hvac_cmd_fail_since = fail_since
-    coord.automation_engine = ae
-    coord.hass.states.get.return_value = SimpleNamespace(state=live, attributes={})
+    coord.automation_engine = engine
+    coord.hass.states.get.side_effect = lambda _eid: engine.hass.states.get(_eid)
     coord._compute_hvac_control_issues = types.MethodType(
         mod.ClimateAdvisorCoordinator._compute_hvac_control_issues, coord
     )
@@ -45,28 +43,60 @@ def _issues(coord, now):
         return coord._compute_hvac_control_issues()
 
 
+def _open_mode_episode(engine, timers):
+    """Drive the REAL engine to an open 'thermostat ignored the requested mode' episode."""
+    asyncio.run(engine._set_temperature(70.0, reason="t", mode="heat"))
+    timers.fire(engine, 10)
+    timers.fire(engine, 130)
+    assert engine._hvac_write_record.episode_reason == "heat"
+
+
+def _open_failure_episode(engine):
+    engine.hass.services.async_call.side_effect = RuntimeError("boom")
+    asyncio.run(engine._set_hvac_mode("cool", reason="t"))
+    assert engine._hvac_cmd_fail_announced is not None
+
+
 class TestComputeHvacControlIssues:
     def test_mode_not_obeyed_listed_with_diagnostic_detail(self):
-        now = datetime.now(UTC)
-        out = _issues(_coord(episode_reason="heat", mismatch_since=now - timedelta(minutes=12)), now)
+        engine = _engine("off")
+        timers = _Timers()
+        p1, p2, p3 = _patched(timers)
+        with p1, p2, p3:
+            _open_mode_episode(engine, timers)
+        out = _issues(_coord(engine), NOW + timedelta(minutes=12))
         assert [i["issue"] for i in out] == ["mode_not_obeyed"]
         d = out[0]["detail"]
         assert "heat" in d and "'off'" in d and "12 min" in d
 
     def test_clears_when_episode_recovers(self):
-        now = datetime.now(UTC)
-        assert _issues(_coord(episode_reason=None), now) == []
+        engine = _engine("off")
+        timers = _Timers()
+        p1, p2, p3 = _patched(timers)
+        with p1, p2, p3:
+            _open_mode_episode(engine, timers)
+            engine.hass.states.get.return_value.state = "heat"
+            timers.fire(engine, 130)
+        assert _issues(_coord(engine), NOW) == []
 
-    def test_command_failing_listed(self):
-        now = datetime.now(UTC)
-        out = _issues(_coord(fail_announced="cool", fail_since=now - timedelta(minutes=5)), now)
+    def test_command_failing_shows_the_attempted_mode_not_the_episode_key(self):
+        engine = _engine("off")
+        p1, p2, p3 = _patched(_Timers())
+        with p1, p2, p3:
+            _open_failure_episode(engine)
+        out = _issues(_coord(engine), NOW + timedelta(minutes=5))
         assert [i["issue"] for i in out] == ["command_failing"]
-        assert "cool" in out[0]["detail"] and "5 min" in out[0]["detail"]
+        assert "last attempted mode: cool" in out[0]["detail"] and "5 min" in out[0]["detail"]
+        assert "failed)" not in out[0]["detail"]
 
     def test_both_episodes_listed(self):
-        now = datetime.now(UTC)
-        out = _issues(_coord(episode_reason="heat", mismatch_since=now, fail_announced="heat", fail_since=now), now)
-        assert {i["issue"] for i in out} == {"mode_not_obeyed", "command_failing"}
+        engine = _engine("off")
+        timers = _Timers()
+        p1, p2, p3 = _patched(timers)
+        with p1, p2, p3:
+            _open_mode_episode(engine, timers)
+            _open_failure_episode(engine)
+        assert {i["issue"] for i in _issues(_coord(engine), NOW)} == {"mode_not_obeyed", "command_failing"}
 
     def test_unconfigured_mock_engine_yields_nothing(self):
         """A bare MagicMock engine (unset attributes are truthy) must not fabricate issues."""
@@ -79,8 +109,12 @@ class TestComputeHvacControlIssues:
         assert _issues(coord, datetime.now(UTC)) == []
 
     def test_detail_is_not_an_instruction(self):
-        now = datetime.now(UTC)
-        d = _issues(_coord(episode_reason="heat", mismatch_since=now), now)[0]["detail"].lower()
+        engine = _engine("off")
+        timers = _Timers()
+        p1, p2, p3 = _patched(timers)
+        with p1, p2, p3:
+            _open_mode_episode(engine, timers)
+        d = _issues(_coord(engine), NOW)[0]["detail"].lower()
         for word in ("please", "you should", "turn ", "check "):
             assert word not in d
 

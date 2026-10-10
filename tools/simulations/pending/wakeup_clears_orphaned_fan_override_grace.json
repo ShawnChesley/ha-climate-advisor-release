@@ -60,11 +60,13 @@
   "assertions": [
     {
       "at": "2026-07-14T06:00:00",
-      "expect": "field_equals",
-      "field": "engine_state._grace_active",
-      "value": false,
+      "expect": "event_emitted",
+      "event": "grace_cancelled",
+      "payload_subset": {
+        "trigger": "fan_manual_override"
+      },
       "track": "integration",
-      "reason": "Issue #874: handle_morning_wakeup() calls clear_manual_override() (clearing the override flags) and must now also cancel the grace period tied to that override in the same step — _grace_active must already be False immediately after wake-up, not still True awaiting the next coordinator cycle's _check_orphaned_grace() watchdog."
+      "reason": "Issue #874 (asserted on the grace_cancelled event, not the end-of-run _grace_active flag, because a later legitimate reconcile cycle can start a new grace): handle_morning_wakeup() calls clear_manual_override() (clearing the override flags) and must now also cancel the grace period tied to that override in the same step — _grace_active must already be False immediately after wake-up, not still True awaiting the next coordinator cycle's _check_orphaned_grace() watchdog."
     }
   ],
   "verdict": {

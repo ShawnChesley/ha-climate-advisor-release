@@ -835,6 +835,8 @@ class AutomationEngine:
     _write_seq: int = 0
     _hvac_cmd_fail_announced: str | None = None
     _hvac_cmd_fail_since: datetime | None = None
+    _hvac_cmd_fail_mode: str | None = None  # last attempted mode of the open failure episode
+    _request_refresh_callback: Any | None = None
     # Issue #1049 change 1: (mode, when) of the last mode command that went out successfully;
     # dedupes the explicit set_hvac_mode that would otherwise follow in the same cycle.
     _mode_switch_marker: tuple[str, datetime] | None = None
@@ -2486,6 +2488,9 @@ class AutomationEngine:
             old_setpoint_f: Previous thermostat setpoint in degrees F (setpoint overrides only).
             new_setpoint_f: New thermostat setpoint in degrees F (setpoint overrides only).
         """
+        # Issue #1049: the occupant is taking control -- an open "thermostat did not take the mode CA
+        # requested" episode no longer describes a fault (ownership passed), so end it now.
+        self._close_mode_episode_quietly("manual override detected")
         state = self.hass.states.get(self.climate_entity)
         detected_mode = state.state if state else "unknown"
         confirm_seconds = int(self.config.get(CONF_OVERRIDE_CONFIRM_PERIOD, DEFAULT_OVERRIDE_CONFIRM_SECONDS))
@@ -3413,6 +3418,7 @@ class AutomationEngine:
         """
         step = next_fallback_episode("failed", self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since, dt_util.now())
         self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since = step.announced, step.since
+        self._hvac_cmd_fail_mode = mode  # what Status/diagnostics show as "last attempted mode"
         if step.kind == "none":
             _LOGGER.debug("hvac_command_failed episode already announced -- suppressing repeat (mode=%s)", mode)
             return
@@ -3424,6 +3430,7 @@ class AutomationEngine:
         if setpoint_f is not None:
             extra["setpoint_f"] = setpoint_f  # internal F (never the display unit)
         self._emit_engine_incident("hvac_command_failed", extra)
+        self._request_status_refresh()  # episode opened: Status should not wait for the 30-min poll
 
     def _note_hvac_command_ok(self, mode: str) -> None:
         """Close an open ``hvac_command_failed`` episode with a recovery note (Issue #1049)."""
@@ -3433,6 +3440,7 @@ class AutomationEngine:
         self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since = step.announced, step.since
         if step.kind != "recovered":
             return
+        self._hvac_cmd_fail_mode = None
         _LOGGER.info(
             "HVAC command recovered -- thermostat accepted a command again (mode=%s down=%s min)",
             mode,
@@ -3443,6 +3451,17 @@ class AutomationEngine:
                 "hvac_command_recovered",
                 {"hvac_mode": mode, "climate_entity": self.climate_entity, "minutes_down": step.minutes_down},
             )
+        self._request_status_refresh()
+
+    def _request_status_refresh(self) -> None:
+        """Ask the coordinator for one refresh so Status reflects an episode open/close now (Issue #1049).
+
+        Called exactly once per episode transition (never per check), following the
+        Issue #510 precedent of pushing a state change to the card instead of waiting for
+        the next 30-minute poll.
+        """
+        if self._request_refresh_callback:
+            self._request_refresh_callback()
 
     def _update_write_record(self, **changes: Any) -> None:
         """Replace the frozen ``HvacWriteRecord`` with an updated copy (Issue #1049)."""
@@ -3502,25 +3521,14 @@ class AutomationEngine:
             return outcome
         if outcome is ModeAlignmentOutcome.UNREADABLE or outcome.value.startswith("excluded_"):
             self._update_write_record(apply_skip_reason=outcome.value)
+            if outcome is ModeAlignmentOutcome.EXCLUDED_OVERRIDE:
+                # The occupant took over: "CA requested X, thermostat is not in X" no longer
+                # describes a fault, so the open episode must not linger on Status for hours.
+                self._close_mode_episode_quietly("manual control began")
             return outcome
         if outcome is ModeAlignmentOutcome.ALIGNED:
-            step = next_fallback_episode(None, rec.episode_reason, rec.mismatch_since, now)
-            self._update_write_record(apply_skip_reason=None, mismatch_since=None, episode_reason=step.announced)
-            if step.kind == "recovered":
-                _LOGGER.info(
-                    "HVAC mode now applied — thermostat is in %s (was not following for %s min)",
-                    requested,
-                    step.minutes_down,
-                )
-                if self._emit_event_callback:
-                    self._emit_event_callback(
-                        "hvac_mode_applied_recovered",
-                        {
-                            "requested_mode": requested,
-                            "climate_entity": self.climate_entity,
-                            "minutes_down": step.minutes_down,
-                        },
-                    )
+            self._update_write_record(apply_skip_reason=None)
+            self._recover_mode_episode(requested)
             return outcome
         # MISALIGNED
         since = rec.mismatch_since or now
@@ -3530,6 +3538,7 @@ class AutomationEngine:
         step = next_fallback_episode(requested, rec.episode_reason, since, now)
         self._update_write_record(episode_reason=step.announced, mismatch_since=step.since)
         if step.kind in ("fallback", "changed"):
+            self._request_status_refresh()  # once per episode open
             _LOGGER.warning(
                 "HVAC mode not applied — requested %s but thermostat reports %r (entity=%s). "
                 "The thermostat may be ignoring mode commands.",
@@ -3548,6 +3557,66 @@ class AutomationEngine:
                     },
                 )
         return outcome
+
+    def _recover_mode_episode(self, requested: str | None) -> None:
+        """Close an open mode-not-applied episode because the thermostat IS in the requested mode.
+
+        Honest wording: the recovery event only ever claims what is true -- the thermostat now
+        reports the requested mode (whether CA's command finally took or the occupant set it).
+        """
+        rec = self._hvac_write_record
+        step = next_fallback_episode(None, rec.episode_reason, rec.mismatch_since, dt_util.now())
+        self._update_write_record(mismatch_since=None, episode_reason=step.announced)
+        if step.kind != "recovered":
+            return
+        _LOGGER.info(
+            "HVAC mode now applied — thermostat is in %s (was not following for %s min)",
+            requested,
+            step.minutes_down,
+        )
+        if self._emit_event_callback:
+            self._emit_event_callback(
+                "hvac_mode_applied_recovered",
+                {
+                    "requested_mode": requested,
+                    "climate_entity": self.climate_entity,
+                    "minutes_down": step.minutes_down,
+                },
+            )
+        self._request_status_refresh()  # once per episode close
+
+    def _close_mode_episode_quietly(self, why: str) -> None:
+        """End an open episode WITHOUT claiming the thermostat obeyed (ownership passed to the occupant).
+
+        No recovery event: "the thermostat is now in the requested mode" would be false. The
+        Activity Log row stays as history; the Status warning clears and an INFO line records why.
+        """
+        rec = self._hvac_write_record
+        if rec.episode_reason is None:
+            return
+        _LOGGER.info("HVAC mode-not-applied episode closed (%s) — requested=%s", why, rec.episode_reason)
+        self._update_write_record(mismatch_since=None, episode_reason=None)
+        self._request_status_refresh()
+
+    def reconcile_mode_episode(self) -> None:
+        """Close an open mode episode that no longer describes reality (Issue #1049).
+
+        Called by the coordinator each update cycle. Two cases the scheduled read-back cannot
+        see on its own: the occupant took manual control (quiet close), and the thermostat is
+        already in the requested mode because the occupant (or the device, late) set it
+        (recovery -- it is true).
+        """
+        rec = self._hvac_write_record
+        if rec.episode_reason is None:
+            return
+        if self._manual_override_active or self._override_confirm_pending:
+            self._close_mode_episode_quietly("manual control")
+            return
+        state = self.hass.states.get(self.climate_entity)
+        live = getattr(state, "state", None) if state is not None else None
+        requested = self._last_commanded_hvac_mode
+        if isinstance(live, str) and requested and live == requested:
+            self._recover_mode_episode(requested)
 
     def _schedule_mode_alignment_recheck(self, my_seq: int) -> None:
         """Schedule the >=130 s read-back mode check in its own cancel slot (Issue #1049)."""
@@ -3745,6 +3814,30 @@ class AutomationEngine:
         return True
 
     async def _set_temperature(
+        self,
+        temperature: float,
+        *,
+        reason: str,
+        mode: str = "cool",
+        skip_setpoint_sanity_check: bool = False,
+    ) -> HvacCommandResult:
+        """Set the thermostat target temperature; record the write's final outcome (Issue #1049).
+
+        Thin wrapper over :meth:`_set_temperature_impl`: every return path of the write (sent,
+        failed, rejected, WHF-blocked, dry-run, superseded) lands in ``_hvac_write_record.result``
+        so incident context and diagnostics report what happened to the SETPOINT write, not just
+        the last mode command.
+        """
+        result = await self._set_temperature_impl(
+            temperature,
+            reason=reason,
+            mode=mode,
+            skip_setpoint_sanity_check=skip_setpoint_sanity_check,
+        )
+        self._update_write_record(result=result)
+        return result
+
+    async def _set_temperature_impl(
         self,
         temperature: float,
         *,

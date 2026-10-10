@@ -3430,6 +3430,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # incident (#739/#748) this module exists to catch.
         _invariant_violations = self._run_invariant_watchdog(hvac_action=hvac_action)
         # Issue #1049 (change 7): the thermostat not following commands, surfaced on the Status card.
+        # First let the engine close an episode that reality has overtaken (occupant took manual
+        # control, or the thermostat is now in the requested mode), so Status never lingers.
+        if self.automation_engine is not None:
+            self.automation_engine.reconcile_mode_episode()
         _hvac_control_issues = self._compute_hvac_control_issues()
 
         # Issue #805: generic entity-availability sweep. Detects a removed/unavailable
@@ -5536,6 +5540,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Pre-cool trigger handler completed: %s", result)
         if "suppressed" in result:
             self._pre_cool_status = result.replace("suppressed: ", "pre-cool suppressed — ")
+        elif result.startswith("not applied"):
+            # Issue #1049: the write was blocked/failed/not sent -- never present it as active.
+            self._pre_cool_status = result.replace("not applied", "pre-cool not applied", 1)
         elif "applied" in result:
             self._pre_cool_status = result.replace("applied: ", "pre-cool active (").rstrip() + ")"
         await self.async_refresh()
@@ -6409,10 +6416,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         if (
             _setpoint_changed
-            # Issue #1049: a reconnecting thermostat has no prior setpoint (old_temp is None) —
-            # that is a reading appearing, not an occupant changing it.
+            # Issue #1049: a reconnecting thermostat has no prior setpoint — that is a reading
+            # appearing, not an occupant changing it. (Only the recovery case: a missing prior
+            # setpoint in any other transition keeps its original override semantics.)
             and not _is_availability_recovery
-            and old_temp is not None
             and self._today_record
             and not self.automation_engine._temp_command_pending
             and not self.automation_engine._hvac_command_pending
@@ -9791,16 +9798,21 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         issues: list[dict[str, str]] = []
         rec = getattr(ae, "_hvac_write_record", None)
         requested = getattr(rec, "episode_reason", None)
-        if isinstance(requested, str) and requested:
-            state = self.hass.states.get(ae.climate_entity)
-            live = getattr(state, "state", None)
+        state = self.hass.states.get(ae.climate_entity)
+        live = getattr(state, "state", None)
+        # Never show a self-contradicting entry: hidden while the occupant owns the thermostat
+        # and whenever the thermostat already reports the requested mode.
+        user_owns = bool(getattr(ae, "_manual_override_active", False)) or bool(
+            getattr(ae, "_override_confirm_pending", False)
+        )
+        if isinstance(requested, str) and requested and not user_owns and live != requested:
             detail = f"Thermostat is not following the requested mode: requested {requested}, reports {live!r}"
             mins = _minutes_since(getattr(rec, "mismatch_since", None))
             if mins is not None:
                 detail += f" for {mins} min"
             issues.append({"issue": "mode_not_obeyed", "detail": detail})
-        failed_mode = getattr(ae, "_hvac_cmd_fail_announced", None)
-        if isinstance(failed_mode, str) and failed_mode:
+        failed_mode = getattr(ae, "_hvac_cmd_fail_mode", None)
+        if getattr(ae, "_hvac_cmd_fail_announced", None) and isinstance(failed_mode, str) and failed_mode:
             detail = f"Thermostat commands are failing (last attempted mode: {failed_mode})"
             mins = _minutes_since(getattr(ae, "_hvac_cmd_fail_since", None))
             if mins is not None:
