@@ -59,6 +59,52 @@ class TestBandRestoreHold:
         assert _band(True, "vacation") == _band(False, "vacation")
 
 
+class TestExecutorPathIsReadOnly:
+    """api.py runs get_chart_data() in an executor: the band builder must read the loop-computed
+    cache and never call the engine accessor (which writes state and reads hass.states)."""
+
+    def _coord(self, engine, cached):
+        cls = _coord_mod().ClimateAdvisorCoordinator
+        c = object.__new__(cls)
+        c.config = dict(CFG)
+        c.automation_engine = engine
+        c._current_classification = None
+        c._occupancy_mode = "home"
+        c._hourly_forecast_temps = []
+        c._tou_precondition_window_tuple = lambda: None
+        c._occupancy_restore_held_cache = cached
+        c._build_target_band_for = types.MethodType(cls._build_target_band_for, c)
+        c._occupancy_restore_held = types.MethodType(cls._occupancy_restore_held, c)
+        return c
+
+    def _forecast(self):
+        return [{"datetime": datetime(2026, 10, 10, h).isoformat()} for h in (12, 14, 16)]
+
+    def test_builder_never_touches_the_engine_and_uses_the_cache(self):
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise AssertionError("executor path called the engine accessor")
+
+        engine = SimpleNamespace(occupancy_restore_hold_reason=boom, _occupancy_restore_deferred_pending=True)
+        c = self._coord(engine, True)
+        band = c._build_target_band_for(NOW, None, self._forecast())
+        assert calls == [] and engine._occupancy_restore_deferred_pending is True
+        assert [(b["lower"], b["upper"]) for b in band] == [(60.0, 80.0), (60.0, 80.0), (70.0, 75.0)]
+        assert [
+            (b["lower"], b["upper"])
+            for b in self._coord(engine, False)._build_target_band_for(NOW, None, self._forecast())
+        ][0] == (70.0, 75.0)
+
+    def test_loop_refresh_updates_the_cache_from_the_engine(self):
+        engine = SimpleNamespace(occupancy_restore_hold_reason=lambda: "open_sensor")
+        c = self._coord(engine, False)
+        assert c._occupancy_restore_held() is True and c._occupancy_restore_held_cache is True
+        engine.occupancy_restore_hold_reason = lambda: None
+        assert c._occupancy_restore_held() is False and c._occupancy_restore_held_cache is False
+
+
 class TestOccupancyRestoreHeldAccessor:
     def _coord(self, engine):
         c = object.__new__(_coord_mod().ClimateAdvisorCoordinator)
@@ -140,6 +186,11 @@ class TestRenderers:
 
         r = ctx.EVENT_RENDERERS["fan_cancel"]
         base = {"trigger": "physical_drift_correction", "readback": True}
-        assert "retrying once" in r({**base, "retry": True}, "fahrenheit")[0]
-        assert "giving up" in r(base, "fahrenheit")[0]
+        assert "retrying once" in r({**base, "retry": True, "session_kept": True}, "fahrenheit")[0]
+        kept = r({**base, "session_kept": True}, "fahrenheit")[0]
+        assert "giving up" in kept and "AC released" not in kept and "AC stays off" in kept
+        released = r({**base, "session_kept": False}, "fahrenheit")[0]
+        assert "giving up" in released and "AC released" in released
+        assert "AC released" in r({**base, "retry": True, "session_kept": False}, "fahrenheit")[0]
+        assert "AC released" not in r({**base, "retry": True, "session_kept": True}, "fahrenheit")[0]
         assert "stale flag cleared" in r({"trigger": "physical_drift_correction"}, "fahrenheit")[0]

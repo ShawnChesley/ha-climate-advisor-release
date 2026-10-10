@@ -29,6 +29,7 @@ if "homeassistant" not in sys.modules:
 from custom_components.climate_advisor.comfort_stall_decision import (  # noqa: E402
     StallReason,
     decide_comfort_stall,
+    stall_margins,
 )
 
 T0 = datetime(2026, 10, 4, 11, 0, tzinfo=UTC)
@@ -41,7 +42,8 @@ def _decide(now=T0, **over):
         "comfort_heat": 68.0,
         "comfort_cool": 75.0,
         "now": now,
-        "margin_f": 1.0,
+        "heat_margin_f": 1.0,
+        "cool_margin_f": 1.0,
         "sustain_seconds": SUSTAIN,
         "previous_direction": None,
         "previous_since": None,
@@ -164,7 +166,7 @@ def _coordinator_class():
 class _Rig:
     """A partial real coordinator with the real stall methods bound; time is driven by the test."""
 
-    def __init__(self, *, unit="fahrenheit", hysteresis=1.0, modes=None, action="idle", mode="off"):
+    def __init__(self, *, unit="fahrenheit", hysteresis=1.0, modes=None, action="idle", mode="off", day_type="cold"):
         cls = _coordinator_class()
         self.coord = coord = object.__new__(cls)
         coord.config = {"temp_unit": unit, "nat_vent_hysteresis_f": hysteresis}
@@ -177,7 +179,10 @@ class _Rig:
         ae._hvac_write_record = None
         ae._hvac_cmd_fail_announced = None
         ae._hvac_cmd_fail_mode = None
+        # Real deadband values per day type (config defaults: hot/cold 5 F, others 2 F).
+        ae._comfort_deadband_for_day_type = lambda dt: 5.0 if dt in ("hot", "cold") else 2.0
         coord.automation_engine = ae
+        coord._current_classification = SimpleNamespace(day_type=day_type) if day_type else None
         self.ae = ae
         coord._startup_coalesce_active = False
         self.refreshes = 0
@@ -513,3 +518,112 @@ class TestStatusRefreshOnTransition:
             assert r.refreshes == 0
         finally:
             r.close()
+
+
+class TestExclusionDuringAnnouncedStall:
+    """An exclusion mid-episode must neither recover nor re-announce (verifier finding 1)."""
+
+    def test_unavailable_thermostat_does_not_recover_or_realert(self):
+        r = _rig()
+        try:
+            _run_half_hours(r, 3, 62.0)  # announced at t=180
+            assert r.names() == ["hvac_output_stall"] and len(r.notifications) == 1
+            r.set_thermostat(mode="unavailable")
+            r.tick(200, 62.0)
+            r.tick(230, 62.0)
+            r.set_thermostat(mode="off", action="idle")
+            for m in range(260, 180 + 12 * 60, 30):  # back, pending clock restarts, 3 h passes
+                r.tick(m, 62.0)
+            assert r.names() == ["hvac_output_stall"], "no recovery row, no second stall row"
+            assert len(r.notifications) == 1, "no second push at +3 h after the exclusion"
+            # Reminder cadence is still 12 h from the LAST push (t=180), not restarted.
+            r.tick(180 + 12 * 60, 62.0)
+            assert len(r.notifications) == 2 and r.names() == ["hvac_output_stall"]
+        finally:
+            r.close()
+
+    def test_real_recovery_after_an_exclusion_still_reported(self):
+        r = _rig()
+        try:
+            _run_half_hours(r, 3, 62.0)
+            r.set_thermostat(mode="unavailable")
+            r.tick(200, 62.0)
+            r.set_thermostat(mode="off", action="idle")
+            r.tick(260, 70.0)
+            assert r.names() == ["hvac_output_stall", "hvac_output_stall_recovered"]
+            assert r.events[-1][1]["reason"] == "in_band"
+        finally:
+            r.close()
+
+    def test_equipment_that_ran_during_the_exclusion_is_a_recovery(self):
+        r = _rig()
+        try:
+            _run_half_hours(r, 3, 62.0)
+            r.ae._manual_override_active = True
+            r.tick(200, 62.0)
+            r.coord._note_equipment_activity("heating", now=T0 + timedelta(minutes=210))
+            r.ae._manual_override_active = False
+            r.tick(240, 62.0)
+            assert r.names() == ["hvac_output_stall", "hvac_output_stall_recovered"]
+            assert r.events[-1][1]["reason"] == "equipment_ran"
+        finally:
+            r.close()
+
+
+class TestAgainstTheGrainDeadband:
+    """CA deliberately does not act against the day's grain inside the comfort-family deadband,
+    so the stall must not complain about a direction CA itself would not yet act on."""
+
+    def test_warm_house_on_cold_sunny_day_thermostat_in_heat_is_quiet(self):
+        """Cold day (heating native, cooling against-grain 5 F): 77 F vs 75 F ceiling is CA's own choice."""
+        r = _rig(day_type="cold", mode="heat", action="idle")
+        try:
+            _run_half_hours(r, 10, 77.0)
+            assert r.events == [] and r.notifications == []
+        finally:
+            r.close()
+
+    def test_cool_house_on_hot_day_is_quiet_inside_the_deadband(self):
+        """Hot day (cooling native, heating against-grain 5 F): 66 F vs 68 F floor must not alert."""
+        r = _rig(day_type="hot", mode="cool", action="idle")
+        try:
+            _run_half_hours(r, 10, 66.0)
+            assert r.events == [] and r.notifications == []
+        finally:
+            r.close()
+
+    def test_against_grain_alerts_once_past_deadband_plus_margin(self):
+        r = _rig(day_type="hot", mode="off")
+        try:
+            _run_half_hours(r, 3, 61.0)  # 7 F below floor > 5 + 1
+            assert r.names() == ["hvac_output_stall"]
+        finally:
+            r.close()
+
+    def test_with_the_grain_keeps_the_flat_margin_the_1048_shape(self):
+        """Below the floor on a cold day with the thermostat Off: the #1048 case still alerts."""
+        r = _rig(day_type="cold", mode="off")
+        try:
+            _run_half_hours(r, 3, 66.5)  # 1.5 F below floor > 1 F flat margin
+            assert r.names() == ["hvac_output_stall"]
+        finally:
+            r.close()
+
+    def test_mild_day_has_no_native_direction_so_both_directions_use_the_deadband(self):
+        r = _rig(day_type="mild", mode="off")
+        try:
+            _run_half_hours(r, 6, 66.0)  # 2 F below: inside 2 + 1
+            assert r.events == []
+        finally:
+            r.close()
+        r = _rig(day_type="mild", mode="off")
+        try:
+            _run_half_hours(r, 3, 64.0)  # 4 F below: past 2 + 1
+            assert r.names() == ["hvac_output_stall"]
+        finally:
+            r.close()
+
+    def test_stall_margins_table(self):
+        assert stall_margins("heating", 5.0, 1.0) == (1.0, 6.0)
+        assert stall_margins("cooling", 5.0, 1.0) == (6.0, 1.0)
+        assert stall_margins(None, 2.0, 1.0) == (3.0, 3.0)

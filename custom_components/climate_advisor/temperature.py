@@ -192,9 +192,10 @@ def next_fallback_episode(
 def reminder_due(last: datetime | None, now: datetime, interval_s: float) -> bool:
     """Pure reminder/debounce rule: True when nothing was sent yet or ``interval_s`` has elapsed.
 
-    The one shared "is it time to (re)send" predicate for the owner-alert paths (entity
-    health daily reminder, blind-fan push debounce). The caller owns storing ``now`` as the
-    new last-sent time when it acts.
+    The shared "is it time to (re)send" predicate for the coordinator's owner-alert paths:
+    the entity-health daily reminder and the comfort stall alert's 12 h reminder. (The
+    blind-fan push debounce still uses its own inline check -- tracked in issue #1058.) The
+    caller owns storing ``now`` as the new last-sent time when it acts.
     """
     return last is None or (now - last).total_seconds() >= interval_s
 

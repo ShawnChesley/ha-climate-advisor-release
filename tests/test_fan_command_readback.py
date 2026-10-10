@@ -195,3 +195,62 @@ class TestReadback:
         st = _ignored_state(eng)
         eng.hass.states.get.side_effect = lambda eid: st if eid == FAN else MagicMock(attributes={})
         assert eng._build_fan_fsm_inputs().physical_on is False
+
+
+class TestGiveUpDoesNotRepeat:
+    """After the second ignored on-command CA stops re-activating the fan (verifier finding 5)."""
+
+    def _gave_up(self):
+        import asyncio
+
+        eng, events = _engine(None)
+        st = _ignored_state(eng)
+        eng.hass.states.get.side_effect = lambda eid: st if eid == FAN else MagicMock(attributes={})
+        for _ in range(2):
+            eng._reconcile_fan_physical_drift()
+        eng._fan_active = True
+        eng._fan_toggle_command_time = datetime.now().astimezone() - timedelta(seconds=600)
+        for _ in range(2):
+            eng._reconcile_fan_physical_drift()
+        assert eng._fan_readback_gave_up is True
+        return eng, events, asyncio
+
+    def test_activation_is_blocked_after_give_up(self):
+        from custom_components.climate_advisor.automation import FanCommandResult
+
+        eng, events, asyncio = self._gave_up()
+        before = len(events)
+        result = asyncio.run(eng._activate_fan(reason="nat_vent_cycling_on"))
+        assert result is FanCommandResult.SUPPRESSED
+        assert eng._fan_active is False
+        eng.hass.services.async_call.assert_not_called()
+        assert len(events) == before, "no new fan_activated / fan_cancel row per cycle"
+
+    def test_fan_reading_on_lifts_the_block(self):
+        eng, _events, _asyncio = self._gave_up()
+        eng._fan_active = True
+        on = _fan_state("on", datetime.now().astimezone())
+        eng.hass.states.get.side_effect = lambda eid: on if eid == FAN else MagicMock(attributes={})
+        eng._reconcile_fan_physical_drift()
+        assert eng._fan_readback_gave_up is False and eng._fan_readback_attempts == 0
+
+    def test_occupant_turning_the_fan_on_lifts_the_block(self):
+        eng, _events, _asyncio = self._gave_up()
+        eng.handle_fan_manual_override(fan_before="off", fan_after="on")
+        assert eng._fan_readback_gave_up is False
+
+    def test_cancel_payload_says_whether_the_session_was_kept(self):
+        eng, events = _engine(None)  # window open -> session kept
+        st = _ignored_state(eng)
+        eng.hass.states.get.side_effect = lambda eid: st if eid == FAN else MagicMock(attributes={})
+        for _ in range(2):
+            eng._reconcile_fan_physical_drift()
+        assert [d["session_kept"] for e, d in events if e == "fan_cancel"] == [True]
+
+        eng2, events2 = _engine(None)
+        eng2._sensor_check_callback = lambda: False  # windows closed -> session ended, AC released
+        st2 = _ignored_state(eng2)
+        eng2.hass.states.get.side_effect = lambda eid: st2 if eid == FAN else MagicMock(attributes={})
+        for _ in range(2):
+            eng2._reconcile_fan_physical_drift()
+        assert [d["session_kept"] for e, d in events2 if e == "fan_cancel"] == [False]

@@ -2380,9 +2380,19 @@ def _render_fan_cancel(p: dict, unit: str) -> tuple[str, str]:
     settings = f"{fan_device}: {fan_before}->{fan_after}" if fan_before and fan_after else ""
     trigger = p.get("trigger")
     if trigger == "physical_drift_correction" and p.get("readback"):
+        # session_kept False = the windows had closed so the ventilation session ended and the AC
+        # suppression was released; otherwise the session (and the AC suppression) stays.
+        released = p.get("session_kept") is False
         if p.get("retry"):
-            return "Fan switch ignored the on-command -- AC released, retrying once", settings
-        return "Fan switch ignored the on-command again -- giving up, AC released", settings
+            if released:
+                return "Fan switch ignored the on-command -- ventilation ended, AC released", settings
+            return "Fan switch ignored the on-command -- retrying once", settings
+        if released:
+            return "Fan switch ignored the on-command again -- giving up on the fan, AC released", settings
+        return (
+            "Fan switch ignored the on-command again -- giving up on the fan (AC stays off while windows are open)",
+            settings,
+        )
     if trigger == "physical_drift_correction":
         return "Fan ownership corrected -- stale flag cleared (was already off)", settings
     if trigger == "timer_boundary_settle":

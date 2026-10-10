@@ -52,7 +52,8 @@ from .automation import (
 from .briefing import generate_briefing
 from .chart_log import ChartStateLog
 from .classifier import DayClassification, ForecastSnapshot, classify_day
-from .comfort_stall_decision import StallReason, decide_comfort_stall
+from .comfort_family_decision import _native_family
+from .comfort_stall_decision import StallReason, decide_comfort_stall, stall_margins
 from .confirmed_transition import is_confirmed, resolve_candidate_since
 from .const import (
     _VENT_SPLIT_TYPES,
@@ -583,6 +584,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
     _stall_announced_direction: str | None = None
     _stall_announced_at: datetime | None = None
     _stall_last_push: datetime | None = None
+    # Loop-computed once per cycle; read (never recomputed) by the executor-thread chart path.
+    _occupancy_restore_held_cache: bool = False
     _stall_status: dict[str, str] | None = None  # the open hvac_control_issues entry, else None
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any], entry_id: str = "") -> None:
@@ -5215,17 +5218,23 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 pre_cool_trigger_h=_pc_trigger_h,
                 pre_cool_target=_pc_target,
                 tou_precondition_window=self._tou_precondition_window_tuple(),
-                restore_hold=self._occupancy_restore_held(),
+                restore_hold=self._occupancy_restore_held_cache,
             )
         )
 
     def _occupancy_restore_held(self) -> bool:
-        """True while the engine is holding a deferred arrival-home comfort restore (Issue #1050)."""
+        """True while the engine is holding a deferred arrival-home comfort restore (Issue #1050).
+
+        EVENT LOOP ONLY: the engine accessor reads ``hass.states`` and self-clears its pending
+        marker. ``get_chart_data()`` runs in an executor thread (api.py) and reaches the band
+        builder, so it must never call this -- it reads ``_occupancy_restore_held_cache``, which
+        this method refreshes once per cycle from ``_resolve_target_band_schedule()``.
+        """
         engine = getattr(self, "automation_engine", None)
         accessor = getattr(engine, "occupancy_restore_hold_reason", None)
-        if not callable(accessor):
-            return False
-        return isinstance(accessor(), str)
+        held = callable(accessor) and isinstance(accessor(), str)
+        self._occupancy_restore_held_cache = held
+        return held
 
     def _resolve_target_band_schedule(self) -> None:
         """Resolve and cache this cycle's target-band schedule (Issue #514) — cached on
@@ -5253,6 +5262,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         ``_build_target_band_for()`` directly, since it must reflect the exact moment a
         chart request arrives, not the last 30-min cycle's snapshot.
         """
+        self._occupancy_restore_held()  # refresh the loop-side cache the executor path reads
         self._target_band_schedule = self._build_target_band_for(
             dt_util.now(),
             self.automation_engine._thermal_model if self.automation_engine else None,
@@ -6477,16 +6487,20 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         _setpoint_override_detected = False
         if new_state.state == "heat_cool":
-            _new_high = new_state.attributes.get("target_temp_high")
-            _old_high = old_state.attributes.get("target_temp_high")
-            _new_low = new_state.attributes.get("target_temp_low")
-            _old_low = old_state.attributes.get("target_temp_low")
-            _setpoint_changed = (_new_high != _old_high) or (_new_low != _old_low)
-            # Use the cooling (high) setpoint as the representative value for override_details
-            new_temp, old_temp = _new_high, _old_high
-            _sp_attr = "target_temp_high"
+            # Issue #1048: heat_cool exposes a low and a high setpoint. Record whichever one(s)
+            # actually changed (the larger move when both did); the old code always read the high
+            # setpoint, so a low-only change was logged as magnitude 0.
+            _sp_attrs = [
+                _a
+                for _a in ("target_temp_high", "target_temp_low")
+                if new_state.attributes.get(_a) != old_state.attributes.get(_a)
+            ]
+            _setpoint_changed = bool(_sp_attrs)
+            _sp_attr = _sp_attrs[0] if _sp_attrs else "target_temp_high"
+            new_temp, old_temp = new_state.attributes.get(_sp_attr), old_state.attributes.get(_sp_attr)
         else:
             _sp_attr = "temperature"
+            _sp_attrs = [_sp_attr]
             new_temp = new_state.attributes.get("temperature")
             old_temp = old_state.attributes.get("temperature")
             _setpoint_changed = new_temp != old_temp
@@ -6516,12 +6530,16 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             old_val = new_val = None
             old_setpoint_f = new_setpoint_f = None
             try:
-                old_val = old_setpoint_f = read_attribute_temp_f(old_state, _sp_attr, _ov_unit)[0]
-                new_val = new_setpoint_f = read_attribute_temp_f(new_state, _sp_attr, _ov_unit)[0]
-                if old_val is None or new_val is None:
+                _pairs: list[tuple[float, float]] = []
+                for _a in _sp_attrs:
+                    _o = read_attribute_temp_f(old_state, _a, _ov_unit)[0]
+                    _n = read_attribute_temp_f(new_state, _a, _ov_unit)[0]
+                    if _o is not None and _n is not None:
+                        _pairs.append((round(_o, 2), round(_n, 2)))
+                if not _pairs:
                     raise ValueError("setpoint not numeric")
-                old_val = round(old_val, 2)
-                new_val = round(new_val, 2)
+                old_val, new_val = max(_pairs, key=lambda _p: abs(_p[1] - _p[0]))
+                old_setpoint_f, new_setpoint_f = old_val, new_val
                 magnitude = round(new_val - old_val, 2)
                 # Issue #583: increment the counter only after the append below is guaranteed
                 # to succeed, so manual_overrides and len(override_details) can never diverge.
@@ -10014,12 +10032,21 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             and comfort_cool is not None
             and self._is_nat_vent_tolerated_deviation(indoor, comfort_heat, comfort_cool)
         )
+        # Only a direction CA itself would act on counts: against the day's grain the margin
+        # includes the day-type comfort-family deadband (see stall_margins).
+        _day_type = getattr(self._current_classification, "day_type", None) if self._current_classification else None
+        _heat_margin, _cool_margin = stall_margins(
+            _native_family(_day_type),
+            ae._comfort_deadband_for_day_type(_day_type),
+            COMFORT_STALL_MARGIN_F,
+        )
         decision = decide_comfort_stall(
             indoor=indoor,
             comfort_heat=comfort_heat,
             comfort_cool=comfort_cool,
             now=now,
-            margin_f=COMFORT_STALL_MARGIN_F,
+            heat_margin_f=_heat_margin,
+            cool_margin_f=_cool_margin,
             sustain_seconds=COMFORT_STALL_SUSTAIN_SECONDS,
             previous_direction=self._stall_direction,
             previous_since=self._stall_since,
@@ -10043,14 +10070,26 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             return
 
         announced = self._stall_announced_direction
-        if decision.reason is not StallReason.STALLED:
-            self._stall_status = None
-            if announced is not None:
-                # In band again, or heating/cooling equipment ran after the alert.
+        if announced is not None:
+            # An announced episode closes ONLY on a real recovery: back in the band (or the
+            # house crossed to the opposite side), or heating/cooling equipment actually ran in
+            # the announced direction after the alert. A PENDING tick that merely follows an
+            # exclusion (thermostat unavailable, window opened...) is NOT a recovery -- the
+            # 3 h pending clock restarts but the episode, its reminder cadence and its
+            # "already announced" state carry on (no false recovery row, no second alert).
+            recovered_by: str | None = None
+            if decision.reason is StallReason.IN_BAND or (
+                decision.direction is not None and decision.direction != announced
+            ):
+                recovered_by = "in_band"
+            else:
+                _ran = (self._equipment_last_active or {}).get(announced)
+                if _ran is not None and self._stall_announced_at is not None and _ran > self._stall_announced_at:
+                    recovered_by = "equipment_ran"
+            if recovered_by is not None:
                 minutes = (
                     round((now - self._stall_announced_at).total_seconds() / 60) if self._stall_announced_at else None
                 )
-                recovered_by = "in_band" if decision.reason is StallReason.IN_BAND else "equipment_ran"
                 _LOGGER.info(
                     "Comfort stall recovered: direction=%s reason=%s minutes=%s", announced, recovered_by, minutes
                 )
@@ -10061,9 +10100,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 self._stall_announced_direction = None
                 self._stall_announced_at = None
                 self._stall_last_push = None
+                announced = None
                 # hvac_control_issues was computed earlier in this cycle: refresh once (on the
                 # transition only, so no loop) so Status drops the entry now, not 30 min later.
                 self.hass.async_create_task(self.async_request_refresh())
+        if decision.reason is not StallReason.STALLED:
+            self._stall_status = None
             return
 
         # Confirmed stall.

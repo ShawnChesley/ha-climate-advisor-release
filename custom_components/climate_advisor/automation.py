@@ -876,6 +876,9 @@ class AutomationEngine:
     # >=1 -> gives up with the normal grace period + one warning episode). Episode fields use
     # next_fallback_episode(); class-level defaults for engines built via object.__new__ in tests.
     _fan_readback_attempts: int = 0
+    # True after the second ignored on-command: CA stops re-activating the fan (no hourly
+    # activate -> ignored -> give-up loop) until the fan reads ON or the occupant turns it on.
+    _fan_readback_gave_up: bool = False
     _fan_readback_announced: str | None = None
     _fan_readback_since: datetime | None = None
     _hvac_write_record: HvacWriteRecord = HvacWriteRecord()
@@ -1881,6 +1884,9 @@ class AutomationEngine:
         _override_origin_state = self.fan_lifecycle_state
 
         was_override_active = self._fan_override_active
+        # Issue #1050: the occupant (or an RF remote) turned the fan on -- it demonstrably reacts, so
+        # a read-back give-up no longer blocks CA's own fan activation.
+        self._note_fan_readback_recovered()
         self._stop_fan_min_runtime_cycles()
         self._fan_override_active = True
         self._fan_override_time = dt_util.now().isoformat()
@@ -10545,6 +10551,10 @@ class AutomationEngine:
         reason clears or occupancy leaves home. Coordinator's target-band schedule reads this to
         keep the chart band consistent with what the engine is actually (not) commanding.
         Self-clearing: once the live hold reason is gone the pending marker is dropped.
+
+        EVENT LOOP ONLY: it WRITES the pending marker and reads ``hass.states``. Never call it
+        from an executor thread (``get_chart_data()``); the coordinator caches the answer once per
+        cycle in ``_occupancy_restore_held_cache`` for that path.
         """
         if not self._occupancy_restore_deferred_pending:
             return None
@@ -11423,6 +11433,14 @@ class AutomationEngine:
             _LOGGER.debug("_activate_fan: already active — no-op (%s)", reason)
             return FanCommandResult.ALREADY_IN_STATE
 
+        # Issue #1050 (#1048 change 21): the fan switch ignored CA's on-command twice. Without
+        # this gate every grace expiry re-activated it and the whole ignored -> give-up cycle
+        # repeated indefinitely (one fan_cancel row per cycle). Stay off the fan until it reads ON
+        # or the occupant turns it on (_note_fan_readback_recovered()).
+        if self._fan_readback_gave_up:
+            _LOGGER.debug("_activate_fan: skipped -- fan switch ignored CA's on-command twice (%s)", reason)
+            return FanCommandResult.SUPPRESSED
+
         # Issue #731 Phase 5: routed through _resolve_fan_fsm_state().
         from .fan_fsm import FanFsmEventKind
 
@@ -12084,10 +12102,11 @@ class AutomationEngine:
 
     def _note_fan_readback_recovered(self) -> None:
         """The fan entity reads on again: close any read-back episode and reset the retry budget."""
-        if self._fan_readback_attempts == 0 and self._fan_readback_announced is None:
+        if self._fan_readback_attempts == 0 and self._fan_readback_announced is None and not self._fan_readback_gave_up:
             return
         step = next_fallback_episode(None, self._fan_readback_announced, self._fan_readback_since, dt_util.now())
         self._fan_readback_attempts = 0
+        self._fan_readback_gave_up = False
         self._fan_readback_announced, self._fan_readback_since = None, None
         if step.kind == "recovered":
             _LOGGER.info("Fan command read-back recovered: the fan switch reacts to commands again")
@@ -12246,6 +12265,14 @@ class AutomationEngine:
                     "Fan physical-state drift confirmed over 2 backstop ticks: _fan_active=True but"
                     " physical state=off — self-correcting stale flag (Issue #423)"
                 )
+            # Issue #561: preserving the nat-vent session across this correction (so
+            # nat_vent_temperature_check() can immediately re-fire) is only correct if the
+            # session is still justified by an open sensor. Computed before the event so the
+            # read-back row can say what actually happened (session kept vs. AC released).
+            _was_nat_vent_active = self._natural_vent_active
+            _preserve_session = _was_nat_vent_active and self._any_monitored_sensor_open()
+            if _readback_drift and not _readback_retry:
+                self._fan_readback_gave_up = True
             if self._emit_event_callback:
                 _cancel_payload: dict[str, Any] = {
                     "trigger": "physical_drift_correction",
@@ -12256,6 +12283,7 @@ class AutomationEngine:
                     _cancel_payload["reason"] = "fan command ignored: command entity never reacted"
                     _cancel_payload["readback"] = True
                     _cancel_payload["retry"] = _readback_retry
+                    _cancel_payload["session_kept"] = bool(_preserve_session)
                 self._emit_event_callback("fan_cancel", _cancel_payload)
             # Issue #561: preserving the nat-vent session across this correction (so
             # nat_vent_temperature_check() can immediately re-fire below) is only correct if
@@ -12267,8 +12295,6 @@ class AutomationEngine:
             # session is no longer justified, end it for real (preserve=False) and release any
             # WHF HVAC suppression it was holding, mirroring on_fan_turned_off()'s genuine
             # fan-off sequence.
-            _was_nat_vent_active = self._natural_vent_active
-            _preserve_session = _was_nat_vent_active and self._any_monitored_sensor_open()
             if _was_nat_vent_active and not _preserve_session:
                 _LOGGER.warning(
                     "Nat-vent session force-closed during physical-drift correction — no"

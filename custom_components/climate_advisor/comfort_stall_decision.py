@@ -66,13 +66,33 @@ def _supports(direction: str, hvac_modes: Iterable[str] | None) -> bool:
     return bool(_MODES_FOR_DIRECTION[direction] & set(hvac_modes))
 
 
+def stall_margins(native_family: str | None, deadband_f: float, margin_f: float) -> tuple[float, float]:
+    """Per-direction margins ``(heat_margin_f, cool_margin_f)`` outside the band before a stall counts.
+
+    Climate Advisor deliberately does NOT act against the day's grain until the house is past
+    the day-type comfort deadband (``comfort_family_decision``: heat on a hot day, cool on a
+    cold day; a mild day has no native family so both directions are against-grain).  An alert
+    for a direction CA itself would not yet act on is a false alarm -- e.g. a warm house on a
+    cold sunny day with the thermostat idle in Heat.  So the against-the-grain direction waits
+    for ``deadband_f + margin_f`` (CA would have escalated and the equipment still isn't
+    running); the with-the-grain direction keeps the flat ``margin_f``.
+
+    ``native_family`` is ``comfort_family_decision._native_family(day_type)`` ("heating" /
+    "cooling" / None) -- the one place that direction is defined.
+    """
+    heat = margin_f if native_family == "heating" else margin_f + deadband_f
+    cool = margin_f if native_family == "cooling" else margin_f + deadband_f
+    return heat, cool
+
+
 def decide_comfort_stall(
     *,
     indoor: float | None,
     comfort_heat: float | None,
     comfort_cool: float | None,
     now: datetime,
-    margin_f: float,
+    heat_margin_f: float,
+    cool_margin_f: float,
     sustain_seconds: float,
     previous_direction: str | None,
     previous_since: datetime | None,
@@ -87,7 +107,7 @@ def decide_comfort_stall(
 ) -> StallDecision:
     """Decide whether the house is stalled outside the active comfort band.
 
-    ``indoor``/``comfort_*``/``margin_f`` share one unit (internal Fahrenheit).
+    ``indoor``/``comfort_*``/``*_margin_f`` share one unit (internal Fahrenheit); see ``stall_margins``.
     ``last_active`` maps direction -> the last time equipment (``hvac_action`` heating /
     cooling) was seen in that direction.  Exclusions (all reset the clock):
     thermostat or indoor unavailable, thermostat without ``hvac_action`` (can't prove
@@ -113,9 +133,9 @@ def decide_comfort_stall(
     direction: str | None = None
     if excluded_by is None:
         assert indoor is not None and comfort_heat is not None and comfort_cool is not None  # for type checkers
-        if indoor < comfort_heat - margin_f:
+        if indoor < comfort_heat - heat_margin_f:
             direction = DIRECTION_HEAT
-        elif indoor > comfort_cool + margin_f:
+        elif indoor > comfort_cool + cool_margin_f:
             direction = DIRECTION_COOL
         if direction is not None and not _supports(direction, hvac_modes):
             excluded_by = "mode_unsupported"
