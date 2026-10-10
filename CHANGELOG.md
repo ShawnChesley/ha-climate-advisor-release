@@ -3,6 +3,16 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.94] — 2026-10-10
+
+- Fix #1048 (part 2 of 2, #1050): if the house stays more than 1 °F outside the comfort band you are using for 3 hours and the heating or cooling has not run, you now get one push notification (no email), a Status line and an Activity Log entry, then a reminder every 12 hours and a note when it clears. It stays quiet while you have manual control, a door or window is open, the thermostat is offline or cannot do the needed mode, or the house is within Climate Advisor's own comfort tolerance.
+- Fix #1048: Celsius households now see Celsius everywhere — the Activity Log wording ("outdoor 23.9°C > threshold…", sleep and comfort bands), the Settings tab and the comfort-range sensor attributes, the Target Temperature sensor, the pre-heat amount, suggestions and the AI reports. Records of thermostat changes you made are now stored in the right unit, so the "you usually raise it by about 1°C" suggestion is correct. Existing history recorded before this release is left as is; the 14-day override suggestion may briefly mix old and new records.
+- Fix #1048: arriving home while you have a manual change (even an unconfirmed one) or a door or window is open no longer forces the comfort temperature; the push says comfort will resume once it clears, and leaving home cancels an unconfirmed change and applies the setback.
+- Fix #1048: after a Home Assistant restart the Activity Log no longer fills with dozens of identical "all sensors closed" lines.
+- Fix #1048: a thermostat setpoint written seconds before bedtime no longer delays the sleep setpoint by up to 30 minutes.
+- Fix #1048: if a fan switch silently ignores Climate Advisor's "on" command, Climate Advisor now notices within about 10 minutes, releases the AC, retries once and then stops trying, instead of suppressing the AC indefinitely.
+- Internal (#1048): shared helpers replace several copies of the display conversion, offline-sensor rule, open-window rule, override-confirm decision and background notify/reminder logic. No change to what you see.
+
 ## [0.7.93] — 2026-10-10
 
 - Fix #1048 (part 1 of 2, #1049): Climate Advisor now switches your thermostat to Heat or Cool itself before asking for a temperature. Before, on thermostats such as Sensi and ecobee that ignore the mode sent along with a temperature, the thermostat could stay Off for days while the Activity Log said "heat applied". If the thermostat still doesn't follow, you now get one warning in the Activity Log and a line on the Status tab (and a note when it recovers), and failed commands are reported once with the reason. A thermostat coming back from offline is no longer mistaken for you turning it off. Note: a deliberate "Off" is no longer permanent — on mild days Climate Advisor turns it back on at the next cycle, and on other days after the one-hour hands-off period.
