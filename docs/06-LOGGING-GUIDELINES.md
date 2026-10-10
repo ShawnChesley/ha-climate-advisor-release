@@ -7,9 +7,9 @@ Standards for log statements across all Climate Advisor modules.
 ## Anchors
 | Question | Short answer | → Full answer |
 |---|---|---|
-| What formatting rules apply to all log messages? | Use %-style formatting (never f-strings), em dash `—` to separate event from detail context, past tense for completed actions, and always include units (°F, seconds, minutes). | [§Format Rules](06-LOGGING-GUIDELINES.md#format-rules) |
+| What formatting rules apply to all log messages? | Use %-style formatting (never f-strings), em dash `—` to separate event from detail context, past tense for completed actions, and always include units (°F, seconds, minutes). Logger lines carry internal °F; occupant-facing *reason strings* follow the user's `temp_unit` (Issue #1050). | [§Format Rules](06-LOGGING-GUIDELINES.md#format-rules) |
 | What log level should a thermostat mode/setpoint change use, and what must the message include? | `INFO` for a successful write (Issue #585 — routine operation, not a malfunction), via the `_set_hvac_mode` / `_set_temperature` primitives which emit a single consolidated line with a mandatory `reason` keyword argument and `role` field. No call site may omit the reason. The same primitives log at `INFO` when a guard defers/redirects the write for a routine, expected, system-managed reason (e.g. WHF owns the thermostat), and at `WARNING` when a guard clamps/overrides a *value* the caller asked for, or leaves HVAC in a state the caller didn't intend (Issue #874 narrows the #585 rule — see below). | [§Thermostat Adjustment Logging](06-LOGGING-GUIDELINES.md#thermostat-adjustment-logging) |
-| What is the reason string convention for thermostat adjustment log messages? | `trigger — context` pattern using em dash: e.g., `"daily classification — hot day, trend warming 8°F"` or `"bedtime — heat setback (comfort 70 - 4 + modifier 2)"`. | [§Reason string convention](06-LOGGING-GUIDELINES.md#reason-string-convention) |
+| What is the reason string convention for thermostat adjustment log messages? | `trigger — context` pattern using em dash: e.g., `"daily classification — hot day, trend warming 8°F"` or `"bedtime — heat setback (comfort 70 - 4 + modifier 2)"`; temperatures inside the reason are rendered in the user's unit (°C for a Celsius home) via the engine's `_t()` / `_td()` helpers. | [§Reason string convention](06-LOGGING-GUIDELINES.md#reason-string-convention) |
 | How are skipped actions logged when automation is disabled (observe-only mode)? | With a `[DRY RUN]` prefix at INFO level, e.g., `"[DRY RUN] Would set HVAC mode to cool — daily classification — hot day"`. Easily grep'd to distinguish from real actions. | [§Dry-run prefix convention](06-LOGGING-GUIDELINES.md#dry-run-prefix-convention) |
 | What distinguishes DEBUG from INFO level? | DEBUG: high-frequency or transient events (threshold calculations, debounce timers, per-classification details). INFO: lifecycle milestones and meaningful state transitions (HVAC mode changes, briefings sent, records saved). | [§Level Semantics](06-LOGGING-GUIDELINES.md#level-semantics) |
 
@@ -31,6 +31,7 @@ The logger name automatically carries module identity (`custom_components.climat
 - Use an **em dash** (`—`) to separate the event from its detail context
 - Use **past tense** for completed actions ("Recorded day", "Loaded state")
 - Include **units** wherever quantities appear: `°F`, `seconds`, `minutes`, `chars`
+- **Logger lines stay in internal °F; reason strings use the user's unit (Issue #1050).** A string passed as the `reason` of a thermostat adjustment or event (the text the Activity Log and push notifications show the occupant) must format temperatures with `AutomationEngine._t()` / `_td()` (`format_temp` / `format_temp_delta`, `decimals=1`), never a hard-coded `°F` literal. A `_LOGGER` call that is not part of a reason keeps the raw °F value and the `°F` label so logs stay comparable across installs. Do not alter the substrings other code matches on (`airflow reversed`, `cooled to floor`, `free cooling gone`, `manual override to`, `sleep band [`, `comfort band [`, `> threshold`, ...) -- see [temperature-conversion.md](temperature-conversion.md#display-sites-and-reason-strings-issue-1050-part-of-1048).
 
 ## Level Semantics
 
@@ -66,7 +67,7 @@ WARNING  Pre-cool target 62.0°F below floor 64.0°F (sleep_heat=62.0 + hysteres
 
 ### Reason string convention
 
-Reasons follow a **trigger — context** pattern using the em dash separator:
+Reasons follow a **trigger — context** pattern using the em dash separator. The examples in this guide show a Fahrenheit home; for a Celsius home the same reasons render the temperatures in °C (Issue #1050):
 
 | Trigger | Context format |
 |---------|---------------|
