@@ -360,7 +360,7 @@ class TestApplyComfortBandDual:
         Issue #301: dual-setpoint (heat_cool) path removed. Even for a heat_cool-capable
         thermostat, CA sends a single cool command to avoid Ecobee comfort-program reassertion.
         """
-        eng = _make_apply_engine(hvac_modes=_DUAL_MODES, supported_features=_DUAL_FEATURES, current_mode="off")
+        eng = _make_apply_engine(hvac_modes=_DUAL_MODES, supported_features=_DUAL_FEATURES, current_mode="cool")
         band = ComfortBand(floor=60.0, ceiling=74.0, active="ceiling", reason="test")
         asyncio.run(eng._apply_comfort_band(band, reason="test warm"))
 
@@ -383,7 +383,7 @@ class TestApplyComfortBandDual:
 
         Issue #301: floor defense uses heat mode + single temperature, not heat_cool dual setpoints.
         """
-        eng = _make_apply_engine(hvac_modes=_DUAL_MODES, supported_features=_DUAL_FEATURES, current_mode="off")
+        eng = _make_apply_engine(hvac_modes=_DUAL_MODES, supported_features=_DUAL_FEATURES, current_mode="heat")
         band = ComfortBand(floor=70.0, ceiling=80.0, active="floor", reason="test")
         asyncio.run(eng._apply_comfort_band(band, reason="test cold"))
 
@@ -410,7 +410,9 @@ class TestApplyComfortBandDual:
         asyncio.run(eng._apply_comfort_band(band, reason="test single-setpoint"))
 
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0
+        # Issue #1048: heat_cool is a real mode != cool, so CA now switches explicitly first
+        # (Sensi/ecobee ignore the hvac_mode kwarg), then sends the single cool setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]
 
         temp = _temp_calls(eng)
         assert len(temp) == 1
@@ -445,7 +447,7 @@ class TestApplyComfortBandCoolOnly:
 
         Issue #301: single call with hvac_mode embedded. No separate set_hvac_mode.
         """
-        eng = _make_apply_engine(hvac_modes=_COOL_MODES, supported_features=_COOL_FEATURES, current_mode="off")
+        eng = _make_apply_engine(hvac_modes=_COOL_MODES, supported_features=_COOL_FEATURES, current_mode="cool")
         band = ComfortBand(floor=60.0, ceiling=74.0, active="ceiling", reason="test")
         asyncio.run(eng._apply_comfort_band(band, reason="test cool"))
 
@@ -492,7 +494,7 @@ class TestApplyComfortBandHeatOnly:
 
         Issue #301: single call with hvac_mode embedded. No separate set_hvac_mode.
         """
-        eng = _make_apply_engine(hvac_modes=_HEAT_MODES, supported_features=_HEAT_FEATURES, current_mode="off")
+        eng = _make_apply_engine(hvac_modes=_HEAT_MODES, supported_features=_HEAT_FEATURES, current_mode="heat")
         band = ComfortBand(floor=70.0, ceiling=80.0, active="floor", reason="test")
         asyncio.run(eng._apply_comfort_band(band, reason="test heat"))
 

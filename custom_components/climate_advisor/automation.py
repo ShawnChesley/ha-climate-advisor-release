@@ -124,9 +124,11 @@ from .const import (
     VACATION_SETBACK_EXTRA,
 )
 from .desired_state import (
+    MODE_SWITCH_DEDUPE_SECONDS,
     FanCycleOutcome,
     ScheduledBandGate,
     SetpointRetryAction,
+    decide_explicit_mode_switch,
     decide_grace_start,
     decide_override_confirm,
     decide_revisit,
@@ -790,6 +792,12 @@ class AutomationEngine:
     _write_seq: int = 0
     _hvac_cmd_fail_announced: str | None = None
     _hvac_cmd_fail_since: datetime | None = None
+    # Issue #1049 change 1: (mode, when) of the last mode command that went out successfully;
+    # dedupes the explicit set_hvac_mode that would otherwise follow in the same cycle.
+    _mode_switch_marker: tuple[str, datetime] | None = None
+    _manual_override_active: bool = False
+    _override_confirm_pending: bool = False
+    _last_mode_switch_result: HvacCommandResult | None = None
 
     def __init__(
         self,
@@ -3421,8 +3429,10 @@ class AutomationEngine:
             )
             self._restamp_climate_command_times(temp=False)
             if _call.outcome is ClimateCallOutcome.REJECTED:
+                self._mode_switch_marker = None
                 return HvacCommandResult.FAILED
             if _call.outcome is ClimateCallOutcome.FAILED:
+                self._mode_switch_marker = None
                 # Issue #805: this is the single write point for hvac_mode (Fix 1b) -- an
                 # invalid/removed climate_entity must not raise uncaught here (it would abort
                 # the whole coordinator update cycle). The entity-health sweep tells the user
@@ -3432,6 +3442,7 @@ class AutomationEngine:
                 return HvacCommandResult.FAILED
             if _call.outcome is ClimateCallOutcome.OK:
                 self._note_hvac_command_ok(mode)
+            self._mode_switch_marker = (mode, dt_util.now())
             _LOGGER.info("Set HVAC mode to %s — %s role=%s", mode, reason, self.role)
             self._record_action(f"Set HVAC to {mode}", reason)
             # When taking HVAC offline, assert fan_mode=auto to clear any post-heat
@@ -3470,6 +3481,80 @@ class AutomationEngine:
         finally:
             self._hvac_command_pending = False
         return HvacCommandResult.EXECUTED if _call.ok else HvacCommandResult.UNCONFIRMED
+
+    def _mode_switch_marker_recent(self, mode: str) -> bool:
+        """True when a successful mode command to ``mode`` went out within the dedupe window."""
+        marker = self._mode_switch_marker
+        if marker is None or marker[0] != mode:
+            return False
+        try:
+            return (dt_util.now() - marker[1]).total_seconds() < MODE_SWITCH_DEDUPE_SECONDS
+        except TypeError:
+            return False
+
+    async def _ensure_hvac_mode_for_write(self, mode: str, my_seq: int) -> bool:
+        """Switch the thermostat to ``mode`` before a heat/cool setpoint write (Issue #1049).
+
+        Sensi/ecobee ignore the ``hvac_mode`` kwarg of ``climate.set_temperature`` (#1048), so a
+        write into the wrong mode leaves the thermostat Off/wrong while the log says "applied".
+        Returns True when the caller should go on to write the setpoint, False when it must
+        stop (mode command failed/rejected, or a newer write superseded this one while the mode
+        command was in flight). Adds no pause/override/window guard: it only makes the mode that
+        the write was already asking for actually take effect. Shared by ``_set_temperature``
+        and the nudge/retry path (which deliberately does not go through ``_set_temperature``).
+        """
+        state = self.hass.states.get(self.climate_entity)
+        live = getattr(state, "state", None) if state is not None else None
+        if not decide_explicit_mode_switch(
+            commanded_mode=mode,
+            live_state=live,
+            advertised_modes=self._get_thermostat_capabilities().modes,
+            recent_switch_to_mode=self._mode_switch_marker_recent(mode),
+        ):
+            return True
+        _LOGGER.info("Switching HVAC mode before setpoint write — %s -> %s entity=%s", live, mode, self.climate_entity)
+        # Stamp BEFORE the awaited call so the echo of our own mode change is never read as a
+        # manual change (same contract as _set_hvac_mode).
+        self._hvac_command_pending = True
+        self._last_commanded_hvac_mode = mode
+        self._restamp_climate_command_times()
+        try:
+            _call = await self._call_climate(
+                "set_hvac_mode",
+                {"entity_id": self.climate_entity, "hvac_mode": mode},
+                f"HVAC command failed — mode={mode} entity={self.climate_entity}",
+            )
+        finally:
+            self._hvac_command_pending = False
+        self._restamp_climate_command_times()
+        if _call.outcome is ClimateCallOutcome.FAILED:
+            self._mode_switch_marker = None
+            self._last_mode_switch_result = HvacCommandResult.FAILED
+            self._note_hvac_command_failed(mode, _call.error)
+            return False
+        if _call.outcome is ClimateCallOutcome.REJECTED:
+            self._mode_switch_marker = None
+            self._last_mode_switch_result = HvacCommandResult.FAILED
+            return False
+        if _call.outcome is ClimateCallOutcome.TIMEOUT:
+            # State unknown, not failed: re-read for the log and carry on; the read-back check
+            # (change 2) is the safety net if the thermostat never obeys.
+            _after = self.hass.states.get(self.climate_entity)
+            _LOGGER.warning(
+                "HVAC mode switch to %s unconfirmed — thermostat now reports %r; continuing with setpoint write",
+                mode,
+                getattr(_after, "state", None),
+            )
+            self._last_mode_switch_result = HvacCommandResult.UNCONFIRMED
+        else:
+            self._note_hvac_command_ok(mode)
+            self._last_mode_switch_result = HvacCommandResult.EXECUTED
+        self._mode_switch_marker = (mode, dt_util.now())
+        self._record_action(f"Set HVAC to {mode}", "mode switch before setpoint write")
+        if self._write_seq != my_seq:
+            _LOGGER.info("Setpoint write superseded by a newer command during the mode switch — aborting")
+            return False
+        return True
 
     async def _set_temperature(
         self,
@@ -3569,6 +3654,10 @@ class AutomationEngine:
             # Single call: hvac_mode + temperature together.  Including hvac_mode in every
             # call bypasses HA deduplication (the mode key makes each call distinct) and
             # ensures the thermostat is always in the correct mode.
+            # Issue #1049 change 1: make the mode real first (Sensi/ecobee ignore the hvac_mode
+            # kwarg below). _my_seq was captured above, before this await.
+            if not await self._ensure_hvac_mode_for_write(mode, _my_seq):
+                return
             # Issue #1049: awaited via _call_climate (blocking, non-cancelling wait) so a
             # rejection is visible instead of swallowed by a non-blocking call.
             _call = await self._call_climate(
@@ -3663,6 +3752,11 @@ class AutomationEngine:
                     )
                     if _action is SetpointRetryAction.SUPERSEDED:
                         return  # newer command superseded; skip retry
+                    if self._manual_override_active or self._override_confirm_pending:
+                        # Issue #1049 (in-phase investigation i): a user took manual control
+                        # after the rejected write -- never re-assert CA's setpoint over it.
+                        _LOGGER.info("Setpoint retry skipped -- manual override active/pending")
+                        return
                     if _action is SetpointRetryAction.NUDGE_THEN_TARGET:
                         _nudge_temp_f = _retry_temp + 1.0 if _retry_mode == "cool" else _retry_temp - 1.0
                         _nudge_temp = from_fahrenheit(_nudge_temp_f, unit)
@@ -3685,6 +3779,8 @@ class AutomationEngine:
                                     "reject_streak": self._setpoint_reject_streak,
                                 },
                             )
+                        if not await self._ensure_hvac_mode_for_write(_retry_mode, _retry_seq):
+                            return
                         self._restamp_climate_command_times()
                         _nudge_call = await self._call_climate(
                             "set_temperature",
@@ -3707,6 +3803,9 @@ class AutomationEngine:
                                 current_write_seq=self._write_seq, target_write_seq=_retry_seq
                             ):
                                 return  # newer command superseded; skip
+                            if self._manual_override_active or self._override_confirm_pending:
+                                _LOGGER.info("Real-target send after nudge skipped -- manual override active/pending")
+                                return
                             _LOGGER.info(
                                 "Sending real target after nudge: %.1f %s",
                                 _retry_temp,

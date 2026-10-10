@@ -223,7 +223,7 @@ class TestWarmDayBandArming:
         Issue #301: dual-setpoint (heat_cool) path removed. CA sends a single cool command
         to avoid Ecobee comfort-program reassertion. No separate set_hvac_mode call.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
         c = _make_classification(day_type="warm", hvac_mode="off")
         asyncio.run(engine.apply_classification(c))
 
@@ -262,7 +262,7 @@ class TestWarmDayBandArming:
 
         The single call always includes hvac_mode so HA deduplication is bypassed.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="heat_cool")
+        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
         c = _make_classification(day_type="warm", hvac_mode="off")
         asyncio.run(engine.apply_classification(c))
 
@@ -281,7 +281,7 @@ class TestWarmDayBandArming:
 
         Issue #301: same single-call pattern regardless of day type.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
         c = _make_classification(day_type="hot", hvac_mode="cool")
         asyncio.run(engine.apply_classification(c))
 
@@ -321,7 +321,7 @@ class TestWarmDayBandArming:
         """
         engine = _make_engine(
             comfort_heat=70.0,
-            current_mode="off",
+            current_mode="cool",
             hvac_modes=["off", "cool"],
             supported_features=1,
         )

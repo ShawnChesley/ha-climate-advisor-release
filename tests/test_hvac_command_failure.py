@@ -127,6 +127,9 @@ class TestSetTemperatureCommandFailure:
 
     def test_service_call_exception_is_caught_not_raised(self, caplog):
         engine = _make_automation_engine()
+        # Already in the commanded mode: no explicit mode switch (Issue #1048), so the
+        # failing call is the set_temperature itself.
+        engine.hass.states.get.return_value.state = "cool"
         engine.hass.services.async_call.side_effect = Exception("Entity climate.thermostat not found")
 
         with caplog.at_level(logging.ERROR, logger=AUTOMATION_LOGGER):

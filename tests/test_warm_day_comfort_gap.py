@@ -149,7 +149,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
         the heater fires naturally if indoor drops below it.
         Issue #301: single call with hvac_mode='cool' (ceiling-active warm day).
         """
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="cool")
         c = _make_warm_off_classification()
         asyncio.run(engine.apply_classification(c))
 
@@ -169,7 +169,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
         with hvac_mode='cool'. The thermostat's own floor setpoint (comfort_heat) provides
         the safety backstop implicitly.
         """
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="cool")
         c = _make_warm_off_classification()
         asyncio.run(engine.apply_classification(c))
 
@@ -189,7 +189,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         Issue #301: single set_temperature call with hvac_mode='cool'.
         """
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=70.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=70.0, current_mode="cool")
         c = _make_warm_off_classification()
         asyncio.run(engine.apply_classification(c))
 
@@ -206,7 +206,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         Issue #301: single set_temperature call with hvac_mode='cool'.
         """
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=72.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=72.0, current_mode="cool")
         c = _make_warm_off_classification()
         asyncio.run(engine.apply_classification(c))
 
@@ -223,10 +223,10 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         Issue #301: single set_temperature call with hvac_mode='cool'.
         """
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=72.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=72.0, current_mode="cool")
         # Override states.get to return state without indoor temp
         climate_state = MagicMock()
-        climate_state.state = "off"
+        climate_state.state = "cool"
         climate_state.attributes = {
             "hvac_modes": ["off", "heat", "cool", "heat_cool"],
             "supported_features": CLIMATE_FEATURE_TARGET_TEMP_RANGE,
@@ -247,7 +247,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
     def test_no_warm_day_comfort_gap_event(self):
         """warm_day_comfort_gap event no longer exists in P3; replaced by comfort_band_applied."""
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="cool")
         events: list[tuple[str, dict]] = []
         engine._emit_event_callback = lambda name, data: events.append((name, data))
 
@@ -261,7 +261,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
     def test_guard_applies_to_any_off_day_type(self):
         """Any day_type with hvac_mode='off' (mild, warm) arms the ceiling band (Issue #301)."""
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=65.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=65.0, current_mode="cool")
         c = _make_warm_off_classification(day_type="mild")
         asyncio.run(engine.apply_classification(c))
 
@@ -275,7 +275,7 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
     def test_no_log_about_deferred_off(self, caplog):
         """'Warm-day off deferred' log no longer exists in P3 — band armed instead."""
-        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="off")
+        engine = _make_engine(comfort_heat=70.0, indoor_temp=68.0, current_mode="cool")
         c = _make_warm_off_classification()
 
         with caplog.at_level(logging.WARNING, logger=AUTOMATION_LOGGER):
@@ -320,7 +320,7 @@ def _make_ceiling_guard_engine(config_overrides: dict | None = None) -> Automati
     """Engine for ceiling-guard tests: dual-capable + outdoor temp attribute."""
     return _make_engine(
         indoor_temp=73.0,
-        current_mode="off",
+        current_mode="cool",
         config_overrides=config_overrides,
     )
 
@@ -340,7 +340,7 @@ def _make_cg_engine(comfort_cool: float = 74.0, indoor_temp: float = 73.0) -> Au
     return _make_engine(
         config_overrides={"comfort_cool": comfort_cool},
         indoor_temp=indoor_temp,
-        current_mode="off",
+        current_mode="cool",
     )
 
 
@@ -444,7 +444,7 @@ class TestCeilingGuardWholeHouseFanNeverEscalates:
         return _make_engine(
             config_overrides={"comfort_cool": comfort_cool, CONF_FAN_MODE: FAN_MODE_WHOLE_HOUSE},
             indoor_temp=indoor_temp,
-            current_mode="off",
+            current_mode="cool",
         )
 
     def test_never_escalates_even_when_natural_vent_inactive_and_breach_imminent(self):
@@ -600,7 +600,7 @@ class TestCeilingGuardSkips:
         engine = _make_engine(
             config_overrides={"comfort_cool": 74.0, "aggressive_savings": True},
             indoor_temp=75.0,  # within 74 + 2°F savings margin
-            current_mode="off",
+            current_mode="cool",
         )
         engine._last_outdoor_temp = 70.0
         engine._natural_vent_active = True
