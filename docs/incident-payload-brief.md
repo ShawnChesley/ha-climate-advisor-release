@@ -32,9 +32,15 @@
 ## Interfaces
 
 ```python
-def build_incident_payload(incident_class: str, incident_id: str, *, comfort_heat: float | None,
-                           comfort_cool: float | None, occupancy_mode: str | None = None,
-                           extra: dict[str, Any] | None = None) -> dict[str, Any]: ...
+def build_incident_payload(
+    incident_class: str,
+    incident_id: str,
+    *,
+    comfort_heat: float | None,
+    comfort_cool: float | None,
+    occupancy_mode: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]: ...
 def is_climate_validation_error(err: BaseException) -> bool: ...
 ```
 
