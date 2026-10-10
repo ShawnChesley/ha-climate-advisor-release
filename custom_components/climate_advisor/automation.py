@@ -130,12 +130,14 @@ from .desired_state import (
     SetpointRetryAction,
     decide_explicit_mode_switch,
     decide_grace_start,
+    decide_open_sensor_hold,
     decide_override_confirm,
     decide_revisit,
     decide_scheduled_band_gate,
     decide_scheduled_write_seq_current,
     decide_setpoint_retry_action,
 )
+from .override_confirm_split import OverrideConfirmPathOutcome, decide_override_confirm_path
 
 if TYPE_CHECKING:
     from .classification_fsm import ClassificationDecision
@@ -1460,8 +1462,12 @@ class AutomationEngine:
         self._is_recent_fan_command_callback = callbacks.is_recent_fan_command
         self._reclassify_callback = callbacks.reclassify
 
-    async def _notify(self, message: str, title: str, notification_type: str) -> None:
-        """Send a notification via configured channels, filtered by per-event preferences."""
+    async def _notify(self, message: str, title: str, notification_type: str, *, email: bool = True) -> None:
+        """Send a notification via configured channels, filtered by per-event preferences.
+
+        ``email=False`` suppresses the email channel for this call (push still follows its
+        per-event preference); the default keeps today's push + email behavior.
+        """
         if self.dry_run:
             _LOGGER.info("[DRY RUN] Would send notification: %s — %s role=%s", title, message, self.role)
             return
@@ -1471,7 +1477,7 @@ class AutomationEngine:
         if self.config.get(push_key, True):
             await self.hass.services.async_call("notify", service_name, {"message": message, "title": title})
             _LOGGER.info("Notification sent: %s — %s role=%s", title, message, self.role)
-        if self.config.get(email_key, True):
+        if email and self.config.get(email_key, True):
             await self.hass.services.async_call("notify", "send_email", {"message": message, "title": title})
             _LOGGER.info("Email notification sent: %s — %s role=%s", title, message, self.role)
 
@@ -2600,8 +2606,15 @@ class AutomationEngine:
             cls_mode = self._current_classification.hvac_mode if self._current_classification else None
             # For setpoint overrides: mode may still match classification, but
             # the user deliberately moved the setpoint — always take PATH A.
-            _setpoint_override = source == "setpoint"
-            if _setpoint_override or (current_mode not in ("unavailable", "unknown") and current_mode != cls_mode):
+            # One definition of the PATH A/B split (override_confirm_split), shared with the FSM.
+            if (
+                decide_override_confirm_path(
+                    setpoint_override=source == "setpoint",
+                    current_mode=current_mode,
+                    classification_mode=cls_mode,
+                )
+                is OverrideConfirmPathOutcome.CONFIRM
+            ):
                 # PATH A: Still divergent (or deliberate setpoint override) — formally confirm
                 _LOGGER.info(
                     "Override confirmed after %d minutes (mode=%s, classification wants %s)",
@@ -3214,11 +3227,11 @@ class AutomationEngine:
         *not* own HVAC yet the window is still open.
         """
         self._last_comfort_band = band
-        if (
-            not self._natural_vent_active
-            and not self._whf_owns_hvac()
-            and not self._sensor_debounce_pending
-            and self._any_monitored_sensor_open()
+        if decide_open_sensor_hold(
+            natural_vent_active=self._natural_vent_active,
+            whf_owns_hvac=self._whf_owns_hvac(),
+            debounce_pending=self._sensor_debounce_pending,
+            any_sensor_open=self._any_monitored_sensor_open(),
         ):
             _LOGGER.warning(
                 "_apply_comfort_band: monitored door/window open — refusing to arm active mode "
@@ -4533,12 +4546,17 @@ class AutomationEngine:
         live: 2026-08-11 incident, a sensor open since bedtime with no fresh open event ever
         firing. Call this at the top of each of those four, before they build the gate's inputs.
         """
-        if self._paused_by_door or self._natural_vent_active or self._whf_owns_hvac():
-            return  # already paused, or nat-vent/WHF already legitimately owns this
+        if self._paused_by_door:
+            return  # already paused
         if self._is_within_planned_window_period():
             return  # windows intentionally open — same exception handle_door_window_open() honors
-        if self._sensor_debounce_pending or not self._any_monitored_sensor_open():
-            return  # not open, or only momentarily/transiently open — do not pause on a blip
+        if not decide_open_sensor_hold(
+            natural_vent_active=self._natural_vent_active,
+            whf_owns_hvac=self._whf_owns_hvac(),
+            debounce_pending=self._sensor_debounce_pending,
+            any_sensor_open=self._any_monitored_sensor_open(),
+        ):
+            return  # nat-vent/WHF owns this, or not open / only transiently open — do not pause on a blip
         await self._pause_for_door_window(
             entity_label="monitored door/window",
             reason="door/window still open at comfort-restore time",

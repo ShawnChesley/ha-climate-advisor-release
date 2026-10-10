@@ -162,6 +162,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from .desired_state import decide_open_sensor_hold
 from .door_window_close_response import (
     DoorCloseResponseInputs,
     DoorCloseResponseOutcome,
@@ -478,11 +479,14 @@ def _sync_reconcile_next_state(
     if current_state == DoorWindowLifecycleState.NORMAL and inputs.grace_active:
         return DoorWindowLifecycleState.GRACE
 
-    if inputs.natural_vent_active or inputs.whf_owns_hvac:
-        return current_state
     if inputs.within_planned_window:
         return current_state
-    if inputs.sensor_debounce_pending or not inputs.any_sensor_open:
+    if not decide_open_sensor_hold(
+        natural_vent_active=inputs.natural_vent_active,
+        whf_owns_hvac=inputs.whf_owns_hvac,
+        debounce_pending=inputs.sensor_debounce_pending,
+        any_sensor_open=inputs.any_sensor_open,
+    ):
         return current_state
 
     sub_state = _pause_sub_state(decide_pause_entry(PauseEntryInputs(hvac_mode=inputs.hvac_mode)))

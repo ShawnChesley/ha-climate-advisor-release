@@ -51,6 +51,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 
+from .const import UNAVAILABLE_STATES
+
 
 @dataclass(frozen=True)
 class ScheduledReevaluation:
@@ -446,7 +448,7 @@ def decide_scheduled_write_seq_current(*, current_write_seq: int, target_write_s
 MODE_SWITCH_DEDUPE_SECONDS = 120
 
 _EXPLICIT_SWITCH_MODES = frozenset({"heat", "cool"})
-_UNREADABLE_LIVE_STATES = frozenset({"unavailable", "unknown"})
+_UNREADABLE_LIVE_STATES = UNAVAILABLE_STATES
 
 
 def decide_explicit_mode_switch(
@@ -475,6 +477,28 @@ def decide_explicit_mode_switch(
     if live_state == commanded_mode:
         return False
     return not recent_switch_to_mode
+
+
+def decide_open_sensor_hold(
+    *,
+    natural_vent_active: bool,
+    whf_owns_hvac: bool,
+    debounce_pending: bool,
+    any_sensor_open: bool,
+) -> bool:
+    """True when a monitored door/window is genuinely open and nothing legitimately owns it.
+
+    Issue #1048 (Phase 2): the single definition of the open-window predicate that three
+    sites used to hand-write -- ``AutomationEngine._apply_comfort_band()``,
+    ``_sync_paused_by_door_with_live_sensors()`` and
+    ``door_window_fsm.derive_door_window_lifecycle_state()``'s pause-entry tail.
+
+    Held (True) only when a sensor is open, its open/close debounce has settled (a blip is
+    not an open window), and neither nat-vent nor a whole-house-fan session owns the
+    HVAC/window relationship (they legitimately run with windows open). Callers layer
+    their own extra conditions (planned-window period, already-paused, grace) on top.
+    """
+    return any_sensor_open and not debounce_pending and not natural_vent_active and not whf_owns_hvac
 
 
 _OCCUPANCY_AWAY = "away"  # mirrors const.OCCUPANCY_AWAY
