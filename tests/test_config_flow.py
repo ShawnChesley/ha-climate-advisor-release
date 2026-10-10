@@ -3260,6 +3260,7 @@ async def _coro(value):
     return value
 
 
+@pytest.mark.skipif(not HAS_VOLUPTUOUS, reason="voluptuous not installed (schema keys are stubbed)")
 class TestOptionsFlowCelsiusRoundTrip:
     """Issue #1049: re-saving options in a Celsius household showed 18.00000000004, failed with
     'too large', and the threshold sliders topped out at 18 / bottomed at -2 °C. Uses the real
