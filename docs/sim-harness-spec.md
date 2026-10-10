@@ -113,10 +113,12 @@ This spec does NOT cover:
 | Domain + service | Effect on FakeState |
 |---|---|
 | `climate.set_hvac_mode` | `state = data["hvac_mode"]` |
-| `climate.set_temperature` | `attributes["temperature"]`, `["target_temp_low"]`, `["target_temp_high"]` updated as present |
+| `climate.set_temperature` | `attributes["temperature"]`, `["target_temp_low"]`, `["target_temp_high"]` updated as present; `state = data["hvac_mode"]` **only for the default (obedient) entity** — see the `sensi_like` quirk below |
 | `climate.set_fan_mode` | `attributes["fan_mode"] = data["fan_mode"]` |
 | `fan.turn_on` / `switch.turn_on` | `state = "on"` |
 | `fan.turn_off` / `switch.turn_off` | `state = "off"` |
+
+**Opt-in `sensi_like` thermostat quirk (Issue #1048).** Real Sensi (and HA-core ecobee) thermostats ignore the `hvac_mode` kwarg of `climate.set_temperature`, and Sensi rejects `set_temperature` while the thermostat is Off. A scenario enables this with `"thermostat_quirk": "sensi_like"` in its `config` (unit tests call `fake_hass.set_entity_quirk(entity_id, QUIRK_SENSI_LIKE)`). For a quirked entity: `set_temperature` never changes the state string from `hvac_mode`; `set_temperature` while state is `"off"` is rejected — a non-blocking call swallows the error (as real HA does: logged, not raised) and leaves state unchanged, a `blocking=True` call raises `FakeHomeAssistantError`; `set_hvac_mode` works normally. Rejected calls still appear in `action_log`. Default entities are unchanged (they honour the kwarg). The engine-state snapshot exposes the thermostat's real mode as `engine_state._thermostat_hvac_mode` for `field_equals` assertions (`last_hvac_mode` reads `action_log` and so cannot see a silently ignored mode).
 
 Without this, production code that reads the thermostat back (e.g. `handle_occupancy_away` checking the actual HVAC mode before selecting setback_heat vs setback_cool) would see the stale initial state and diverge for the wrong reason — reproducing neither the real HA behavior nor the legacy `SimState` mutation pattern.
 
