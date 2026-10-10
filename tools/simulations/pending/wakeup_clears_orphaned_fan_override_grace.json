@@ -42,10 +42,10 @@
       "type": "external_fan_state_change",
       "entity": "fan.attic",
       "state": "off",
-      "note": "Establishes a prior 'off' state for the fan entity so the 05:55 change below is a real observed transition."
+      "note": "Establishes a prior 'off' state for the fan entity so the 05:58:30 change below is a real observed transition."
     },
     {
-      "time": "2026-07-14T05:55:00",
+      "time": "2026-07-14T05:58:30",
       "type": "external_fan_state_change",
       "entity": "fan.attic",
       "state": "on",
@@ -54,23 +54,25 @@
     {
       "time": "2026-07-14T06:00:00",
       "type": "wakeup",
-      "note": "Wake-up fires 5 minutes later — well within the 3600s grace window, so only an explicit cancel (not natural expiry) can clear it by this point."
+      "note": "Wake-up fires 90 seconds later — well within the 3600s grace window, so only an explicit cancel (not natural expiry) can clear it by this point."
     }
   ],
   "assertions": [
     {
       "at": "2026-07-14T06:00:00",
-      "expect": "field_equals",
-      "field": "engine_state._grace_active",
-      "value": false,
+      "expect": "event_emitted",
+      "event": "grace_cancelled",
+      "payload_subset": {
+        "trigger": "fan_manual_override"
+      },
       "track": "integration",
-      "reason": "Issue #874: handle_morning_wakeup() calls clear_manual_override() (clearing the override flags) and must now also cancel the grace period tied to that override in the same step — _grace_active must already be False immediately after wake-up, not still True awaiting the next coordinator cycle's _check_orphaned_grace() watchdog."
+      "reason": "Issue #874 (asserted on the grace_cancelled event, not the end-of-run _grace_active flag, because a later legitimate reconcile cycle can start a new grace): handle_morning_wakeup() calls clear_manual_override() (clearing the override flags) and must now also cancel the grace period tied to that override in the same step — _grace_active must already be False immediately after wake-up, not still True awaiting the next coordinator cycle's _check_orphaned_grace() watchdog."
     }
   ],
   "verdict": {
     "type": "positive",
     "summary": "Morning wake-up clears an orphaned fan-override grace period immediately, not on the next watchdog cycle (Issue #874)",
-    "observed_behavior": "external_fan_state_change (05:55, WHF on, override detected, grace started) → wakeup (06:00, clear_manual_override() + explicit grace cancel, _grace_active=False by the same timestamp)",
+    "observed_behavior": "external_fan_state_change (05:58:30, WHF on, override detected, grace started) → wakeup (06:00, clear_manual_override() + explicit grace cancel, _grace_active=False by the same timestamp)",
     "expected_behavior": "A grace period tied to an override that handle_morning_wakeup()/handle_bedtime() themselves just cleared must never outlive that clear, even briefly — the watchdog is a backstop for other paths, not a substitute for these two handlers doing their own cleanup."
   },
   "use_coordinator": true,

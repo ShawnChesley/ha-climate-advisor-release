@@ -1154,6 +1154,7 @@
           <div class="value">${data.automation_status || 'unknown'}</div>
           ${data.coordinator_healthy === false ? `<div class="value" style="color:var(--danger, #f44336)">⚠ Climate Advisor unavailable since ${data.stale_since ? new Date(data.stale_since).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : 'unknown'} — ${escapeHtml(data.last_error || 'unknown error')}</div>` : ''}
           ${(data.invariant_violations || []).map(v => `<div class="value" style="color:var(--danger, #f44336)">⚠ ${escapeHtml(v.detail)}</div>`).join('')}
+          ${(data.hvac_control_issues || []).map(v => `<div class="value" style="color:var(--danger, #f44336)">⚠ ${escapeHtml(v.detail)}</div>`).join('')}
           ${(data.entity_health_issues || []).map(i => `<div class="value" style="color:var(--danger, #f44336)">⚠ ${escapeHtml(i.friendly_name)} (${escapeHtml(i.entity_id)}) is ${escapeHtml(i.status)}</div>`).join('')}
           ${data.pause_suppressed_classification_text ? `<div class="value">${escapeHtml(data.pause_suppressed_classification_text)}</div>` : ''}
           ${data.nat_vent_active && data.nat_vent_off_threshold != null && data.nat_vent_on_threshold != null ? `
@@ -2649,8 +2650,8 @@
         <tr><td>Date</td><td>${plan.date}</td></tr>
         <tr><td>Expected Day Type</td><td>${plan.day_type}</td></tr>
         <tr><td>Expected HVAC</td><td>${plan.hvac_mode}</td></tr>
-        <tr><td>Expected High</td><td>${plan.expected_high}${unitSym}</td></tr>
-        <tr><td>Expected Low</td><td>${plan.expected_low}${unitSym}</td></tr>
+        <tr><td>Expected High</td><td>${plan.expected_high != null ? Number(plan.expected_high).toFixed(1) + unitSym : '—'}</td></tr>
+        <tr><td>Expected Low</td><td>${plan.expected_low != null ? Number(plan.expected_low).toFixed(1) + unitSym : '—'}</td></tr>
         <tr><td>Windows Rec.</td><td>${plan.windows_recommended ? 'Yes' : 'No'}</td></tr>
         <tr><td>Window Open</td><td>${plan.window_open_time || '\u2014'}</td></tr>
         <tr><td>Window Close</td><td>${plan.window_close_time || '\u2014'}</td></tr>

@@ -49,3 +49,70 @@ def decide_setpoint_verify(
     if abs(actual_temp - expected_temp) > _TOLERANCE_F:
         return SetpointVerifyOutcome.REASSERT
     return SetpointVerifyOutcome.WITHIN_TOLERANCE
+
+
+class ModeAlignmentOutcome(Enum):
+    """Outcomes of the read-back "did the thermostat take the requested mode?" check (Issue #1049).
+
+    A sibling of ``SetpointVerifyOutcome`` -- deliberately NOT extra members of it
+    (``tools/sim_harness/full_surface_integration.py`` maps every member of that enum).
+    The ``EXCLUDED_*`` members say *why* a check was not evaluated so the write record can
+    carry the reason without the shell re-deriving the exclusion order.
+    """
+
+    STALE = "stale"  # a newer write superseded this check
+    NOT_APPLICABLE = "not_applicable"  # no mode was ever requested
+    EXCLUDED_DRY_RUN = "excluded_dry_run"
+    EXCLUDED_OVERRIDE = "excluded_manual_override"  # user owns the thermostat (override / confirm pending)
+    EXCLUDED_WHF = "excluded_whf_owned"
+    EXCLUDED_PAUSED = "excluded_paused"  # off-by-design door/window pause, requested mode is not "off"
+    EXCLUDED_BUSY = "excluded_command_in_progress"  # a newer command is still in flight
+    UNREADABLE = "unreadable"  # thermostat unavailable/unknown/None -- cannot judge
+    ALIGNED = "aligned"
+    MISALIGNED = "misaligned"
+
+
+_UNREADABLE_MODE_STATES = frozenset({"", "unavailable", "unknown"})
+
+
+def decide_mode_alignment(
+    *,
+    current_write_seq: int,
+    check_write_seq: int,
+    requested_mode: str | None,
+    live_state: object,
+    manual_override_active: bool,
+    override_confirm_pending: bool,
+    paused_by_door: bool,
+    whf_owns_hvac: bool,
+    dry_run: bool,
+    command_in_progress: bool,
+) -> ModeAlignmentOutcome:
+    """Pure read-back decision: is the thermostat in the mode Climate Advisor last requested?
+
+    Sensi/ecobee ignore the ``hvac_mode`` kwarg of ``climate.set_temperature`` and Sensi reports
+    ``temperature: null`` while Off, so the setpoint verify alone cannot see a thermostat that
+    never switched on (Issue #1048). Order matters: staleness first, then "nothing requested",
+    then every reason the user/another subsystem owns the thermostat, then readability.
+    A door/window pause only excludes non-"off" requests -- an "off" request that the thermostat
+    ignores is exactly the Off-direction miss this check exists to catch.
+    """
+    if current_write_seq != check_write_seq:
+        return ModeAlignmentOutcome.STALE
+    if not requested_mode:
+        return ModeAlignmentOutcome.NOT_APPLICABLE
+    if dry_run:
+        return ModeAlignmentOutcome.EXCLUDED_DRY_RUN
+    if manual_override_active or override_confirm_pending:
+        return ModeAlignmentOutcome.EXCLUDED_OVERRIDE
+    if whf_owns_hvac:
+        return ModeAlignmentOutcome.EXCLUDED_WHF
+    if paused_by_door and requested_mode != "off":
+        return ModeAlignmentOutcome.EXCLUDED_PAUSED
+    if command_in_progress:
+        return ModeAlignmentOutcome.EXCLUDED_BUSY
+    if not isinstance(live_state, str) or live_state in _UNREADABLE_MODE_STATES:
+        return ModeAlignmentOutcome.UNREADABLE
+    if live_state == requested_mode:
+        return ModeAlignmentOutcome.ALIGNED
+    return ModeAlignmentOutcome.MISALIGNED

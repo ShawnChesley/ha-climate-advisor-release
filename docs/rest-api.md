@@ -13,6 +13,7 @@
 | How does api.py read coordinator state and why does it sometimes bypass the coordinator cache? | Primary reads use `coordinator.data.get(...)` with safe defaults. Live HVAC state is read via `hass.states.get(climate_entity_id)` to guarantee freshness past the 30-minute update cycle. | [Coordinator Access Pattern](#coordinator-access-pattern) |
 | What security guardrails prevent sensitive data from leaking through the config or AI status endpoints? | `ClimateAdvisorConfigView` applies the two-case redaction rule. `ClimateAdvisorAIStatusView` calls `status.pop("api_key", None)` before serialising. Unknown suggestion-accept keys are applied in-memory only and never persisted to the HA config entry. | [Security Notes](#security-notes) |
 | How does a caller know an `event_log`/`activity_record` response doesn't cover the full requested window? | Both endpoints return `is_truncated` (bool) and `oldest_available` (ISO timestamp or null) alongside their normal payload, computed by comparing the oldest stored event against the requested window's cutoff. | [Event Log Truncation Signal](#event-log-truncation-signal) |
+| What is `hvac_control_issues` in the status response? | A list of `{issue, detail}` entries (same shape as `invariant_violations`) present only while the thermostat is not following Climate Advisor: `mode_not_obeyed` (requested mode vs live mode, minutes) or `command_failing` (last attempted mode, minutes). Empty list when fine; Status-tab only (Issue #1049). | [Endpoints](#endpoints) |
 
 ## Scope
 
@@ -40,11 +41,11 @@ All 21 view classes set `requires_auth = True`. HA handles token validation befo
 
 | URL | Purpose | Key response fields |
 |---|---|---|
-| `/api/climate_advisor/status` | Current system snapshot | `day_type`, `trend_direction`, `trend_magnitude`, `hvac_mode`, `hvac_action`, `indoor_temp`, `outdoor_temp`, `unit`, `automation_status`, `occupancy_mode`, `fan_status`, `contact_status`, `manual_override_active`, `next_action`, `compliance_score` |
+| `/api/climate_advisor/status` | Current system snapshot | `day_type`, `trend_direction`, `trend_magnitude`, `hvac_mode`, `hvac_action`, `indoor_temp`, `outdoor_temp`, `unit`, `automation_status`, `occupancy_mode`, `fan_status`, `contact_status`, `manual_override_active`, `next_action`, `compliance_score`, `invariant_violations`, `hvac_control_issues` |
 | `/api/climate_advisor/briefing` | Today's daily briefing text | `briefing`, `briefing_sent_today`, `verbosity` |
 | `/api/climate_advisor/chart_data` | Temperature forecast chart data | Delegated to `coordinator.get_chart_data()`. Response includes `target_band` time-series array, `historical_setpoint`, and `predicted_setpoint` arrays (Issue #151, #160). |
 | `/api/climate_advisor/automation_state` | Full automation engine debug state | Delegated to `coordinator.get_debug_state()` |
-| `/api/climate_advisor/learning` | Learning engine summary | `today_record`, `yesterday_record`, `tomorrow_plan`, `suggestions`, `compliance`, `comfort_range_low`, `comfort_range_high`, `unit` |
+| `/api/climate_advisor/learning` | Learning engine summary | `today_record`, `yesterday_record`, `tomorrow_plan`, `suggestions`, `compliance`, `comfort_range_low`, `comfort_range_high`, `unit` **Units (Issue #1049):** `tomorrow_plan.expected_high` / `expected_low` are converted at this boundary into the configured `unit` (via `temperature.display_temp()`, on a copy; `coordinator.tomorrow_plan` stays internal °F), matching `comfort_range_*`; the frontend appends the unit symbol and does no conversion. |
 | `/api/climate_advisor/config` | Integration configuration | `settings` list of `{key, value, label, description, category}` — sensitive values redacted |
 | `/api/climate_advisor/ai_status` | AI client health and budget | `status` (api_key removed), `recent_requests` (last 10) |
 | `/api/climate_advisor/investigation_reports` | AI investigator report history | Direct return from `coordinator.get_investigation_report_history()` |

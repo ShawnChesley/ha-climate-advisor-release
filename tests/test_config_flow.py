@@ -3258,3 +3258,103 @@ class TestUnitStepDefault:
 
 async def _coro(value):
     return value
+
+
+@pytest.mark.skipif(not HAS_VOLUPTUOUS, reason="voluptuous not installed (schema keys are stubbed)")
+class TestOptionsFlowCelsiusRoundTrip:
+    """Issue #1049: re-saving options in a Celsius household showed 18.00000000004, failed with
+    'too large', and the threshold sliders topped out at 18 / bottomed at -2 °C. Uses the real
+    step handlers; the slider bounds/defaults are read from the recorded NumberSelectorConfig
+    calls and the schema keys' defaults."""
+
+    SETPOINT_KEYS = ("comfort_heat", "comfort_cool", "setback_heat", "setback_cool", "sleep_heat", "sleep_cool")
+    THRESHOLD_KEYS = ("threshold_hot", "threshold_warm", "threshold_mild", "threshold_cool")
+
+    @staticmethod
+    def _form(step: str, entry_data: dict):
+        from custom_components.climate_advisor import config_flow
+
+        flow, _captured = _make_options_flow(entry_data)
+        config_flow.selector.NumberSelectorConfig.reset_mock()
+        result = asyncio.run(getattr(flow, step)(None))
+        bounds = [(c.kwargs["min"], c.kwargs["max"]) for c in config_flow.selector.NumberSelectorConfig.call_args_list]
+        defaults = {str(k): k.default() for k in result["data_schema"].schema}
+        return defaults, bounds
+
+    def _assert_defaults_in_bounds(self, defaults, bounds, keys):
+        for key, (mn, mx) in zip(keys, bounds, strict=True):
+            assert mn <= defaults[key] <= mx, f"{key}: {defaults[key]} outside [{mn}, {mx}]"
+
+    def test_setpoints_noise_value_is_within_slider_bounds(self):
+        # to_fahrenheit(18.0) = 64.4 -> from_fahrenheit = 18.000000000000004 (> max before the fix)
+        entry = {**FULL_CONFIG, "temp_unit": "celsius", "setback_heat": 64.4, "comfort_heat": 64.4 + 1}
+        defaults, bounds = self._form("async_step_setpoints", entry)
+        self._assert_defaults_in_bounds(defaults, bounds, self.SETPOINT_KEYS)
+        assert defaults["setback_heat"] == 18.0
+
+    def test_thresholds_defaults_in_bounds_for_celsius_default_thresholds(self):
+        # DEFAULT_THRESHOLD_COOL = 45F = 7.2C is fine; 65F-capable range must include 18.33C
+        entry = {**FULL_CONFIG, "temp_unit": "celsius", "threshold_cool": 65, "threshold_hot": 110}
+        defaults, bounds = self._form("async_step_classification_thresholds", entry)
+        self._assert_defaults_in_bounds(defaults, bounds, self.THRESHOLD_KEYS)
+
+    def test_threshold_f_bounds_reachable_in_celsius(self):
+        from custom_components.climate_advisor.config_flow import threshold_slider_ranges
+        from custom_components.climate_advisor.temperature import CELSIUS, from_fahrenheit
+
+        f = threshold_slider_ranges(False)
+        c = threshold_slider_ranges(True)
+        for key, (fmin, fmax, _s) in f.items():
+            assert c[key][0] <= from_fahrenheit(fmin, CELSIUS)
+            assert c[key][1] >= from_fahrenheit(fmax, CELSIUS)
+
+    def test_setpoint_f_bounds_reachable_in_celsius(self):
+        from custom_components.climate_advisor.config_flow import setpoint_slider_ranges
+        from custom_components.climate_advisor.temperature import CELSIUS, from_fahrenheit
+
+        f = setpoint_slider_ranges(False)
+        c = setpoint_slider_ranges(True)
+        for key, (fmin, fmax, _d, _s) in f.items():
+            assert c[key][0] <= from_fahrenheit(fmin, CELSIUS)
+            assert c[key][1] >= from_fahrenheit(fmax, CELSIUS)
+
+    def test_celsius_round_trip_keeps_stored_fahrenheit(self):
+        from custom_components.climate_advisor.temperature import CELSIUS, to_fahrenheit
+
+        entry = {
+            **FULL_CONFIG,
+            "temp_unit": "celsius",
+            "comfort_heat": 68,
+            "comfort_cool": 75.2,
+            "setback_heat": 64.4,
+            "setback_cool": 80.6,
+            "sleep_heat": 60.8,
+            "sleep_cool": 71.6,
+            "threshold_hot": 95,
+            "threshold_warm": 80.6,
+            "threshold_mild": 71.6,
+            "threshold_cool": 64.4,
+        }
+        for step, keys in (
+            ("async_step_setpoints", self.SETPOINT_KEYS),
+            ("async_step_classification_thresholds", self.THRESHOLD_KEYS),
+        ):
+            defaults, _bounds = self._form(step, entry)
+            data = _run_options_flow(entry, [(step, dict(defaults))])
+            for key in keys:
+                assert data[key] == pytest.approx(entry[key], abs=0.01), key
+                assert data[key] == pytest.approx(to_fahrenheit(defaults[key], CELSIUS))
+
+    def test_fahrenheit_unchanged(self):
+        entry = {**FULL_CONFIG, "temp_unit": "fahrenheit", "setback_heat": 63, "sleep_heat": 64, "sleep_cool": 72}
+        defaults, bounds = self._form("async_step_setpoints", entry)
+        assert defaults["setback_heat"] == 63
+        assert defaults["comfort_heat"] == 70
+        self._assert_defaults_in_bounds(defaults, bounds, self.SETPOINT_KEYS)
+
+    def test_display_default_only_clamps_within_epsilon(self):
+        from custom_components.climate_advisor.config_flow import _display_default
+
+        assert _display_default(64.4, True, 7, 18) == 18  # fp noise snapped to max
+        assert _display_default(66.0, True, 7, 18) == pytest.approx(18.8889, abs=1e-4)  # genuine overshoot kept
+        assert _display_default(70, False, 55, 80) == 70

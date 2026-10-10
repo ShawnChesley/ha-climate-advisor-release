@@ -19,6 +19,20 @@ from datetime import datetime
 from typing import Any
 
 
+class FakeHomeAssistantError(Exception):
+    """Stand-in for ``homeassistant.exceptions.HomeAssistantError`` (Issue #1048).
+
+    Raised by ``_FakeServices.async_call`` only for a ``blocking=True`` call that an
+    opt-in entity quirk rejects. Production catches ``Exception``, so the class
+    identity does not matter; it exists so tests can assert on a distinct type.
+    """
+
+
+# Opt-in per-entity thermostat quirks (Issue #1048). Default entities obey every
+# kwarg exactly as before; only entities explicitly marked here deviate.
+QUIRK_SENSI_LIKE = "sensi_like"
+
+
 @dataclass
 class FakeState:
     """Minimal state object returned by FakeHass.states.get()."""
@@ -110,6 +124,25 @@ class _FakeServices:
         self._clock_fn = clock_fn  # callable → current sim datetime
         self._states = states
         self._handlers: dict[tuple[str, str], Any] = {}
+        # Issue #1048: entity_id -> set of quirk names (opt-in; empty by default).
+        self._quirks: dict[str, set[str]] = {}
+
+    def set_entity_quirk(self, entity_id: str, quirk: str) -> None:
+        """Mark ``entity_id`` with an opt-in behavioural quirk (Issue #1048).
+
+        ``QUIRK_SENSI_LIKE`` models Sensi (and HA-core ecobee) thermostats:
+        ``climate.set_temperature`` IGNORES the ``hvac_mode`` kwarg, and
+        ``climate.set_temperature`` while the entity state is ``"off"`` is rejected
+        (HomeAssistantError). A non-blocking call swallows the rejection (real HA
+        logs and drops it) and leaves state unchanged; a ``blocking=True`` call
+        raises ``FakeHomeAssistantError``. ``climate.set_hvac_mode`` works normally.
+        """
+        self._quirks.setdefault(entity_id, set()).add(quirk)
+
+    def has_quirk(self, entity_id: Any, quirk: str) -> bool:
+        if isinstance(entity_id, list):
+            entity_id = entity_id[0] if entity_id else None
+        return bool(entity_id) and quirk in self._quirks.get(entity_id, ())
 
     def async_register(self, domain: str, service: str, handler: Any, schema: Any = None) -> None:
         """Register (or overwrite) a service handler — mirrors real HA's global namespace."""
@@ -190,6 +223,20 @@ class _FakeServices:
             result = handler(call)
             if inspect.iscoroutine(result):
                 await result
+        if (
+            domain == "climate"
+            and service == "set_temperature"
+            and self.has_quirk(data.get("entity_id"), QUIRK_SENSI_LIKE)
+        ):
+            existing = self._states.get(
+                data["entity_id"] if isinstance(data["entity_id"], str) else data["entity_id"][0]
+            )
+            if existing is not None and existing.state == "off":
+                if blocking:
+                    raise FakeHomeAssistantError(
+                        "Cannot set temperature while the thermostat is off (sensi_like quirk)"
+                    )
+                return  # non-blocking: HA logs and swallows; state unchanged
         self._apply_state_feedback(domain, service, data, context=context)
 
     def _apply_state_feedback(self, domain: str, service: str, data: dict, context: Any = None) -> None:
@@ -222,7 +269,7 @@ class _FakeServices:
             if service == "set_hvac_mode" and "hvac_mode" in data:
                 state_str = data["hvac_mode"]
             elif service == "set_temperature":
-                if "hvac_mode" in data:
+                if "hvac_mode" in data and not self.has_quirk(entity_id, QUIRK_SENSI_LIKE):
                     state_str = data["hvac_mode"]
                 if "temperature" in data:
                     attrs["temperature"] = data["temperature"]
@@ -497,6 +544,10 @@ class FakeHass:
     # ------------------------------------------------------------------
     # Scheduler linkage
     # ------------------------------------------------------------------
+
+    def set_entity_quirk(self, entity_id: str, quirk: str) -> None:
+        """Opt an entity into a thermostat quirk, e.g. ``QUIRK_SENSI_LIKE`` (Issue #1048)."""
+        self.services.set_entity_quirk(entity_id, quirk)
 
     def set_scheduler(self, scheduler: Any) -> None:
         """Wire in the FakeScheduler so async_create_task coroutines are driven."""

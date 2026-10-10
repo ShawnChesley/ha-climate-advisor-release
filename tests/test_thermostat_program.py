@@ -366,7 +366,7 @@ class TestApplyComfortBandDual:
 
         # No separate set_hvac_mode call
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(eng)
         # Single call (Issue #301): one set_temperature call with hvac_mode + temperature
@@ -388,7 +388,7 @@ class TestApplyComfortBandDual:
         asyncio.run(eng._apply_comfort_band(band, reason="test cold"))
 
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["heat"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(eng)
         # Single call (Issue #301)
@@ -410,7 +410,9 @@ class TestApplyComfortBandDual:
         asyncio.run(eng._apply_comfort_band(band, reason="test single-setpoint"))
 
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0
+        # Issue #1048: heat_cool is a real mode != cool, so CA now switches explicitly first
+        # (Sensi/ecobee ignore the hvac_mode kwarg), then sends the single cool setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]
 
         temp = _temp_calls(eng)
         assert len(temp) == 1
@@ -450,7 +452,7 @@ class TestApplyComfortBandCoolOnly:
         asyncio.run(eng._apply_comfort_band(band, reason="test cool"))
 
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0  # no separate set_hvac_mode call
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(eng)
         # Single call (Issue #301)
@@ -497,7 +499,7 @@ class TestApplyComfortBandHeatOnly:
         asyncio.run(eng._apply_comfort_band(band, reason="test heat"))
 
         hvac = _hvac_calls(eng)
-        assert len(hvac) == 0  # no separate set_hvac_mode call
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["heat"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(eng)
         # Single call (Issue #301)

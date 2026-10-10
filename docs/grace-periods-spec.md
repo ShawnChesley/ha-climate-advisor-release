@@ -29,6 +29,7 @@
 | Can the routine comfort-band arm (`_apply_comfort_band()`) still write an active HVAC mode through a genuinely open window, even with `_paused_by_door` correctly tracked? | It could (Issue #629). `_apply_comfort_band()` never re-checked live window state itself — it trusted the gate computed once at the top of its caller. A coordinator refresh firing `apply_classification()` in the same tick nat-vent releases ownership could reach it with `_paused_by_door` still `False` (correct when checked) but the window still open, silently committing an active mode via `_set_temperature()`'s bundled `hvac_mode`. Fixed by a structural choke-point guard directly in `_apply_comfort_band()`, mirroring the WHF/AC mutex choke-point in `_set_hvac_mode()`. | [§ Comfort-Band Arm Had No Independent Window Check (Issue #629)](#comfort-band-arm-had-no-independent-window-check-issue-629) |
 | Is there a named state enum for override/grace? | Yes: `override_grace_fsm.py` models state as `(OverrideConfirmState, GraceState)` — two small composed pieces, not one flat enum, since grace routinely runs independent of any override. As of Phase 6, the FSM is the sole authority, no longer shadow-only: `_resolve_override_grace_fsm_state()` computes the decision and `_apply_override_grace_fsm_state()` writes it into the canonical flags (`_grace_active`, `_manual_override_active`, etc.), which the rest of production still reads directly — the flags are the FSM's output, not an independent second source of truth. | [§ State Machine](#state-machine) |
 | Does `lifecycle_dispatcher.py` supply `_grace_active`/`_manual_override_active`, or just audit them? | Audit only (Issue #717). `_resolve_override_grace_fsm_state()`/`_confirm_override_action()`/`_clear_manual_override_active()` emit real `GRACE_STARTED/ENDED`/`OVERRIDE_CONFIRMED/CLEARED` events at every genuine transition, but `AutomationEngine` is both the sole emitter and sole consumer of its own events today — the canonical flags stay the source of truth throughout this spec; the dispatcher never feeds a decision. | [§ Dispatcher-Based Event Sync](#dispatcher-based-event-sync-issue-717) |
+| Does a thermostat coming back from `unavailable`/`unknown` start an override or grace period? | No (Issue #1049). `const.is_availability_recovery(old_state)` excludes it from all four thermostat override-detection sites in `_async_thermostat_changed()` (door/window-pause mode override, re-override during grace, plain mode override, setpoint-only override); a device waking up Off or with no setpoint is a reconnect, not an occupant action. | [Thermostat Availability Recovery](#thermostat-availability-recovery-issue-1049) |
 
 ---
 
@@ -927,3 +928,18 @@ HVAC mode with windows still open. Fixed by adding a `_natural_vent_active` guar
 is still considered active, deferring to `_exit_nat_vent()` as the only path that ends that
 session's suppression, matching the pattern already established for the physical-fan-state guard
 immediately above it.
+
+---
+
+## Thermostat Availability Recovery (Issue #1049)
+
+**Occupant outcome:** after an HA or cloud-thermostat outage (e.g. Sensi), the thermostat reports `unavailable` and then reconnects, often as `off` or with stale/absent attributes. Previously that looked like the occupant turning the system off, so Climate Advisor started a manual-override grace period and stopped managing the house.
+
+**Rule:** a state change whose `old_state` was in `UNAVAILABLE_STATES` (`{"unavailable", "unknown"}`, `const.py`) is an availability recovery (`is_availability_recovery(old_state)`; `old_state=None` is not). `coordinator._async_thermostat_changed()` computes this once and `and not _is_availability_recovery` gates:
+
+1. the door/window-pause HVAC-mode override branch,
+2. the "different mode while grace is active" re-override branch,
+3. the plain HVAC-mode override branch,
+4. the setpoint-only override branch (a reconnecting thermostat has no prior setpoint: `old_temp is None`).
+
+No early return: the other bookkeeping in the handler still runs. The same helper is used by the contact-sensor reconnect-blip check. The `unavailable` -> `on` fan-entity case is covered separately earlier in this spec (the `fan_entity` unavailable-transition fix). Tests: `tests/test_availability_recovery_override.py`.

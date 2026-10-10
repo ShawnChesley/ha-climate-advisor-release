@@ -98,3 +98,35 @@ class TestReadStateTempF:
     def test_reads_the_requested_attribute_name(self):
         state = SimpleNamespace(attributes={"current_temperature": 20.0, "temperature": 999.0})
         assert read_state_temp_f(state, "current_temperature", CELSIUS) == pytest.approx(68.0)
+
+
+class TestDisplayHelpers:
+    """Issue #1049: None-safe rounded display wrappers + format_temp_delta via convert_delta."""
+
+    def test_display_temp(self):
+        from custom_components.climate_advisor.temperature import CELSIUS, FAHRENHEIT, display_temp
+
+        assert display_temp(61.34, CELSIUS) == 16.3
+        assert display_temp(51.8, CELSIUS) == 11.0
+        assert display_temp(72.04, FAHRENHEIT) == 72.0
+        assert display_temp(72.0, CELSIUS, ndigits=2) == 22.22
+        assert display_temp(None, CELSIUS) is None
+
+    def test_display_delta_is_scale_only(self):
+        from custom_components.climate_advisor.temperature import CELSIUS, FAHRENHEIT, display_delta
+
+        assert display_delta(9.0, CELSIUS) == 5.0
+        assert display_delta(9.0, FAHRENHEIT) == 9.0
+        assert display_delta(None, CELSIUS) is None
+
+    def test_format_temp_delta_delegates_to_convert_delta(self, monkeypatch):
+        from custom_components.climate_advisor import temperature
+
+        monkeypatch.setattr(temperature, "convert_delta", lambda v, u: 42.0)
+        assert temperature.format_temp_delta(9.0, temperature.CELSIUS) == "42°C"
+
+    def test_format_temp_delta_none_raises_like_convert_delta(self):
+        from custom_components.climate_advisor.temperature import CELSIUS, format_temp_delta
+
+        with pytest.raises(ValueError):
+            format_temp_delta(None, CELSIUS)

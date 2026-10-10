@@ -155,7 +155,8 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         calls = engine.hass.services.async_call.call_args_list
         hvac_calls = [call for call in calls if call.args[1] == "set_hvac_mode"]
-        assert len(hvac_calls) == 0
+        # Issue #1048: Off is a real mode != cool, so CA switches explicitly before the single setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac_calls] == ["cool"]
         # hvac_mode='cool' must appear inside the set_temperature payload
         temp_calls = [call for call in calls if call.args[1] == "set_temperature"]
         # Single call (Issue #301)
@@ -195,7 +196,8 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         calls = engine.hass.services.async_call.call_args_list
         hvac_calls = [call for call in calls if call.args[1] == "set_hvac_mode"]
-        assert len(hvac_calls) == 0
+        # Issue #1048: Off is a real mode != cool, so CA switches explicitly before the single setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac_calls] == ["cool"]
         temp_calls = [call for call in calls if call.args[1] == "set_temperature"]
         # Single call (Issue #301)
         assert len(temp_calls) == 1
@@ -212,7 +214,8 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         calls = engine.hass.services.async_call.call_args_list
         hvac_calls = [call for call in calls if call.args[1] == "set_hvac_mode"]
-        assert len(hvac_calls) == 0
+        # Issue #1048: Off is a real mode != cool, so CA switches explicitly before the single setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac_calls] == ["cool"]
         temp_calls = [call for call in calls if call.args[1] == "set_temperature"]
         # Single call (Issue #301)
         assert len(temp_calls) == 1
@@ -239,7 +242,8 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         calls = engine.hass.services.async_call.call_args_list
         hvac_calls = [call for call in calls if call.args[1] == "set_hvac_mode"]
-        assert len(hvac_calls) == 0
+        # Issue #1048: Off is a real mode != cool, so CA switches explicitly before the single setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac_calls] == ["cool"]
         temp_calls = [call for call in calls if call.args[1] == "set_temperature"]
         # Single call (Issue #301); band arms regardless of indoor temp
         assert len(temp_calls) == 1
@@ -267,7 +271,8 @@ class TestWarmDayBandArmingReplacesComfortGap:
 
         calls = engine.hass.services.async_call.call_args_list
         hvac_calls = [call for call in calls if call.args[1] == "set_hvac_mode"]
-        assert len(hvac_calls) == 0
+        # Issue #1048: Off is a real mode != cool, so CA switches explicitly before the single setpoint.
+        assert [c.args[2]["hvac_mode"] for c in hvac_calls] == ["cool"]
         temp_calls = [call for call in calls if call.args[1] == "set_temperature"]
         # Single call (Issue #301)
         assert len(temp_calls) == 1
@@ -344,6 +349,18 @@ def _make_cg_engine(comfort_cool: float = 74.0, indoor_temp: float = 73.0) -> Au
     )
 
 
+def _guard_cool_calls(calls) -> list:
+    """set_hvac_mode(cool) calls issued AFTER the first set_temperature.
+
+    The comfort-band write's own explicit mode switch (Issue #1048) comes BEFORE its
+    set_temperature; the ODE ceiling guard's mode call comes after. Isolates the guard.
+    """
+    first_temp = next((i for i, c in enumerate(calls) if c.args[1] == "set_temperature"), None)
+    if first_temp is None:
+        return []
+    return [c for c in calls[first_temp:] if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
+
+
 class TestCeilingGuardFires:
     """Decision point B: outdoor > indoor, breach within lead_time → set HVAC cool."""
 
@@ -366,6 +383,25 @@ class TestCeilingGuardFires:
         # Guard must fire at least one cool call and be the last hvac call (overrides prior band arming)
         assert len(cool_calls) == 1
         assert hvac_calls[-1].args[2]["hvac_mode"] == "cool"
+
+    def test_off_start_sends_exactly_one_mode_call_through_the_real_guard_path(self):
+        """Issue #1049: Off thermostat + ceiling guard fires -> the band write's explicit switch to cool is
+        the ONLY set_hvac_mode; the guard must not send a second identical one moments later."""
+        engine = _make_cg_engine(comfort_cool=74.0, indoor_temp=73.0)  # current_mode="off"
+        engine._last_outdoor_temp = 76.0
+        _set_thermal_model(engine, k_passive=-0.05, conf="medium", k_active_cool=None)
+        emitted = []
+        engine._emit_event_callback = lambda n, d: emitted.append(n)
+        now = datetime(2026, 5, 11, 10, 0, 0, tzinfo=UTC)
+        curve = _make_predicted_indoor(start_hour_utc=10, temps=[73.0, 74.5, 76.0])
+        with patch("custom_components.climate_advisor.automation.dt_util") as mock_dt:
+            mock_dt.now.return_value = now
+            asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
+        calls = engine.hass.services.async_call.call_args_list
+        mode_calls = [c for c in calls if c.args[1] == "set_hvac_mode"]
+        assert [c.args[2]["hvac_mode"] for c in mode_calls] == ["cool"]
+        assert "ceiling_guard_fired" in emitted, "the guard must still fire (its setpoint write is unaffected)"
+        assert len([c for c in calls if c.args[1] == "set_temperature"]) >= 2
 
     def test_sets_temperature_to_comfort_cool(self):
         """When guard fires, target temp is set to comfort_cool."""
@@ -466,8 +502,7 @@ class TestCeilingGuardWholeHouseFanNeverEscalates:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        hvac_calls = [c for c in calls if c.args[1] == "set_hvac_mode"]
-        assert not any(c.args[2].get("hvac_mode") == "cool" for c in hvac_calls), (
+        assert not _guard_cool_calls(calls), (
             "WHOLE_HOUSE_FAN archetype must never escalate to AC via the ODE ceiling guard"
         )
 
@@ -504,9 +539,7 @@ class TestCeilingGuardSkips:
 
         asyncio.run(engine.apply_classification(_make_warm_off_classification()))
         calls = engine.hass.services.async_call.call_args_list
-        hvac_calls = [c for c in calls if c.args[1] == "set_hvac_mode"]
-        cool_calls = [c for c in hvac_calls if c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0
+        assert not _guard_cool_calls(calls)
 
     def test_skips_when_no_model(self):
         """No calibrated model (k_passive=None) → guard skips."""
@@ -522,8 +555,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        hvac_calls = [c for c in calls if c.args[1] == "set_hvac_mode"]
-        assert not any(c.args[2].get("hvac_mode") == "cool" for c in hvac_calls)
+        assert not _guard_cool_calls(calls)
 
     def test_dormant_when_outdoor_below_natvent_running_in_band(self):
         """Issue #247: dormant ONLY when outdoor<=indoor AND nat-vent running AND indoor in band.
@@ -548,8 +580,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0  # free cooling still viable → dormant
+        assert not _guard_cool_calls(calls)  # free cooling still viable → dormant
 
     def test_fires_when_indoor_breaches_ceiling_despite_outdoor_below(self):
         """Issue #247: nat-vent active, outdoor < indoor, indoor ABOVE comfort_cool → escalate to AC.
@@ -614,8 +645,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0  # savings margin tolerates the small overshoot
+        assert not _guard_cool_calls(calls)  # savings margin tolerates the small overshoot
 
     def test_skips_when_no_breach_in_curve(self):
         """All predicted temps below comfort_cool → guard dormant."""
@@ -631,8 +661,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0
+        assert not _guard_cool_calls(calls)
 
     def test_skips_when_breach_too_far_away(self):
         """Breach predicted far in future (> lead_time). Guard stands by."""
@@ -648,8 +677,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0
+        assert not _guard_cool_calls(calls)
 
     def test_bridge_tolerance_suppresses_near_miss(self):
         """Bridge home: breach at comfort_cool+0.5 (below bridge threshold of +1.0) → guard skips."""
@@ -665,8 +693,7 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve))
 
         calls = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0
+        assert not _guard_cool_calls(calls)
 
     def test_weather_change_guard_dormant_when_no_breach_on_second_call(self):
         """Two consecutive calls: first has breach, second has no breach. Guard dormant on second."""
@@ -690,5 +717,4 @@ class TestCeilingGuardSkips:
             asyncio.run(engine.apply_classification(_make_warm_off_classification(), predicted_indoor=curve_no_breach))
 
         calls2 = engine.hass.services.async_call.call_args_list
-        cool_calls = [c for c in calls2 if c.args[1] == "set_hvac_mode" and c.args[2].get("hvac_mode") == "cool"]
-        assert len(cool_calls) == 0
+        assert not _guard_cool_calls(calls2)

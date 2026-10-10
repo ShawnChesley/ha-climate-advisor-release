@@ -285,6 +285,9 @@ def _make_automation_engine(config_overrides: dict | None = None) -> AutomationE
         notify_service=config["notify_service"],
         config=config,
     )
+    # Issue #1049: these tests count/capture async_call_later for grace timers; the mode
+    # read-back recheck's own scheduling is covered in test_hvac_mode_alignment.py.
+    engine._schedule_mode_alignment_recheck = MagicMock()
     return engine
 
 
@@ -508,6 +511,7 @@ class TestHandleAllDoorsWindowsClosed:
             "climate",
             "set_hvac_mode",
             {"entity_id": "climate.thermostat", "hvac_mode": "cool"},
+            blocking=True,
         )
 
 
@@ -614,6 +618,7 @@ class TestHandleAllDoorsWindowsClosedZeroDurationGrace:
             "climate",
             "set_hvac_mode",
             {"entity_id": "climate.thermostat", "hvac_mode": "heat"},
+            blocking=True,
         )
 
 
@@ -1022,7 +1027,7 @@ class TestPauseForDoorWindowActionSplit:
         assert result is False  # hvac_already_off=False -- was actively turned off
         assert engine._pre_pause_mode == "cool"
         engine.hass.services.async_call.assert_any_call(
-            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}
+            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}, blocking=True
         )
 
     def test_action_returns_true_when_already_off(self):
@@ -1752,7 +1757,7 @@ class TestRePauseForOpenSensorFsmAuthoritative:
         assert engine._paused_entity == "re-check"
         assert engine._paused_since is not None
         engine.hass.services.async_call.assert_any_call(
-            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}
+            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}, blocking=True
         )
 
 

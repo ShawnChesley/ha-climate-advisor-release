@@ -69,6 +69,12 @@ LEGITIMATELY_REPEATING_EVENT_TYPES = frozenset(
         "override_confirmed",
         "override_cleared",
         "grace_started",
+        # Issue #1049: a recurring mismatch/recover/mismatch cycle against a thermostat that
+        # keeps ignoring mode commands legitimately re-emits identical payloads; the
+        # once-per-episode gate (next_fallback_episode) is what bounds them, not payload novelty.
+        "hvac_mode_not_applied",
+        "hvac_mode_applied_recovered",
+        "hvac_command_recovered",
     }
 )
 

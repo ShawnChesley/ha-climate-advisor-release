@@ -1440,6 +1440,29 @@ class TestPayloadCompletenessFollowUp:
         assert "76" in settings and "68" in settings and "74" in settings
         assert "home" in settings
 
+    def test_incident_detected_shows_thermostat_context_in_user_unit(self):
+        """Issue #1049 (change 8): thermostat mode/action and CA's last attempt, temps converted."""
+        _label, settings = self._render(
+            "incident_detected",
+            {
+                "incident_class": "comfort_undertemp",
+                "incident_id": "abc",
+                "indoor_f": 66.0,
+                "comfort_heat": 70.0,
+                "comfort_cool": 75.0,
+                "thermostat_mode": "off",
+                "thermostat_action": "off",
+                "last_commanded_mode": "heat",
+                "last_commanded_setpoint_f": 71.6,
+                "last_command_result": "sent",
+            },
+            unit="celsius",
+        )
+        assert "thermostat: off (off)" in settings
+        assert "CA last tried: heat @ 22" in settings
+        assert "(sent)" in settings
+        assert "71.6" not in settings  # shown in the user's unit, not internal F
+
     # -- K7: morning_wakeup DEFER_OCCUPANCY now emits --------------------------
 
     def test_morning_wakeup_skipped_occupancy_reason(self):

@@ -404,6 +404,13 @@ def run_production_scenario(
             dry_run=dry_run,
         )
 
+    # --- Issue #1048: opt-in thermostat quirk (scenario config "thermostat_quirk") ---
+    # "sensi_like": set_temperature ignores the hvac_mode kwarg and is rejected while
+    # the thermostat is Off. Absent by default, so all existing scenarios are unchanged.
+    _quirk = merged_config.get("thermostat_quirk")
+    if _quirk:
+        fake_hass.set_entity_quirk(climate_entity, _quirk)
+
     # --- Sensor tracker — drives engine._sensor_check_callback (engine-only mode) ---
     # Issue #476: when a coordinator is present, its real __init__ already wired
     # engine._sensor_check_callback = coordinator._any_sensor_open (production
@@ -1044,6 +1051,11 @@ def _snapshot_engine_state(engine: Any) -> dict[str, Any]:
     # post-run inspection would, using the engine's own reader.
     get_indoor = getattr(engine, "_get_indoor_temp_f", None)
     snap["_last_indoor_temp"] = get_indoor() if callable(get_indoor) else None
+
+    # Issue #1048: the thermostat's ACTUAL mode (ground truth, not what CA commanded).
+    _hass = getattr(engine, "hass", None)
+    _st = _hass.states.get(engine.climate_entity) if _hass is not None else None
+    snap["_thermostat_hvac_mode"] = getattr(_st, "state", None)
 
     # Include classification summary if available
     c = getattr(engine, "_current_classification", None)

@@ -3,6 +3,13 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.93] — 2026-10-10
+
+- Fix #1048 (part 1 of 2, #1049): Climate Advisor now switches your thermostat to Heat or Cool itself before asking for a temperature. Before, on thermostats such as Sensi and ecobee that ignore the mode sent along with a temperature, the thermostat could stay Off for days while the Activity Log said "heat applied". If the thermostat still doesn't follow, you now get one warning in the Activity Log and a line on the Status tab (and a note when it recovers), and failed commands are reported once with the reason. A thermostat coming back from offline is no longer mistaken for you turning it off. Note: a deliberate "Off" is no longer permanent — on mild days Climate Advisor turns it back on at the next cycle, and on other days after the one-hour hands-off period.
+- Fix #1048: the Activity Log no longer says a comfort band, pre-cool or time-of-use step was applied when nothing was sent; it says whether the command was sent, blocked, in test mode or failed.
+- Fix #1048: the diagnostics download now shows what your thermostat supports, what Climate Advisor last asked it to do and what happened (identifying details are redacted).
+- Fix #1048: Celsius households — Tomorrow's Plan now shows the real forecast (16.3°C / 11.0°C, not 61.4°C / 51.8°C), and reopening the settings no longer shows 18.00000000004 or refuses to save.
+
 ## [0.7.92] — 2026-10-09
 
 - Fix #1045: a whole-house fan you turned on yourself now keeps running through a Home Assistant restart for the rest of its manual-override period. Before, a restart a few minutes after you switched the fan on made Climate Advisor forget it, and it switched the fan off again (or took it over as free cooling and stopped it soon after). The Activity Log now marks an override that was kept across a restart.

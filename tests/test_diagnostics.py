@@ -189,3 +189,101 @@ class TestNativeHook:
         assert payload["zone_count"] == 1
         assert payload["entry_title"] == "Bedroom"
         assert payload["config"]["notify_service"] != "notify.mobile_app"
+
+
+class TestThermostatSnapshotInPayload:
+    """Issue #1049 change 6: thermostat capabilities, last command and what happened."""
+
+    @staticmethod
+    def _coordinator_with_thermostat():
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        from custom_components.climate_advisor.automation import HvacCommandResult, HvacWriteRecord
+
+        coord = _make_coordinator(
+            {
+                "climate_entity": "climate.t",
+                "temp_unit": "fahrenheit",
+                "notify_service": "notify.davids_phone",
+                "ai_api_key": "sk-ant-super-secret-value",
+            }
+        )
+        coord.automation_engine = SimpleNamespace(
+            _last_commanded_hvac_mode="heat",
+            _last_commanded_hvac_time=datetime(2026, 10, 9, 6, 30),
+            _pending_setpoint_single=68.0,
+            _temp_command_time=datetime(2026, 10, 9, 6, 30),
+            _hvac_write_record=HvacWriteRecord(result=HvacCommandResult.EXECUTED),
+            _hvac_cmd_fail_since=None,
+            _hvac_cmd_fail_announced=None,
+        )
+        coord._event_log = [{"type": "hvac_mode_not_applied", "requested_mode": "heat", "serial": "SN-999"}]
+        return coord
+
+    @staticmethod
+    def _hass_for(coord, entry):
+        hass = _make_hass({"entry_a": coord}, [entry])
+        attrs = {
+            "hvac_modes": ["off", "heat", "cool"],
+            "supported_features": 9,
+            "min_temp": 45,
+            "max_temp": 95,
+            "target_temp_step": 1,
+            "serial_number": "SN-12345",
+            "mac_address": "AA:BB:CC:DD:EE:FF",
+            "ip_address": "192.168.1.50",
+            "latitude": 34.9,
+            "longitude": -120.4,
+        }
+        hass.states.get.side_effect = lambda eid: (
+            MagicMock(state="off", attributes=attrs) if eid == "climate.t" else None
+        )
+        return hass
+
+    def test_thermostat_snapshot_has_capabilities_and_last_command(self):
+        entry = _make_entry("entry_a", "Bedroom")
+        hass = self._hass_for(self._coordinator_with_thermostat(), entry)
+
+        payload = asyncio.run(async_get_diagnostics_payload(hass, entry))
+
+        snap = payload["thermostat_snapshot"]
+        assert snap["climate_entity"]["capabilities"]["hvac_modes"] == ["off", "heat", "cool"]
+        assert snap["climate_entity"]["capabilities"]["min_temp"] == 45
+        assert snap["last_command"]["mode"] == "heat"
+        assert snap["last_command"]["setpoint"] == 68.0
+        assert snap["last_command"]["result"] == "executed"
+        assert snap["last_command"]["live_state_matches_commanded"] is False
+        assert payload["recent_hvac_events"][0]["type"] == "hvac_mode_not_applied"
+
+    def test_identifying_thermostat_attributes_and_secrets_absent_from_payload(self):
+        entry = _make_entry("entry_a", "Bedroom")
+        hass = self._hass_for(self._coordinator_with_thermostat(), entry)
+
+        text = str(asyncio.run(async_get_diagnostics_payload(hass, entry)))
+
+        for leak in ("SN-12345", "SN-999", "AA:BB:CC:DD:EE:FF", "192.168.1.50", "34.9", "-120.4"):
+            assert leak not in text, leak
+        assert "davids_phone" not in text
+        assert "super-secret" not in text
+
+    def test_automation_enabled_debug_state_still_present(self):
+        entry = _make_entry("entry_a", "Bedroom")
+        coord = self._coordinator_with_thermostat()
+        coord.get_debug_state.return_value = {"automation_enabled": True, "hvac_mode": "heat"}
+        hass = self._hass_for(coord, entry)
+
+        payload = asyncio.run(async_get_diagnostics_payload(hass, entry))
+
+        assert payload["debug_state"]["automation_enabled"] is True
+
+    def test_snapshot_failure_does_not_lose_the_rest_of_the_payload(self):
+        entry = _make_entry("entry_a", "Bedroom")
+        coord = self._coordinator_with_thermostat()
+        hass = self._hass_for(coord, entry)
+        hass.states.get.side_effect = RuntimeError("boom")
+
+        payload = asyncio.run(async_get_diagnostics_payload(hass, entry))
+
+        assert payload["thermostat_snapshot"] is None
+        assert payload["debug_state"] == {"hvac_mode": "heat"}

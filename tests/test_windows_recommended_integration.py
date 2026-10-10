@@ -278,6 +278,7 @@ class TestWindowsRecommendedPauseSuppression:
             "climate",
             "set_hvac_mode",
             {"entity_id": "climate.thermostat", "hvac_mode": "off"},
+            blocking=True,
         )
 
     # ------------------------------------------------------------------

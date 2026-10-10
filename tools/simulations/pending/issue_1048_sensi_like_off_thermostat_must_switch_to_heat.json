@@ -1,0 +1,55 @@
+{
+  "name": "issue_1048_sensi_like_off_thermostat_must_switch_to_heat",
+  "description": "Issue #1048: a Sensi-like thermostat (ignores the hvac_mode kwarg of climate.set_temperature and rejects set_temperature while Off) is Off on a cold morning with indoor below the comfort floor. Climate Advisor must explicitly switch the thermostat to heat (climate.set_hvac_mode) before/with the floor setpoint. On HEAD, CA only embeds hvac_mode in set_temperature, so the quirk drops the call and the thermostat stays Off while CA logs 'comfort band applied'.",
+  "source": "Issue #1048 (devrsw, Sensi, Celsius): 102 of 103 'house too cold' alerts had the thermostat Off; heating never turned on.",
+  "issue": 1048,
+  "notes": [
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: this scenario FAILS on HEAD (thermostat remains 'off') and passes once CA issues a real set_hvac_mode(heat). If the explicit mode switch were deleted from production it would fail again, because the sensi_like quirk drops the mode embedded in set_temperature.",
+    "(b) Docs<->production alignment: docs/sim-harness-spec.md documents the opt-in sensi_like quirk; the production write-point contract is in docs/08-COMPUTATION-REFERENCE.md.",
+    "(c) Occupant experience: the house sits 1-3 degrees below the comfort floor for days with zero heating while the Activity Log says 'heat applied'.",
+    "classification hvac_mode='heat' and windows_recommended=false match DayClassification._compute_recommendations() for day_type 'cold'."
+  ],
+  "config": {
+    "comfort_heat": 70,
+    "comfort_cool": 75,
+    "setback_heat": 60,
+    "setback_cool": 80,
+    "fan_mode": "disabled",
+    "initial_thermostat_mode": "off",
+    "thermostat_quirk": "sensi_like"
+  },
+  "events": [
+    {
+      "time": "2026-01-12T07:00:00",
+      "type": "temp_update",
+      "indoor_f": 64.0,
+      "outdoor_f": 30.0,
+      "note": "Thermostat is Off, indoor 64F is 6F below comfort_heat (70F)."
+    },
+    {
+      "time": "2026-01-12T07:00:00",
+      "type": "classification",
+      "day_type": "cold",
+      "hvac_mode": "heat",
+      "windows_recommended": false,
+      "note": "Cold day: the comfort band arms with the floor edge active, so CA must command heat."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-01-12T07:00:00",
+      "expect": "field_equals",
+      "field": "engine_state._thermostat_hvac_mode",
+      "value": "heat",
+      "track": "logic",
+      "reason": "The thermostat itself (not CA's command log) must end up in heat: a Sensi-like device ignores hvac_mode inside set_temperature, so only an explicit climate.set_hvac_mode(heat) can turn heating on."
+    }
+  ],
+  "verdict": {
+    "type": "negative",
+    "summary": "Reproduces issue #1048: CA never switches a Sensi-like Off thermostat on, so the house stays cold.",
+    "observed_behavior": "On HEAD the thermostat stays 'off': set_temperature(hvac_mode=heat) is ignored/rejected by the quirk and CA never calls set_hvac_mode.",
+    "expected_behavior": "CA issues climate.set_hvac_mode(heat) and the thermostat ends in heat."
+  }
+}

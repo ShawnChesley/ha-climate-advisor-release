@@ -440,6 +440,43 @@ def decide_scheduled_write_seq_current(*, current_write_seq: int, target_write_s
     return current_write_seq == target_write_seq
 
 
+# Issue #1049 (Part of #1048): seconds during which a just-sent successful mode command
+# is trusted as in-flight, so the write that immediately follows it does not send a duplicate
+# set_hvac_mode while a cloud thermostat's state still echoes the old mode (lag 30-120 s).
+MODE_SWITCH_DEDUPE_SECONDS = 120
+
+_EXPLICIT_SWITCH_MODES = frozenset({"heat", "cool"})
+_UNREADABLE_LIVE_STATES = frozenset({"unavailable", "unknown"})
+
+
+def decide_explicit_mode_switch(
+    *,
+    commanded_mode: str,
+    live_state: object,
+    advertised_modes: tuple[str, ...] | list[str],
+    recent_switch_to_mode: bool,
+) -> bool:
+    """True when a setpoint write must be preceded by an explicit ``climate.set_hvac_mode``.
+
+    Sensi and HA-core ecobee ignore the ``hvac_mode`` kwarg of ``climate.set_temperature``
+    (Issue #1048), so the mode embedded in the write never takes effect. Acts ONLY when:
+    the commanded mode is single Heat or Cool (post-fan verify can pass off/auto/fan_only);
+    the thermostat advertises that mode; the live state is a *real* mode different from the
+    commanded one (Off, Auto, heat_cool and the opposite mode all count; None / non-string /
+    unavailable / unknown never trigger a mode call); and no successful mode command to this
+    same mode went out moments ago. Adds no pause / override / window guard of its own.
+    """
+    if commanded_mode not in _EXPLICIT_SWITCH_MODES:
+        return False
+    if commanded_mode not in advertised_modes:
+        return False
+    if not isinstance(live_state, str) or not live_state or live_state in _UNREADABLE_LIVE_STATES:
+        return False
+    if live_state == commanded_mode:
+        return False
+    return not recent_switch_to_mode
+
+
 _OCCUPANCY_AWAY = "away"  # mirrors const.OCCUPANCY_AWAY
 _OCCUPANCY_VACATION = "vacation"  # mirrors const.OCCUPANCY_VACATION
 # Same import-independence convention as _FAN_MODE_DISABLED above.

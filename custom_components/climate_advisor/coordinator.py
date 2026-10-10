@@ -45,6 +45,7 @@ from .automation import (
     _in_sleep_window,
     compute_bedtime_setback,
     compute_pre_cool_target,
+    hvac_outcome_label,
     resolve_pre_cool_modifier,
     select_comfort_band,
 )
@@ -241,6 +242,7 @@ from .const import (
     THRESHOLD_WARM,
     VACATION_SETBACK_EXTRA,
     VERSION,
+    is_availability_recovery,
 )
 from .entity_health import run_entity_health_sweep
 from .fan_mode_resolver import is_thermostat_fan_physically_active
@@ -251,6 +253,7 @@ from .fan_status import (
     resolve_untracked_fan_status,
 )
 from .hvac_action import is_hvac_action_active, is_hvac_compressor_active
+from .incident_payload import build_incident_payload
 from .indoor_temp import IndoorTempReading, resolve_indoor_temp_with_provenance
 from .invariant_watchdog import run_invariant_checks
 from .learning import DailyRecord, LearningEngine, compute_k_passive_blocks, compute_k_passive_endpoint
@@ -3426,6 +3429,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # exactly what stayed self-consistent while reality diverged during the 2026-08-22
         # incident (#739/#748) this module exists to catch.
         _invariant_violations = self._run_invariant_watchdog(hvac_action=hvac_action)
+        # Issue #1049 (change 7): the thermostat not following commands, surfaced on the Status card.
+        # First let the engine close an episode that reality has overtaken (occupant took manual
+        # control, or the thermostat is now in the requested mode), so Status never lingers.
+        if self.automation_engine is not None:
+            self.automation_engine.reconcile_mode_episode()
+        _hvac_control_issues = self._compute_hvac_control_issues()
 
         # Issue #805: generic entity-availability sweep. Detects a removed/unavailable
         # configured entity (thermostat, weather source, sensors, fan, toggles, notify
@@ -3714,6 +3723,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             ATTR_FAN_RUNNING: fan_running,
             ATTR_HVAC_ACTION: hvac_action,
             "invariant_violations": [{"invariant": v.name, "detail": v.detail} for v in _invariant_violations],
+            "hvac_control_issues": _hvac_control_issues,
             "entity_health_issues": [
                 {
                     "config_key": i.config_key,
@@ -5530,6 +5540,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Pre-cool trigger handler completed: %s", result)
         if "suppressed" in result:
             self._pre_cool_status = result.replace("suppressed: ", "pre-cool suppressed — ")
+        elif result.startswith("not applied"):
+            # Issue #1049: the write was blocked/failed/not sent -- never present it as active.
+            self._pre_cool_status = result.replace("not applied", "pre-cool not applied", 1)
         elif "applied" in result:
             self._pre_cool_status = result.replace("applied: ", "pre-cool active (").rstrip() + ")"
         await self.async_refresh()
@@ -5684,7 +5697,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # and treating it as a blip would risk silently skipping debounce on a genuine
             # first-ever open in some other, more exotic startup ordering.
             old_state = event.data.get("old_state")
-            if old_state is not None and old_state.state in ("unavailable", "unknown"):
+            if is_availability_recovery(old_state):
                 if new_state.last_changed is not None:
                     self._sensor_reconnect_blip_last_changed[entity_id] = new_state.last_changed
                 _LOGGER.info(
@@ -5904,6 +5917,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             and new_state.state == _last_cmd_mode
             and (dt_util.now() - _last_cmd_time).total_seconds() < 120
         )
+        # Issue #1049: the thermostat waking from unavailable/unknown (often reporting Off or
+        # stale attributes) is a reconnect, never an occupant action. Computed once; gates all
+        # four override-detection sites below. No early return — other bookkeeping must run.
+        _is_availability_recovery = is_availability_recovery(old_state)
 
         # Detect manual HVAC override during a door/window pause.
         # Note: we intentionally do NOT require old_state == "off" here.
@@ -5917,6 +5934,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self.automation_engine.is_paused_by_door
             and old_state.state != new_state.state
             and new_state.state not in ("off", "unavailable", "unknown")
+            and not _is_availability_recovery
         ):
             _any_command_pending = (
                 self.automation_engine._hvac_command_pending
@@ -5959,6 +5977,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # branch fires first and handles the re-override case.
             old_state.state != new_state.state
             and new_state.state not in ("unavailable", "unknown")
+            and not _is_availability_recovery
             and self.automation_engine._manual_override_active
             and new_state.state != self.automation_engine._manual_override_mode
             and not self.automation_engine._hvac_command_pending
@@ -6007,6 +6026,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         elif (
             old_state.state != new_state.state
             and new_state.state not in ("unavailable", "unknown")
+            and not _is_availability_recovery
             and not self.automation_engine._manual_override_active
             and not self.automation_engine._hvac_command_pending
             and not self.automation_engine._fan_command_pending
@@ -6396,6 +6416,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         if (
             _setpoint_changed
+            # Issue #1049: a reconnecting thermostat has no prior setpoint — that is a reading
+            # appearing, not an occupant changing it. (Only the recovery case: a missing prior
+            # setpoint in any other transition keeps its original override semantics.)
+            and not _is_availability_recovery
             and self._today_record
             and not self.automation_engine._temp_command_pending
             and not self.automation_engine._hvac_command_pending
@@ -9741,16 +9765,87 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             _resolved_heat, _resolved_cool = self._resolve_active_comfort_band()
             comfort_heat = _resolved_heat if comfort_heat is None else comfort_heat
             comfort_cool = _resolved_cool if comfort_cool is None else comfort_cool
-        payload: dict = {
-            "incident_class": incident_class,
-            "incident_id": incident_id,
-            "comfort_cool": comfort_cool,
-            "comfort_heat": comfort_heat,
-            "occupancy_mode": (self.automation_engine._occupancy_mode if self.automation_engine else None),
-        }
-        if extra:
-            payload.update(extra)
+        # Issue #1049: one shared payload builder (incident_payload.py) for this emitter and
+        # the engine's — no second _emit_incident.
+        payload = build_incident_payload(
+            incident_class,
+            incident_id,
+            comfort_heat=comfort_heat,
+            comfort_cool=comfort_cool,
+            occupancy_mode=(self.automation_engine._occupancy_mode if self.automation_engine else None),
+            extra=extra,
+        )
         self._emit_event("incident_detected", payload)
+
+    def _compute_hvac_control_issues(self) -> list[dict[str, str]]:
+        """Open "thermostat is not following commands" episodes for the Status card (Issue #1049, change 7).
+
+        Occupant outcome: Status used to read "active" while a thermostat that ignored the
+        mode request left the house cold. Each entry mirrors the ``invariant_violations``
+        shape (``{issue, detail}``); the detail is diagnostic, not an instruction. Entries
+        exist only while the engine's episode is open, so they clear on recovery.
+        """
+        ae = self.automation_engine
+        if ae is None:
+            return []
+        now = dt_util.now()
+
+        def _minutes_since(since: Any) -> int | None:
+            if isinstance(since, datetime):
+                return max(0, int((now - since).total_seconds() // 60))
+            return None
+
+        issues: list[dict[str, str]] = []
+        rec = getattr(ae, "_hvac_write_record", None)
+        requested = getattr(rec, "episode_reason", None)
+        state = self.hass.states.get(ae.climate_entity)
+        live = getattr(state, "state", None)
+        # Never show a self-contradicting entry: hidden while the occupant owns the thermostat
+        # and whenever the thermostat already reports the requested mode.
+        user_owns = bool(getattr(ae, "_manual_override_active", False)) or bool(
+            getattr(ae, "_override_confirm_pending", False)
+        )
+        if isinstance(requested, str) and requested and not user_owns and live != requested:
+            detail = f"Thermostat is not following the requested mode: requested {requested}, reports {live!r}"
+            mins = _minutes_since(getattr(rec, "mismatch_since", None))
+            if mins is not None:
+                detail += f" for {mins} min"
+            issues.append({"issue": "mode_not_obeyed", "detail": detail})
+        failed_mode = getattr(ae, "_hvac_cmd_fail_mode", None)
+        if getattr(ae, "_hvac_cmd_fail_announced", None) and isinstance(failed_mode, str) and failed_mode:
+            detail = f"Thermostat commands are failing (last attempted mode: {failed_mode})"
+            mins = _minutes_since(getattr(ae, "_hvac_cmd_fail_since", None))
+            if mins is not None:
+                detail += f" for {mins} min"
+            issues.append({"issue": "command_failing", "detail": detail})
+        return issues
+
+    def _thermostat_incident_context(self) -> dict[str, Any]:
+        """What the thermostat is doing and what Climate Advisor last tried (Issue #1049, change 8).
+
+        Added to comfort incidents so "house too cold/hot" says whether the thermostat was
+        Off, in the wrong mode, or idle, and what CA last asked of it. Temperatures stay
+        internal Fahrenheit (renderers convert).
+        """
+        ae = self.automation_engine
+        ctx: dict[str, Any] = {}
+        if ae is None:
+            return ctx
+        state = self.hass.states.get(ae.climate_entity)
+        if state is not None:
+            ctx["thermostat_mode"] = getattr(state, "state", None)
+            attrs = getattr(state, "attributes", None)
+            if isinstance(attrs, dict):
+                ctx["thermostat_action"] = attrs.get("hvac_action")
+        mode = getattr(ae, "_last_commanded_hvac_mode", None)
+        if isinstance(mode, str):
+            ctx["last_commanded_mode"] = mode
+            setpoint = getattr(ae, "_pending_setpoint_single", None)
+            if isinstance(setpoint, (int, float)) and not isinstance(setpoint, bool):
+                ctx["last_commanded_setpoint_f"] = float(setpoint)
+            rec = getattr(ae, "_hvac_write_record", None)
+            ctx["last_command_result"] = hvac_outcome_label(getattr(rec, "result", None))
+        return ctx
 
     def _is_nat_vent_tolerated_deviation(self, indoor: float, comfort_heat: float, comfort_cool: float) -> bool:
         """True if this comfort-band deviation is expected nat-vent cycling tolerance, not a violation.
@@ -9883,6 +9978,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                         "nat_vent_active": (
                             self.automation_engine._natural_vent_active if self.automation_engine else None
                         ),
+                        **self._thermostat_incident_context(),
                     },
                     comfort_heat=comfort_heat,
                     comfort_cool=comfort_cool,
@@ -9911,6 +10007,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                         "nat_vent_active": (
                             self.automation_engine._natural_vent_active if self.automation_engine else None
                         ),
+                        **self._thermostat_incident_context(),
                     },
                     comfort_heat=comfort_heat,
                     comfort_cool=comfort_cool,

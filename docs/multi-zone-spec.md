@@ -2057,6 +2057,8 @@ TO_REDACT)` helper as defense-in-depth, listing `notify_service` and any
 `sensitive`-flagged keys — consistent with existing practice, not a second
 redaction mechanism.
 
+**(as built, Issue #1049):** the payload gained `thermostat_snapshot` (the shared `diagnostic_snapshot.build_diagnostic_snapshot()`: the thermostat's live attributes, a parsed `capabilities` block -- hvac_modes, supported-feature names, min/max/step -- and a `last_command` block -- last commanded mode/setpoint/time, `HvacWriteRecord` result, read-back skip reason, open mismatch/failure episodes) plus `recent_hvac_events` (the newest thermostat-related Activity Log events). Thermostat attribute keys are third-party-defined, so an exact-key `TO_REDACT` cannot cover them; identifying attributes (serial/MAC/IP/latitude/longitude/SSID/`friendly_name`/ids/tokens, plus MAC- and IPv4-shaped values) are redacted by `diagnostic_snapshot.redact_sensitive()` **inside the builder**, so every consumer -- this file, the `api.py` log downloads and the AI investigator (which is sent to the Claude API) -- receives redacted output. `async_redact_data(payload, TO_REDACT)` stays as the second layer for config secrets (`notify_service`, `ai_api_key`); the two layers cover different threat models rather than being competing lists.
+
 **`dump_diagnostics` service: keep it, redirect it, don't deprecate it.**
 Change `handle_dump_diagnostics` to build its payload via the same helper
 function `diagnostics.py` uses (single source of truth for the payload

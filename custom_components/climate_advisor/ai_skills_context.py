@@ -1622,10 +1622,37 @@ def _format_band_setpoint(floor: Any, ceiling: Any, active: Any, unit: str) -> s
 # ---------------------------------------------------------------------------
 
 
+_WRITE_OUTCOME_LABELS = {
+    "blocked": "blocked -- whole-house fan owns the thermostat",
+    "dry_run": "test mode, nothing sent",
+    "failed": "command failed",
+    "superseded": "replaced by a newer command",
+    "not_sent": "no command sent",
+}
+
+
+def _write_not_sent_suffix(p: dict) -> str | None:
+    """Issue #1049 (change 5): reason text when an ``*_applied`` event's write was NOT sent.
+
+    ``None`` for ``outcome == "sent"`` and for historical events with no ``outcome`` field
+    (those predate the field and keep their original wording).
+    """
+    outcome = p.get("outcome")
+    if not outcome or outcome == "sent":
+        return None
+    return _WRITE_OUTCOME_LABELS.get(outcome, str(outcome).replace("_", " "))
+
+
 def _render_comfort_band_applied(p: dict, unit: str) -> tuple[str, str]:
     mode = p.get("mode", "")
     reason = p.get("reason", "")
-    label = f"Comfort band applied ({mode})" if mode else "Comfort band applied"
+    not_sent = _write_not_sent_suffix(p)
+    if not_sent:
+        label = (
+            f"Comfort band NOT applied ({mode}) -- {not_sent}" if mode else f"Comfort band NOT applied -- {not_sent}"
+        )
+    else:
+        label = f"Comfort band applied ({mode})" if mode else "Comfort band applied"
     if reason:
         label = f"{label} -- {reason}"
     settings = _format_band_setpoint(p.get("floor"), p.get("ceiling"), p.get("active"), unit)
@@ -1644,6 +1671,9 @@ def _render_tou_precondition_applied(p: dict, unit: str) -> tuple[str, str]:
     action = "Pre-cooling" if mode == "cool" else "Pre-heating" if mode == "heat" else "Pre-conditioning"
     schedule_id = p.get("schedule_id", "")
     label = f"{action} ahead of scheduled high-cost period" + (f" ({schedule_id})" if schedule_id else "")
+    not_sent = _write_not_sent_suffix(p)
+    if not_sent:
+        label = f"{label} -- NOT applied: {not_sent}"
     target = p.get("target")
     settings = f"target: {format_temp(target, unit)}" if target is not None else ""
     return label, settings
@@ -1722,7 +1752,8 @@ def _render_occupancy_comfort_restored(p: dict, unit: str) -> tuple[str, str]:
 
 def _render_pre_cool_applied(p: dict, unit: str) -> tuple[str, str]:
     target = p.get("target")
-    label = "Pre-cool applied"
+    not_sent = _write_not_sent_suffix(p)
+    label = f"Pre-cool NOT applied -- {not_sent}" if not_sent else "Pre-cool applied"
     settings = ""
     if target is not None:
         try:
@@ -1798,6 +1829,31 @@ def _render_classification_applied(p: dict, unit: str) -> tuple[str, str]:
             settings_parts.append(f"trend magnitude {format_temp_delta(trend_mag, unit)}")
     settings = ", ".join(settings_parts)
     return label, settings
+
+
+def _render_hvac_mode_not_applied(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1049: the thermostat is not in the HVAC mode Climate Advisor requested."""
+    requested = p.get("requested_mode") or "?"
+    actual = p.get("actual_mode")
+    if p.get("kind") == "rejected":
+        label = f"Thermostat rejected HVAC mode {requested} -- mode not changed"
+    else:
+        label = f"Thermostat did not switch to {requested} -- it may be ignoring mode commands"
+    settings = f"requested {requested}, thermostat reports {actual}" if actual else f"requested {requested}"
+    return label, settings
+
+
+def _render_hvac_mode_applied_recovered(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1049: the thermostat is now in the requested HVAC mode."""
+    requested = p.get("requested_mode") or "?"
+    minutes = p.get("minutes_down")
+    return f"Thermostat is now in {requested}", (f"not following for {minutes} min" if minutes is not None else "")
+
+
+def _render_hvac_command_recovered(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1049: the thermostat accepted a climate command again after failures."""
+    minutes = p.get("minutes_down")
+    return "Thermostat accepting commands again", (f"down {minutes} min" if minutes is not None else "")
 
 
 def _render_setpoint_rejected(p: dict, unit: str) -> tuple[str, str]:
@@ -2714,6 +2770,22 @@ def _render_incident_detected(p: dict, unit: str) -> tuple[str, str]:
     occupancy = p.get("occupancy_mode")
     if occupancy:
         settings_parts.append(f"occupancy: {occupancy}")
+    # Issue #1049 (change 8): what the thermostat was doing and what CA last tried.
+    t_mode = p.get("thermostat_mode")
+    if t_mode:
+        t_action = p.get("thermostat_action")
+        settings_parts.append(f"thermostat: {t_mode}" + (f" ({t_action})" if t_action else ""))
+    last_mode = p.get("last_commanded_mode")
+    if last_mode:
+        tried = f"CA last tried: {last_mode}"
+        last_sp = p.get("last_commanded_setpoint_f")
+        if last_sp is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                tried += f" @ {format_temp(float(last_sp), unit)}"
+        result = p.get("last_command_result")
+        if result:
+            tried += f" ({result})"
+        settings_parts.append(tried)
     settings = ", ".join(settings_parts)
     return label, settings
 
@@ -2823,6 +2895,9 @@ EVENT_RENDERERS: dict[str, Callable[[dict, str], tuple[str, str]]] = {
     "comfort_family_switch_locked_out": _render_comfort_family_switch_locked_out,
     "comfort_family_switch": _render_comfort_family_switch,
     "setpoint_rejected": _render_setpoint_rejected,
+    "hvac_mode_not_applied": _render_hvac_mode_not_applied,
+    "hvac_mode_applied_recovered": _render_hvac_mode_applied_recovered,
+    "hvac_command_recovered": _render_hvac_command_recovered,
     "setpoint_nudge": _render_setpoint_nudge,
     "override_cleared": _render_override_cleared,
     "override_confirmed": _render_override_confirmed,
@@ -2943,6 +3018,9 @@ _NO_DEDUP: frozenset[str] = frozenset(
         "fan_blind_started",
         "fan_blind_stopped",
         "fan_blind_recovered",
+        "hvac_mode_not_applied",
+        "hvac_mode_applied_recovered",
+        "hvac_command_recovered",
         "ceiling_guard_fired",
         "incident_detected",
         "setpoint_rejected",
