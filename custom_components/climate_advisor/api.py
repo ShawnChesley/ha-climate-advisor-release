@@ -399,6 +399,9 @@ class ClimateAdvisorStatusView(HomeAssistantView):
                 # Status card only, per this project's Status Card Ontology: it answers "what's
                 # happening right now, and why."
                 "invariant_violations": data.get("invariant_violations", []),
+                # Issue #1049: thermostat not following commands (open mode-alignment / command-failure
+                # episode) — empty list when fine. Same Status Card Ontology as invariant_violations.
+                "hvac_control_issues": data.get("hvac_control_issues", []),
                 # Issue #805: entities (thermostat, weather source, sensors, fan, toggles,
                 # notify service) currently missing or unavailable — empty list when
                 # everything is fine. Same Status Card Ontology as invariant_violations above.

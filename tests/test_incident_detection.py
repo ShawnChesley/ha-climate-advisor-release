@@ -92,6 +92,10 @@ def _make_coordinator_stub(config: dict | None = None):
     # tests/test_incident_detection.py::TestSleepWakeBoundaryFreshness). Each test sets
     # coord._get_indoor_temp.return_value directly instead of coord.data["indoor_temp"].
     coord._get_indoor_temp = MagicMock(return_value=None)
+    # Issue #1049 (change 8): comfort incidents carry the thermostat context; bind the real builder.
+    coord.hass = MagicMock()
+    coord.hass.states.get.return_value = None
+    coord._thermostat_incident_context = types.MethodType(ClimateAdvisorCoordinator._thermostat_incident_context, coord)
     # Issue #411: shared nat-vent-tolerance comfort-deviation gate, consumed by both
     # _detect_and_emit_incidents (above) and coordinator.py's comfort_violations_minutes
     # accumulation (tested separately below via direct calls on this same bound method).
@@ -692,3 +696,74 @@ class TestSimulateNewFeatures:
         assert result["passed"] is True, (
             f"away_occupancy_override_cleared should PASS after bug #220 is fixed. Assertions: {result['assertions']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1049 (change 8): comfort incidents say what the thermostat was doing
+# ---------------------------------------------------------------------------
+
+
+class TestComfortIncidentThermostatContext:
+    """Occupant: "house too cold" alert used to state only temperatures; it now also says the
+    thermostat was Off and what Climate Advisor last tried (the reported #1048 household)."""
+
+    def _engine(self, coord, *, mode="heat", setpoint=72.0, result=None):
+        ae = coord.automation_engine
+        ae.climate_entity = "climate.test"
+        ae._last_commanded_hvac_mode = mode
+        ae._pending_setpoint_single = setpoint
+        ae._hvac_write_record = SimpleNamespace(result=result)
+        return ae
+
+    def test_undertemp_incident_carries_thermostat_context(self) -> None:
+        from custom_components.climate_advisor.automation import HvacCommandResult
+
+        coord = _make_coordinator_stub({"comfort_heat": 70})
+        coord._get_indoor_temp.return_value = 66.0
+        coord.data = {"outdoor_temp": 40.0, "hvac_mode": "off"}
+        self._engine(coord, result=HvacCommandResult.EXECUTED)
+        coord.hass.states.get.return_value = SimpleNamespace(state="off", attributes={"hvac_action": "off"})
+
+        with patch("custom_components.climate_advisor.coordinator.dt_util") as mock_dt:
+            mock_dt.now.return_value = datetime.now(UTC)
+            coord._detect_and_emit_incidents()
+
+        inc = [e for e in coord._event_log if e.get("incident_class") == "comfort_undertemp"]
+        assert len(inc) == 1
+        assert inc[0]["thermostat_mode"] == "off"
+        assert inc[0]["thermostat_action"] == "off"
+        assert inc[0]["last_commanded_mode"] == "heat"
+        assert inc[0]["last_commanded_setpoint_f"] == 72.0  # internal degrees F
+        assert inc[0]["last_command_result"] == "sent"
+
+    def test_overtemp_incident_carries_thermostat_context(self) -> None:
+        coord = _make_coordinator_stub({"comfort_cool": 75})
+        coord._get_indoor_temp.return_value = 78.0
+        coord.data = {"outdoor_temp": 90.0, "hvac_mode": "off"}
+        self._engine(coord, mode="cool", setpoint=74.0, result=None)
+        coord.hass.states.get.return_value = SimpleNamespace(state="heat", attributes={})
+
+        with patch("custom_components.climate_advisor.coordinator.dt_util") as mock_dt:
+            mock_dt.now.return_value = datetime.now(UTC)
+            coord._detect_and_emit_incidents()
+
+        inc = [e for e in coord._event_log if e.get("incident_class") == "comfort_violation"]
+        assert len(inc) == 1
+        assert inc[0]["thermostat_mode"] == "heat"
+        assert inc[0]["last_commanded_mode"] == "cool"
+        assert inc[0]["last_command_result"] == "not_sent"
+
+    def test_no_command_ever_sent_omits_last_command(self) -> None:
+        coord = _make_coordinator_stub({"comfort_heat": 70})
+        coord._get_indoor_temp.return_value = 66.0
+        coord.hass.states.get.return_value = SimpleNamespace(state="off", attributes={})
+        coord.automation_engine.climate_entity = "climate.test"
+        coord.automation_engine._last_commanded_hvac_mode = None
+
+        with patch("custom_components.climate_advisor.coordinator.dt_util") as mock_dt:
+            mock_dt.now.return_value = datetime.now(UTC)
+            coord._detect_and_emit_incidents()
+
+        inc = [e for e in coord._event_log if e.get("incident_class") == "comfort_undertemp"]
+        assert inc and "last_commanded_mode" not in inc[0]
+        assert inc[0]["thermostat_mode"] == "off"

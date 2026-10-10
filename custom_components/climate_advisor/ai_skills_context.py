@@ -2770,6 +2770,22 @@ def _render_incident_detected(p: dict, unit: str) -> tuple[str, str]:
     occupancy = p.get("occupancy_mode")
     if occupancy:
         settings_parts.append(f"occupancy: {occupancy}")
+    # Issue #1049 (change 8): what the thermostat was doing and what CA last tried.
+    t_mode = p.get("thermostat_mode")
+    if t_mode:
+        t_action = p.get("thermostat_action")
+        settings_parts.append(f"thermostat: {t_mode}" + (f" ({t_action})" if t_action else ""))
+    last_mode = p.get("last_commanded_mode")
+    if last_mode:
+        tried = f"CA last tried: {last_mode}"
+        last_sp = p.get("last_commanded_setpoint_f")
+        if last_sp is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                tried += f" @ {format_temp(float(last_sp), unit)}"
+        result = p.get("last_command_result")
+        if result:
+            tried += f" ({result})"
+        settings_parts.append(tried)
     settings = ", ".join(settings_parts)
     return label, settings
 

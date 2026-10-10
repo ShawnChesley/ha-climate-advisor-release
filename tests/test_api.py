@@ -836,6 +836,14 @@ class TestStatusViewCelsiusUnit:
         assert response["unit"] == "celsius"  # KeyError before fix
         assert response["indoor_temp"] == pytest.approx(20.0, abs=0.1)  # 68°F → 20°C
 
+    def test_status_passes_hvac_control_issues_through(self):
+        """Issue #1049 (change 7): Status API exposes hvac_control_issues, [] when absent."""
+        coord = self._make_coordinator()
+        coord.data["hvac_control_issues"] = [{"issue": "mode_not_obeyed", "detail": "x"}]
+        assert _simulate_status_get(coord)["hvac_control_issues"] == [{"issue": "mode_not_obeyed", "detail": "x"}]
+        coord.data.pop("hvac_control_issues")
+        assert _simulate_status_get(coord)["hvac_control_issues"] == []
+
     def test_status_celsius_converts_trend_magnitude(self):
         """trend_magnitude must be converted delta when unit=celsius."""
         import pytest
