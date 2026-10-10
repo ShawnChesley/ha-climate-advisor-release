@@ -183,6 +183,7 @@ from .fan_lifecycle import (
     derive_fan_lifecycle_state,
 )
 from .fan_mode_resolver import is_thermostat_fan_physically_active, resolve_fan_mode_command
+from .fan_status import fan_entity_on
 from .fan_thermostat_decision import (
     FanThermostatInputs,
     FanThermostatOutcome,
@@ -607,6 +608,15 @@ def _override_event_source(reason: str) -> str:
     return "manual" if reason.startswith("user_cancel") else "automation"
 
 
+# Issue #1050 (#1048 #18): occupant-facing text for each arrival-home restore-hold reason.
+_RESTORE_DEFERRED_TEXT: dict[str, str] = {
+    "manual_override": "your manual thermostat change",
+    "override_confirm_pending": "your pending thermostat change",
+    "paused_by_door": "the open door/window",
+    "open_sensor": "the open door/window",
+}
+
+
 def _in_sleep_window(now: datetime, config: dict) -> bool:
     """Return True if ``now`` falls in the configured sleep window (Issue #249).
 
@@ -857,6 +867,17 @@ class AutomationEngine:
     _mode_switch_marker: tuple[str, datetime] | None = None
     _manual_override_active: bool = False
     _override_confirm_pending: bool = False
+    # Issue #1050 (#1048 #18): True between an `occupancy_restore_deferred` and the restore
+    # actually resuming (see occupancy_restore_hold_reason()). Class-level default for engines
+    # built via object.__new__ in tests.
+    _occupancy_restore_deferred_pending: bool = False
+    # Issue #1050 (#1048 change 21): fan command read-back. Attempts = how many times a CA fan-on
+    # was found ignored by the command entity (0 -> next ignore retries once without a grace period;
+    # >=1 -> gives up with the normal grace period + one warning episode). Episode fields use
+    # next_fallback_episode(); class-level defaults for engines built via object.__new__ in tests.
+    _fan_readback_attempts: int = 0
+    _fan_readback_announced: str | None = None
+    _fan_readback_since: datetime | None = None
     _hvac_write_record: HvacWriteRecord = HvacWriteRecord()
     _mode_align_recheck_cancel: Any | None = None
     _last_mode_switch_result: HvacCommandResult | None = None
@@ -2130,6 +2151,7 @@ class AutomationEngine:
         trigger_label: str = "fan_off",
         preserve_nat_vent_session: bool = False,
         source: str = "manual",
+        start_grace: bool = True,
     ) -> None:
         """Shared "fan confirmed off" flag-clearing + grace-period logic.
 
@@ -2157,6 +2179,10 @@ class AutomationEngine:
                 caller was previously hardcoded to "manual" here, making the Activity Report
                 claim the user turned the fan off when CA corrected itself).
 
+        ``start_grace=False`` (Issue #1050 / #1048 change 21): the fan command read-back retry
+        clears the same flags but must NOT start a grace period -- the grace gates nat-vent
+        re-activation, which would block the one retry the read-back exists to attempt.
+
         Issue #731 Phase 5: the SINGLE dispatch site for ``FanFsmEventKind.FLAGS_CLEARED_FOR_GRACE``
         — both real callers (``on_fan_turned_off()``'s genuine fan-off and
         ``_reconcile_fan_physical_drift()``'s CORRECT branch) share this one dispatch rather
@@ -2181,11 +2207,10 @@ class AutomationEngine:
             self._nat_vent_soft_start = False
 
         _LOGGER.info(
-            "Fan flags cleared (%s): _fan_active/_fan_on_since cleared, _natural_vent_active %s;"
-            " starting %s grace period",
+            "Fan flags cleared (%s): _fan_active/_fan_on_since cleared, _natural_vent_active %s; %s",
             reason,
             "preserved" if preserve_nat_vent_session else "cleared",
-            trigger_label,
+            f"starting {trigger_label} grace period" if start_grace else "no grace period (read-back retry)",
         )
 
         # Restart min-runtime cycle scheduling (same as clear_fan_override does)
@@ -2193,7 +2218,8 @@ class AutomationEngine:
 
         # Start grace period to gate nat-vent re-activation — same duration as manual grace
         # but with a distinct trigger string so logs/events are distinguishable.
-        self._start_grace_period(source, trigger=trigger_label)
+        if start_grace:
+            self._start_grace_period(source, trigger=trigger_label)
 
         self._resolve_fan_fsm_state(
             kind=FanFsmEventKind.FLAGS_CLEARED_FOR_GRACE,
@@ -7898,9 +7924,25 @@ class AutomationEngine:
         # cycle.  apply_classification() runs first (it is awaited), sets _temp_command_time, and
         # clears _temp_command_pending in its finally block.  By the time handle_bedtime() runs,
         # the flag is already clear — a time-based cooldown is required.
+        # Issue #1050 (#1048 change 20): the guard only protects a write made INSIDE the sleep period
+        # (the startup apply_classification() that already applied the sleep band). A write made
+        # seconds BEFORE bedtime (e.g. a 22:29:50 daytime setpoint) must not swallow the bedtime
+        # step — that delayed the sleep band up to 30 minutes. When sleep_time/wake_time are unset
+        # _in_sleep_window() cannot answer (returns False), so keep the prior behavior there.
         if self._temp_command_time is not None and (dt_util.now() - self._temp_command_time).total_seconds() < 30:
-            _LOGGER.debug("handle_bedtime: skipping — setpoint write within last 30s (startup dedup guard)")
-            return
+            _sleep_cfg_known = bool(self.config.get("sleep_time") and self.config.get("wake_time"))
+            if not _sleep_cfg_known or _in_sleep_window(self._temp_command_time, self.config):
+                _LOGGER.info(
+                    "handle_bedtime: skipping — setpoint write within last 30s "
+                    "(startup dedup guard) write_at=%s sleep_window_known=%s",
+                    self._temp_command_time.isoformat(),
+                    _sleep_cfg_known,
+                )
+                return
+            _LOGGER.info(
+                "handle_bedtime: proceeding — recent setpoint write at %s was before the sleep period",
+                self._temp_command_time.isoformat(),
+            )
 
         # Issue #498: occupancy/override/paused/nat-vent checks below now route through the
         # single shared gate (desired_state.decide_scheduled_band_gate()) also used by
@@ -10329,6 +10371,7 @@ class AutomationEngine:
             paused_by_door=self._paused_by_door,
             manual_override_active=self._manual_override_active,
             has_classification=self._current_classification is not None,
+            override_confirm_pending=bool(self._override_confirm_pending),
         )
         return decide_away_vacation_dispatch(inputs)
 
@@ -10462,8 +10505,56 @@ class AutomationEngine:
             setback_f=setback_f,
             debounce_seconds=float(debounce_seconds),
             seconds_since_last_notified=seconds_since,
+            restore_hold=self._occupancy_restore_hold_reason(),
         )
         return decide_home_dispatch(inputs)
+
+    def _occupancy_restore_hold_reason(self) -> str | None:
+        """Why arriving home must NOT restore comfort right now, or None (Issue #1050 / #1048 #18).
+
+        Occupant: coming home during a manual thermostat change (even an unconfirmed one), a
+        door/window pause or an open window used to force comfort anyway (and a pause flipped it
+        back off at the next cycle). The restore now waits for the reason to clear.
+
+        Priority: manual_override, override_confirm_pending, paused_by_door, open_sensor.
+        Nat-vent/WHF ownership is NOT a hold (``decide_open_sensor_hold`` is False then) --
+        arrival behaviour during nat-vent is unchanged. Deliberately NOT routed through
+        ``decide_scheduled_band_gate``'s nat-vent deferral, and NOT through
+        ``_sync_paused_by_door_with_live_sensors()`` (that pauses HVAC and pushes).
+        Read-only.
+        """
+        if self._manual_override_active:
+            return "manual_override"
+        if self._override_confirm_pending:
+            return "override_confirm_pending"
+        if self._paused_by_door:
+            return "paused_by_door"
+        if decide_open_sensor_hold(
+            natural_vent_active=self._natural_vent_active,
+            whf_owns_hvac=self._whf_owns_hvac(),
+            debounce_pending=self._sensor_debounce_pending,
+            any_sensor_open=self._any_monitored_sensor_open(),
+        ):
+            return "open_sensor"
+        return None
+
+    def occupancy_restore_hold_reason(self) -> str | None:
+        """Chart/Status accessor: the reason a deferred arrival-home restore is STILL held, or None.
+
+        Non-None only between a deferral (``occupancy_restore_deferred``) and the moment the
+        reason clears or occupancy leaves home. Coordinator's target-band schedule reads this to
+        keep the chart band consistent with what the engine is actually (not) commanding.
+        Self-clearing: once the live hold reason is gone the pending marker is dropped.
+        """
+        if not self._occupancy_restore_deferred_pending:
+            return None
+        if self._occupancy_mode != OCCUPANCY_HOME:
+            self._occupancy_restore_deferred_pending = False
+            return None
+        reason = self._occupancy_restore_hold_reason()
+        if reason is None:
+            self._occupancy_restore_deferred_pending = False
+        return reason
 
     async def _apply_occupancy_home_decision(self, decision: HomeDecision) -> None:
         """Side-effecting shell for the occupancy FSM's home-authoritative branch
@@ -10476,7 +10567,27 @@ class AutomationEngine:
             return  # mirrors legacy's `if not c: return`
 
         c = self._current_classification
+        if decision.restore_deferred_reason is not None:
+            # Issue #1050 (#1048 #18): the restore waits for the reason to clear.
+            self._occupancy_restore_deferred_pending = True
+            _LOGGER.info(
+                "Occupancy home — restore deferred: reason=%s mode=%s (resumes once the reason clears)",
+                decision.restore_deferred_reason,
+                c.hvac_mode,
+            )
+            if self._emit_event_callback and not self._recent_duplicate(
+                "occupancy_restore_deferred", (decision.restore_deferred_reason,), window_seconds=600
+            ):
+                self._emit_event_callback(
+                    "occupancy_restore_deferred",
+                    {
+                        "mode": c.hvac_mode,
+                        "reason": decision.restore_deferred_reason,
+                        "indoor_f": decision.indoor_temp_f,
+                    },
+                )
         if decision.restore:
+            self._occupancy_restore_deferred_pending = False
             await self._set_temperature_for_mode(c, reason=f"occupancy home — restoring {c.hvac_mode} comfort")
             comfort = self.config["comfort_heat"] if c.hvac_mode == "heat" else self.config["comfort_cool"]
             if self._emit_event_callback:
@@ -10518,11 +10629,14 @@ class AutomationEngine:
 
         if decision.notify is HomeNotifyOutcome.SEND:
             self._last_welcome_home_notified = dt_util.now()
-            await self._notify(
-                "🏠 Welcome home! Restoring comfort temperature. Should feel normal in about 20–30 minutes.",
-                "Climate Advisor",
-                notification_type="occupancy_home",
-            )
+            if decision.restore_deferred_reason is not None:
+                _msg = (
+                    "🏠 Welcome home! Comfort temperature will resume once "
+                    f"{_RESTORE_DEFERRED_TEXT.get(decision.restore_deferred_reason, 'the hold')} clears."
+                )
+            else:
+                _msg = "🏠 Welcome home! Restoring comfort temperature. Should feel normal in about 20–30 minutes."
+            await self._notify(_msg, "Climate Advisor", notification_type="occupancy_home")
 
     def _build_fan_fsm_inputs(
         self,
@@ -10586,6 +10700,9 @@ class AutomationEngine:
             and physical_state_available
         ):
             physical_on = self._get_fan_physical_state_callback()
+            if physical_on is None:
+                # Issue #1050: lockstep with _reconcile_fan_physical_drift()'s command read-back.
+                physical_on = self._whf_command_readback_on(fan_mode)
 
         comfort_heat_raw = float(self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
 
@@ -11917,6 +12034,64 @@ class AutomationEngine:
             f"The indoor temperature sensor is reporting again {when}. {tail}",
         )
 
+    def _whf_command_readback_on(self, fan_mode: str) -> bool | None:
+        """Read back CA's own whole-house-fan on-command from the command entity (Issue #1050).
+
+        Occupant: a fan switch that silently ignores "on" no longer leaves the AC suppressed forever.
+
+        Only meaningful where there is no feedback ground truth (fan_state_feedback off -- the
+        default). Returns:
+          * False -- the command entity reads off AND its ``last_changed`` is older than CA's last
+            fan toggle command: the switch never reacted (the ignored-command case);
+          * True  -- the command entity reads on;
+          * None  -- unknowable or not CA's to judge: WHF/BOTH only (the HVAC fan is a different
+            mechanism), a CA-owned session only (a manual/RF-remote session has no CA command to read
+            back), no command recorded yet, entity missing/unavailable, or ``assumed_state`` (remote /
+            IR / momentary transmitters that cannot report state are left alone), or the entity
+            changed AFTER the command (someone turned it off -- the manual-change listener owns that).
+        """
+        if fan_mode not in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_BOTH):
+            return None
+        if self._fan_override_active or self._fan_toggle_command_time is None:
+            return None
+        fan_entity = self.config.get(CONF_FAN_ENTITY)
+        if not fan_entity:
+            return None
+        state = self.hass.states.get(fan_entity)
+        on = fan_entity_on(state)
+        if on is None or on:
+            return on
+        changed = getattr(state, "last_changed", None)
+        try:
+            if isinstance(changed, datetime) and changed < self._fan_toggle_command_time:
+                return False
+        except TypeError:  # naive vs aware -- cannot compare, so do not judge
+            return None
+        return None
+
+    def _announce_fan_readback_failure(self) -> None:
+        """One warning per episode when a retried fan command is ignored again (Issue #1050)."""
+        step = next_fallback_episode(
+            "fan_command_ignored", self._fan_readback_announced, self._fan_readback_since, dt_util.now()
+        )
+        self._fan_readback_announced, self._fan_readback_since = step.announced, step.since
+        if step.kind == "fallback":
+            _LOGGER.warning(
+                "Fan command ignored twice: the whole-house fan switch does not react to turn_on, so "
+                "Climate Advisor has released the AC and will not rely on the fan. Check the fan switch "
+                "or enable fan-state feedback"
+            )
+
+    def _note_fan_readback_recovered(self) -> None:
+        """The fan entity reads on again: close any read-back episode and reset the retry budget."""
+        if self._fan_readback_attempts == 0 and self._fan_readback_announced is None:
+            return
+        step = next_fallback_episode(None, self._fan_readback_announced, self._fan_readback_since, dt_util.now())
+        self._fan_readback_attempts = 0
+        self._fan_readback_announced, self._fan_readback_since = None, None
+        if step.kind == "recovered":
+            _LOGGER.info("Fan command read-back recovered: the fan switch reacts to commands again")
+
     def _reconcile_fan_physical_drift(self) -> None:
         """Detect and self-correct a stale _fan_active=True with no matching physical fan (Issue #423).
 
@@ -11966,6 +12141,7 @@ class AutomationEngine:
         # once every cheaper guard (fan active, applicable archetype, no recent CA
         # command echo) has already passed — avoids an unnecessary state read otherwise.
         physical_on = None
+        _readback_drift = False
         _applicable_archetype = fan_mode in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_HVAC, FAN_MODE_BOTH)
         if self._fan_active and _applicable_archetype and not recent_fan_command:
             if fan_mode == FAN_MODE_HVAC:
@@ -11983,6 +12159,12 @@ class AutomationEngine:
                 )
             elif physical_state_available:
                 physical_on = self._get_fan_physical_state_callback()
+                if physical_on is None:
+                    # Issue #1050 (#1048 change 21): no feedback ground truth (the default) -- read
+                    # back CA's own on-command from the command entity. False only when that entity
+                    # never reacted to the command (last_changed older than the command).
+                    physical_on = self._whf_command_readback_on(fan_mode)
+                    _readback_drift = physical_on is False
 
         # Issue #446 instrumentation: log the raw inputs on EVERY tick, not just on confirmed
         # drift, so a future recurrence has real evidence instead of inference. `physical_on`
@@ -11992,12 +12174,13 @@ class AutomationEngine:
         _command_state = self.hass.states.get(self.config.get(CONF_FAN_ENTITY, ""))
         _LOGGER.debug(
             "Fan drift tick: fan_active=%s fan_mode=%s recent_command=%s physical_available=%s"
-            " physical_on=%s command_entity_state=%s tick_count=%d",
+            " physical_on=%s readback=%s command_entity_state=%s tick_count=%d",
             self._fan_active,
             fan_mode,
             recent_fan_command,
             physical_state_available,
             physical_on,
+            _readback_drift,
             _command_state.state if _command_state else "unavailable",
             self._fan_drift_tick_count,
         )
@@ -12034,6 +12217,9 @@ class AutomationEngine:
         outcome, next_tick_count = decide_fan_drift_reconciliation(inputs)
         self._fan_drift_tick_count = next_tick_count
 
+        if outcome is FanDriftOutcome.RESET and physical_on is True and inputs.fan_active:
+            self._note_fan_readback_recovered()
+
         if outcome is FanDriftOutcome.AWAITING:
             _LOGGER.info(
                 "Fan physical-state drift detected (tick %d/2): _fan_active=True but physical"
@@ -12041,19 +12227,36 @@ class AutomationEngine:
                 next_tick_count,
             )
         elif outcome is FanDriftOutcome.CORRECT:
-            _LOGGER.warning(
-                "Fan physical-state drift confirmed over 2 backstop ticks: _fan_active=True but"
-                " physical state=off — self-correcting stale flag (Issue #423)"
-            )
-            if self._emit_event_callback:
-                self._emit_event_callback(
-                    "fan_cancel",
-                    {
-                        "trigger": "physical_drift_correction",
-                        "reason": "physical-state drift confirmed over 2 backstop ticks",
-                        "fan_device": _fan_device_label(self.config),
-                    },
+            # Issue #1050 (#1048 change 21): a read-back drift means the fan's command entity never
+            # reacted to CA's on-command. First time: release and let the nat-vent re-fire retry
+            # (NO grace period -- it would block that retry). Second time: give up through the normal
+            # correction (grace gates re-activation) and raise ONE warning episode.
+            _readback_retry = _readback_drift and self._fan_readback_attempts == 0
+            if _readback_drift:
+                self._fan_readback_attempts += 1
+                _LOGGER.info(
+                    "Fan command ignored: command entity never reacted to CA's on-command (attempt %d) -- %s",
+                    self._fan_readback_attempts,
+                    "releasing and retrying once" if _readback_retry else "giving up",
                 )
+                if not _readback_retry:
+                    self._announce_fan_readback_failure()
+            else:
+                _LOGGER.warning(
+                    "Fan physical-state drift confirmed over 2 backstop ticks: _fan_active=True but"
+                    " physical state=off — self-correcting stale flag (Issue #423)"
+                )
+            if self._emit_event_callback:
+                _cancel_payload: dict[str, Any] = {
+                    "trigger": "physical_drift_correction",
+                    "reason": "physical-state drift confirmed over 2 backstop ticks",
+                    "fan_device": _fan_device_label(self.config),
+                }
+                if _readback_drift:
+                    _cancel_payload["reason"] = "fan command ignored: command entity never reacted"
+                    _cancel_payload["readback"] = True
+                    _cancel_payload["retry"] = _readback_retry
+                self._emit_event_callback("fan_cancel", _cancel_payload)
             # Issue #561: preserving the nat-vent session across this correction (so
             # nat_vent_temperature_check() can immediately re-fire below) is only correct if
             # the session is still legitimately justified by an open sensor. Without this
@@ -12077,12 +12280,16 @@ class AutomationEngine:
                 trigger_label="physical_drift_correction",
                 preserve_nat_vent_session=_preserve_session,
                 source="automation",
+                **({"start_grace": False} if _readback_retry else {}),
             )
             if _was_nat_vent_active and not _preserve_session:
                 self._release_whf_and_reclassify(
                     reason="physical-drift correction found the nat-vent session's sensors closed"
                 )
-            if fan_mode in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_BOTH):
+            _stale_on_belief = not _readback_drift
+            # (Skipped for a read-back drift: the command entity already reads off and never reacted
+            # to CA, so there is no stale "on" belief to sync -- Issue #1050.)
+            if fan_mode in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_BOTH) and _stale_on_belief:
                 # Issue #449: the control entity's own HA-reported state can silently stay
                 # stuck "on" (a one-way transmitter has no feedback of its own) even though
                 # ground truth has just confirmed the fan is physically off — reconcile it now

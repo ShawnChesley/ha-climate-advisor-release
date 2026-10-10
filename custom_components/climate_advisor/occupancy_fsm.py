@@ -104,11 +104,15 @@ class AwayVacationInputs:
       paused_by_door       -> self._paused_by_door
       manual_override_active -> self._manual_override_active
       has_classification   -> self._current_classification is not None
+      override_confirm_pending -> self._override_confirm_pending (Issue #1050 / #1048 change 18:
+                              leaving home while a manual change is still unconfirmed cancels
+                              it and applies the setback, exactly like a confirmed override)
     """
 
     paused_by_door: bool
     manual_override_active: bool
     has_classification: bool
+    override_confirm_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,7 +139,7 @@ def decide_away_vacation_dispatch(inputs: AwayVacationInputs) -> AwayVacationDec
     """
     if inputs.paused_by_door:
         return AwayVacationDecision(AwayVacationOutcome.SUPPRESSED_PAUSED, clear_override=False)
-    clear_override = inputs.manual_override_active
+    clear_override = inputs.manual_override_active or inputs.override_confirm_pending
     if not inputs.has_classification:
         return AwayVacationDecision(AwayVacationOutcome.NO_CLASSIFICATION, clear_override=clear_override)
     return AwayVacationDecision(AwayVacationOutcome.APPLY, clear_override=clear_override)
@@ -166,6 +170,11 @@ class HomeInputs:
       debounce_seconds      -> config CONF_WELCOME_HOME_DEBOUNCE (or its default)
       seconds_since_last_notified -> elapsed seconds since self._last_welcome_home_notified,
                                or None if never notified
+      restore_hold         -> Issue #1050 (#1048 change 18): the reason the comfort restore must
+                               wait, or None. Resolved by the engine shell (priority:
+                               manual_override, override_confirm_pending, paused_by_door,
+                               open_sensor via ``decide_open_sensor_hold()``); nat-vent/WHF
+                               ownership yields None (unchanged behavior).
     """
 
     has_classification: bool
@@ -175,6 +184,7 @@ class HomeInputs:
     setback_f: float | None
     debounce_seconds: float
     seconds_since_last_notified: float | None
+    restore_hold: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,11 +202,16 @@ class HomeDecision:
     that drove the decision instead of re-reading the sensor after an await (which
     could return None). Non-None on SUPPRESSED_NEAR_COMFORT by construction;
     default None on the NONE outcome.
+
+    ``restore_deferred_reason`` (Issue #1050): non-None exactly when a restore WOULD have
+    happened (hvac_mode heat/cool) but ``HomeInputs.restore_hold`` held it. ``restore`` is
+    then False. The restore resumes through the normal paths once the reason clears.
     """
 
     restore: bool
     notify: HomeNotifyOutcome
     indoor_temp_f: float | None = None
+    restore_deferred_reason: str | None = None
 
 
 def decide_home_dispatch(inputs: HomeInputs) -> HomeDecision:
@@ -207,7 +222,9 @@ def decide_home_dispatch(inputs: HomeInputs) -> HomeDecision:
     if not inputs.has_classification:
         return HomeDecision(restore=False, notify=HomeNotifyOutcome.NONE)
 
-    restore = inputs.hvac_mode in _RESTORE_MODES
+    would_restore = inputs.hvac_mode in _RESTORE_MODES
+    restore = would_restore and inputs.restore_hold is None
+    deferred = inputs.restore_hold if would_restore else None
 
     # Check 1: temperature proximity — skip notification if house already near comfort.
     if (
@@ -218,7 +235,10 @@ def decide_home_dispatch(inputs: HomeInputs) -> HomeDecision:
         and abs(inputs.indoor_temp_f - inputs.comfort_f) < abs(inputs.indoor_temp_f - inputs.setback_f)
     ):
         return HomeDecision(
-            restore=restore, notify=HomeNotifyOutcome.SUPPRESSED_NEAR_COMFORT, indoor_temp_f=inputs.indoor_temp_f
+            restore=restore,
+            notify=HomeNotifyOutcome.SUPPRESSED_NEAR_COMFORT,
+            indoor_temp_f=inputs.indoor_temp_f,
+            restore_deferred_reason=deferred,
         )
 
     # Check 2: debounce — skip notification if one was sent recently.
@@ -228,7 +248,15 @@ def decide_home_dispatch(inputs: HomeInputs) -> HomeDecision:
         and inputs.seconds_since_last_notified < inputs.debounce_seconds
     ):
         return HomeDecision(
-            restore=restore, notify=HomeNotifyOutcome.SUPPRESSED_DEBOUNCE, indoor_temp_f=inputs.indoor_temp_f
+            restore=restore,
+            notify=HomeNotifyOutcome.SUPPRESSED_DEBOUNCE,
+            indoor_temp_f=inputs.indoor_temp_f,
+            restore_deferred_reason=deferred,
         )
 
-    return HomeDecision(restore=restore, notify=HomeNotifyOutcome.SEND, indoor_temp_f=inputs.indoor_temp_f)
+    return HomeDecision(
+        restore=restore,
+        notify=HomeNotifyOutcome.SEND,
+        indoor_temp_f=inputs.indoor_temp_f,
+        restore_deferred_reason=deferred,
+    )

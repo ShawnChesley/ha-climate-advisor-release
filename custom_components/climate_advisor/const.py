@@ -206,6 +206,15 @@ def is_availability_recovery(old_state: Any) -> bool:
     return old_state is not None and is_unavailable_state(getattr(old_state, "state", None))
 
 
+# Issue #1048 change 9 -- "house off-target with no equipment running" stall alert.
+# Outside the active comfort band by more than this margin ...
+COMFORT_STALL_MARGIN_F = 1.0
+# ... continuously for this long, with no heating/cooling equipment run in the needed direction ...
+COMFORT_STALL_SUSTAIN_SECONDS = 3 * 3600
+# ... raises one owner alert, repeated no more often than this while it persists.
+COMFORT_STALL_REMINDER_SECONDS = 12 * 3600
+
+
 # Occupancy toggle configuration
 CONF_HOME_TOGGLE = "home_toggle_entity"
 CONF_HOME_TOGGLE_INVERT = "home_toggle_invert"

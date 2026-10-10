@@ -189,6 +189,24 @@ UNMAPPED_PRODUCTION_EVENTS: frozenset[str] = frozenset(
         "hvac_mode_not_applied",
         "hvac_mode_applied_recovered",
         "hvac_command_recovered",
+        # Issue #1050 (#1048 change 18): occupancy_restore_deferred records that an arrival-home
+        # comfort restore was HELD (manual override / unconfirmed change / door pause / open
+        # window). It is the absence of a write, never a decision outcome itself; left mapped it
+        # would hit the 'unknown:<type>' catch-all and shadow the prior real outcome under
+        # last-decision-wins. Cannot hide a real failure: a scenario that expects the restore
+        # asserts comfort_restored (occupancy_comfort_restored), which is simply not emitted
+        # while held, so the assertion still fails; the hold itself is asserted through the
+        # engine's occupancy_restore_hold_reason() accessor and the real-engine unit tests.
+        # Issue #1050 (#1048 change 9): hvac_output_stall / hvac_output_stall_recovered are
+        # coordinator-level owner-alert rows (house off-target for 3 h with no equipment running
+        # in the needed direction, then its recovery). They never command HVAC and the engine
+        # never emits them; the fake thermostat sets no hvac_action, so a stall would be excluded
+        # anyway. Registered unmapped so they cannot hit the unknown:<type> catch-all and shadow
+        # a real outcome under last-decision-wins. Cannot hide a real failure: whether the house
+        # ended in band / the mode was applied is asserted through live engine state, not these rows.
+        "hvac_output_stall",
+        "hvac_output_stall_recovered",
+        "occupancy_restore_deferred",
     }
 )
 

@@ -52,6 +52,7 @@ from .automation import (
 from .briefing import generate_briefing
 from .chart_log import ChartStateLog
 from .classifier import DayClassification, ForecastSnapshot, classify_day
+from .comfort_stall_decision import StallReason, decide_comfort_stall
 from .confirmed_transition import is_confirmed, resolve_candidate_since
 from .const import (
     _VENT_SPLIT_TYPES,
@@ -90,6 +91,9 @@ from .const import (
     BRIEFING_NAT_VENT_CUTOFF_DRIFT_THRESHOLD_MINUTES,
     BRIEFING_TODAY_HIGH_DRIFT_THRESHOLD_F,
     CHART_LOG_MAX_DAYS,
+    COMFORT_STALL_MARGIN_F,
+    COMFORT_STALL_REMINDER_SECONDS,
+    COMFORT_STALL_SUSTAIN_SECONDS,
     CONF_AI_API_KEY,
     CONF_AI_ENABLED,
     CONF_AUTOMATION_GRACE_PERIOD,
@@ -248,6 +252,7 @@ from .const import (
 from .entity_health import run_entity_health_sweep
 from .fan_mode_resolver import is_thermostat_fan_physically_active
 from .fan_status import (
+    fan_entity_on,
     is_ca_fan_running,
     parse_remote_speed_event,
     parse_remote_timer_event,
@@ -285,6 +290,7 @@ from .temperature import (
     display_temp,
     find_temperature_crossing,
     format_temp,
+    format_temp_delta,
     free_cooling_direction_ok,
     ha_system_unit,
     is_sensor_stale,
@@ -567,6 +573,17 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         "cool": ("_hvac_on_since", "hvac_runtime_minutes"),
         "fan_only": ("_thermostat_fan_only_on_since", "thermostat_fan_only_runtime_minutes"),
     }
+
+    # Issue #1048 change 9: comfort stall alert state. Class-level defaults (immutable or
+    # lazily created) so coordinators built via object.__new__ in tests still work. Not
+    # persisted -- a restart restarts the 3 h clock, matching confirmed_transition.py.
+    _equipment_last_active: dict[str, datetime] | None = None  # "heat"/"cool" -> last hvac_action seen
+    _stall_direction: str | None = None
+    _stall_since: datetime | None = None
+    _stall_announced_direction: str | None = None
+    _stall_announced_at: datetime | None = None
+    _stall_last_push: datetime | None = None
+    _stall_status: dict[str, str] | None = None  # the open hvac_control_issues entry, else None
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any], entry_id: str = "") -> None:
         """Initialize the coordinator."""
@@ -2524,15 +2541,22 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self._door_open_timers.clear()
             self._door_open_timer_expiry.clear()
 
-    def _is_sensor_open(self, entity_id: str) -> bool:
-        """Check if a door/window sensor is in the 'open' state, respecting polarity."""
-        inverted = self.config.get(CONF_SENSOR_POLARITY_INVERTED, False)
-        state = self.hass.states.get(entity_id)
+    def _state_is_open(self, state: Any) -> bool:
+        """Return True when an HA contact-sensor State (or None) reads 'open', respecting polarity.
+
+        Shared by ``_is_sensor_open`` (the live read) and ``_async_door_window_changed``
+        (the event's ``old_state``) so both agree on what "open" means (Issue #1048
+        change 19) — an unavailable/unknown/missing state is never open.
+        """
         if not state:
             return False
-        if inverted:
+        if self.config.get(CONF_SENSOR_POLARITY_INVERTED, False):
             return state.state == "off"
         return state.state == "on"
+
+    def _is_sensor_open(self, entity_id: str) -> bool:
+        """Check if a door/window sensor is in the 'open' state, respecting polarity."""
+        return self._state_is_open(self.hass.states.get(entity_id))
 
     def _is_recent_hvac_command(self, threshold_seconds: float = 3.0) -> bool:
         """Check if an HVAC command was issued very recently (race guard)."""
@@ -5191,8 +5215,17 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 pre_cool_trigger_h=_pc_trigger_h,
                 pre_cool_target=_pc_target,
                 tou_precondition_window=self._tou_precondition_window_tuple(),
+                restore_hold=self._occupancy_restore_held(),
             )
         )
+
+    def _occupancy_restore_held(self) -> bool:
+        """True while the engine is holding a deferred arrival-home comfort restore (Issue #1050)."""
+        engine = getattr(self, "automation_engine", None)
+        accessor = getattr(engine, "occupancy_restore_hold_reason", None)
+        if not callable(accessor):
+            return False
+        return isinstance(accessor(), str)
 
     def _resolve_target_band_schedule(self) -> None:
         """Resolve and cache this cycle's target-band schedule (Issue #514) — cached on
@@ -5787,6 +5820,31 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 cancel()
                 _LOGGER.info("Contact sensor closed: %s — debounce cancelled", entity_id)
 
+            # Issue #1048 change 19: a closed->closed (or unavailable->closed) re-report
+            # carries no information. After an HA restart every contact sensor re-registers
+            # and fires one of these, which flooded the Activity Log with ~48 identical
+            # "all sensors closed" rows. Skip only when nothing could need clearing: the
+            # prior state exists and was not open, the engine is not paused by a door (a
+            # persisted pause must still clear after a restart), nat-vent is inactive and no
+            # fan session is live (handle_all_doors_windows_closed() also ends those).
+            # old_state=None (no prior state at all) always proceeds.
+            _old_state = event.data.get("old_state")
+            _engine = self.automation_engine
+            if (
+                _old_state is not None
+                and not self._state_is_open(_old_state)
+                and not _engine._paused_by_door
+                and not _engine._natural_vent_active
+                and not _engine._fan_active
+                and not _engine._fan_override_active
+            ):
+                _LOGGER.debug(
+                    "Contact sensor closed re-report skipped: %s (was %s) — nothing paused or ventilating",
+                    entity_id,
+                    getattr(_old_state, "state", "none"),
+                )
+                return
+
             # Check if ALL monitored sensors are now closed
             all_closed = all(not self._is_sensor_open(s) for s in self._resolved_sensors)
             if all_closed:
@@ -5886,6 +5944,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         old_state = event.data.get("old_state")
         if not new_state or not old_state:
             return
+
+        # Issue #1048 change 9: remember when heating/cooling equipment was last seen active
+        # (per direction) for the comfort stall alert. Before any early return so a short
+        # cycle between two 30-min coordinator updates is never missed.
+        self._note_equipment_activity(new_state.attributes.get("hvac_action"), old_state.attributes.get("hvac_action"))
 
         # Bug 1 (Issue #321): Suppress override detection during startup coalescing window
         if self._suppress_during_startup_coalescing(f"thermostat override detection for {new_state.state}"):
@@ -7259,7 +7322,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         when falling back.
 
         Returns:
-            True/False if the fan is physically running (feedback mode), None if command-only.
+            True/False if the fan is physically running (feedback mode). None means UNKNOWN and
+            must never be read as off (Issue #1050, #1048 change 21): command-only mode, an
+            unavailable/unknown/missing command entity, an ``assumed_state`` entity, or no fan
+            entity configured at all.
         """
         if not self._fan_state_feedback_enabled():
             _LOGGER.debug("_get_fan_physical_state: returning None — fan_state_feedback=False (command-only mode)")
@@ -7267,9 +7333,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         fan_state_entity_id = self.config.get(CONF_FAN_STATE_ENTITY)
         if fan_state_entity_id:
             state = self.hass.states.get(fan_state_entity_id)
-            if state is not None and not is_unavailable_state(state.state):
+            state_on = fan_entity_on(state)
+            if state_on is not None:
                 self._fan_state_entity_unavailable_warned = False  # reset on success
-                return state.state.lower() in ("on", "true")
+                return state_on
             # Unavailable or missing — warn once then fall back
             if not self._fan_state_entity_unavailable_warned:
                 _LOGGER.warning(
@@ -7280,10 +7347,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # Fallback: read the fan command entity
         fan_entity_id = self.config.get(CONF_FAN_ENTITY)
         if fan_entity_id:
-            fan_state = self.hass.states.get(fan_entity_id)
-            if fan_state is not None:
-                return fan_state.state.lower() in ("on", "true")
-        return False
+            return fan_entity_on(self.hass.states.get(fan_entity_id))
+        return None
 
     def _run_invariant_watchdog(self, *, hvac_action: str | None) -> list:
         """Check hard system invariants and alert on any violation (Issue #749).
@@ -9868,6 +9933,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if mins is not None:
                 detail += f" for {mins} min"
             issues.append({"issue": "command_failing", "detail": detail})
+        # Issue #1048 change 9: the comfort stall entry. Hidden while a mode-not-obeyed
+        # episode is open -- that entry already says why the equipment is not running.
+        stall = self._stall_status
+        if isinstance(stall, dict) and stall and not any(i["issue"] == "mode_not_obeyed" for i in issues):
+            issues.append(dict(stall))
         return issues
 
     def _thermostat_incident_context(self) -> dict[str, Any]:
@@ -9896,6 +9966,168 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             rec = getattr(ae, "_hvac_write_record", None)
             ctx["last_command_result"] = hvac_outcome_label(getattr(rec, "result", None))
         return ctx
+
+    def _note_equipment_activity(self, *actions: Any, now: datetime | None = None) -> None:
+        """Stamp "heating/cooling equipment was active" for the direction(s) in ``actions``.
+
+        The per-direction runtime signal the comfort stall alert needs (Issue #1048 change 9).
+        ``hvac_runtime_minutes`` sums heat and cool and is only flushed at session end, so it
+        cannot answer "has heating run recently?"; this records the last equipment-active
+        ``hvac_action`` per direction instead. Only ``hvac_action`` counts (a thermostat
+        mode of heat/cool says nothing about the equipment).
+        """
+        for action in actions:
+            direction = {"heating": "heat", "cooling": "cool"}.get(action.lower()) if isinstance(action, str) else None
+            if direction is None:
+                continue
+            if self._equipment_last_active is None:
+                self._equipment_last_active = {}
+            self._equipment_last_active[direction] = now or dt_util.now()
+
+    def _update_comfort_stall(
+        self, indoor: float | None, comfort_heat: float | None, comfort_cool: float | None, now: datetime
+    ) -> None:
+        """Track and announce "off-target for hours with no equipment running" (Issue #1048 change 9).
+
+        Occupant outcome: a house left cold (or hot) by a thermostat that never starts the
+        equipment now raises a push alert (not email) after 3 h, repeating every 12 h, instead
+        of going unnoticed for days. Decision lives in ``decide_comfort_stall`` (pure); this
+        shell owns the clock state, the Activity Log events, the push and the Status entry
+        (``hvac_control_issues``). Suppressed -- but the clock keeps running -- while a
+        mode-not-obeyed episode is open, because that entry already explains the idle equipment.
+        """
+        ae = self.automation_engine
+        if ae is None:
+            return
+        state = self.hass.states.get(ae.climate_entity)
+        state_str = getattr(state, "state", None)
+        raw_attrs = getattr(state, "attributes", None)
+        attrs: dict[str, Any] = raw_attrs if isinstance(raw_attrs, dict) else {}
+        action = attrs.get("hvac_action")
+        action = action if isinstance(action, str) and action else None
+        modes = attrs.get("hvac_modes")
+        self._note_equipment_activity(action, now=now)
+
+        in_tolerance = (
+            indoor is not None
+            and comfort_heat is not None
+            and comfort_cool is not None
+            and self._is_nat_vent_tolerated_deviation(indoor, comfort_heat, comfort_cool)
+        )
+        decision = decide_comfort_stall(
+            indoor=indoor,
+            comfort_heat=comfort_heat,
+            comfort_cool=comfort_cool,
+            now=now,
+            margin_f=COMFORT_STALL_MARGIN_F,
+            sustain_seconds=COMFORT_STALL_SUSTAIN_SECONDS,
+            previous_direction=self._stall_direction,
+            previous_since=self._stall_since,
+            last_active=dict(self._equipment_last_active or {}),
+            thermostat_available=state is not None and not is_unavailable_state(state_str),
+            has_hvac_action=action is not None,
+            hvac_modes=modes if isinstance(modes, (list, tuple)) else None,
+            manual_control=bool(getattr(ae, "_manual_override_active", False))
+            or bool(getattr(ae, "_override_confirm_pending", False)),
+            sensor_open=self._any_sensor_open() or bool(getattr(ae, "_paused_by_door", False)),
+            startup_coalescing=bool(self._startup_coalesce_active),
+            nat_vent_tolerated=in_tolerance,
+        )
+        self._stall_direction = decision.direction
+        self._stall_since = decision.since
+
+        if decision.reason is StallReason.EXCLUDED:
+            # Quiet: hide the Status entry; keep any announcement so recovery is still reported.
+            self._stall_status = None
+            _LOGGER.debug("Comfort stall check skipped: excluded_by=%s", decision.excluded_by)
+            return
+
+        announced = self._stall_announced_direction
+        if decision.reason is not StallReason.STALLED:
+            self._stall_status = None
+            if announced is not None:
+                # In band again, or heating/cooling equipment ran after the alert.
+                minutes = (
+                    round((now - self._stall_announced_at).total_seconds() / 60) if self._stall_announced_at else None
+                )
+                recovered_by = "in_band" if decision.reason is StallReason.IN_BAND else "equipment_ran"
+                _LOGGER.info(
+                    "Comfort stall recovered: direction=%s reason=%s minutes=%s", announced, recovered_by, minutes
+                )
+                self._emit_event(
+                    "hvac_output_stall_recovered",
+                    {"direction": announced, "reason": recovered_by, "minutes_down": minutes},
+                )
+                self._stall_announced_direction = None
+                self._stall_announced_at = None
+                self._stall_last_push = None
+                # hvac_control_issues was computed earlier in this cycle: refresh once (on the
+                # transition only, so no loop) so Status drops the entry now, not 30 min later.
+                self.hass.async_create_task(self.async_request_refresh())
+            return
+
+        # Confirmed stall.
+        direction = decision.direction or "heat"
+        if indoor is None or comfort_heat is None or comfort_cool is None:
+            return  # unreachable: the decision excludes missing inputs
+        unit = self.config.get("temp_unit", "fahrenheit")
+        edge = comfort_heat if direction == "heat" else comfort_cool
+        elapsed_s = (now - (decision.effective_since or now)).total_seconds()
+        hours = max(1, round(elapsed_s / 3600))
+        side = "below" if direction == "heat" else "above"
+        equipment = "heating" if direction == "heat" else "cooling"
+        gap_txt = format_temp_delta(abs(indoor - edge), unit, 1)
+        mode_txt = state_str if isinstance(state_str, str) else "unknown"
+        diag = f"thermostat mode {mode_txt}, action {action}"
+        self._stall_status = None
+        if any(i["issue"] == "mode_not_obeyed" for i in self._compute_hvac_control_issues()):
+            _LOGGER.info(
+                "Comfort stall alert held: direction=%s hours=%d -- a mode-not-obeyed episode is open", direction, hours
+            )
+            return
+        self._stall_status = {
+            "issue": "output_stall",
+            "detail": (
+                f"House has been {gap_txt} {side} the comfort band for {hours} h with no {equipment} running ({diag})"
+            ),
+        }
+        message = (
+            f"The house is {gap_txt} {side} your comfort band ({format_temp(edge, unit)}) and the {equipment}"
+            f" hasn't run for {hours} hours ({diag})."
+        )
+        if announced != direction:
+            _LOGGER.warning(
+                "Comfort stall detected: direction=%s indoor=%.1fF edge=%.1fF hours=%d thermostat_mode=%s action=%s",
+                direction,
+                indoor,
+                edge,
+                hours,
+                mode_txt,
+                action,
+            )
+            self._emit_event(
+                "hvac_output_stall",
+                {
+                    "direction": direction,
+                    "indoor_f": indoor,
+                    "edge_f": edge,
+                    "hours": hours,
+                    "thermostat_mode": mode_txt,
+                    "thermostat_action": action,
+                },
+            )
+            self._stall_announced_direction = direction
+            self._stall_announced_at = now
+            self._stall_last_push = now
+            self._notify_in_background("Climate Advisor — house off-target", message, "hvac_output_stall", email=False)
+            # Same lag as the recovery path: refresh once on the open transition only.
+            self.hass.async_create_task(self.async_request_refresh())
+        elif reminder_due(self._stall_last_push, now, COMFORT_STALL_REMINDER_SECONDS):
+            _LOGGER.info("Comfort stall reminder: direction=%s hours=%d", direction, hours)
+            self._stall_last_push = now
+            self._notify_in_background(
+                "Climate Advisor — house still off-target", message, "hvac_output_stall", email=False
+            )
 
     def _is_nat_vent_tolerated_deviation(self, indoor: float, comfort_heat: float, comfort_cool: float) -> bool:
         """True if this comfort-band deviation is expected nat-vent cycling tolerance, not a violation.
@@ -10004,6 +10236,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # used for both the violation-detection comparison below and the incident payload
         # stamped by _emit_incident() so a reviewer sees the band that was actually active.
         comfort_heat, comfort_cool = self._resolve_active_comfort_band()
+        # Issue #1048 change 9: isolated -- a bug in the stall tracker must never abort the
+        # incident scan (or the update cycle) that is detecting a different problem.
+        try:
+            self._update_comfort_stall(indoor, comfort_heat, comfort_cool, now)
+        except Exception:
+            _LOGGER.warning("Comfort stall tracking failed", exc_info=True)
         if (
             indoor
             and comfort_cool
@@ -12072,6 +12310,7 @@ def _compute_target_band_schedule(
     pre_cool_trigger_h: float | None = None,
     pre_cool_target: float | None = None,
     tou_precondition_window: tuple[datetime, datetime, float, str] | None = None,
+    restore_hold: bool = False,
 ) -> list[dict]:
     """Compute the dynamic target band (lower/upper) for each hourly timestamp.
 
@@ -12101,6 +12340,12 @@ def _compute_target_band_schedule(
     computed value would otherwise not exactly match the commanded setpoint (mandatory
     Chart Coverage rule — the chart must never show a band conflicting with what the
     engine actually commands).
+
+    ``restore_hold`` (Issue #1050, #1048 change 18): an arrival-home comfort restore is being
+    HELD by the engine (manual override, unconfirmed change, door pause or open window), so
+    the thermostat is still on the away setback. Home timestamps today that are not after
+    ``now`` then show the setback band, so the chart never claims comfort the engine is not
+    commanding. Later hours show the normal schedule (the hold is expected to clear).
     """
     comfort_heat = float(config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
     comfort_cool = float(config.get("comfort_cool", DEFAULT_COMFORT_COOL))
@@ -12147,7 +12392,7 @@ def _compute_target_band_schedule(
         if occupancy_mode == OCCUPANCY_VACATION:
             lower = setback_heat_eff - VACATION_SETBACK_EXTRA
             upper = setback_cool_eff + VACATION_SETBACK_EXTRA
-        elif occupancy_mode == OCCUPANCY_AWAY and ts_date == now_date:
+        elif ts_date == now_date and (occupancy_mode == OCCUPANCY_AWAY or (restore_hold and ts <= now)):
             lower = setback_heat_eff
             upper = setback_cool_eff
         else:

@@ -1865,6 +1865,48 @@ def _render_hvac_command_recovered(p: dict, unit: str) -> tuple[str, str]:
     return "Thermostat accepting commands again", (f"down {minutes} min" if minutes is not None else "")
 
 
+def _render_occupancy_restore_deferred(p: dict, unit: str) -> tuple[str, str]:
+    # Issue #1050 (#1048 change 18): arriving home while a hold is active -- the comfort restore waits.
+    why = {
+        "manual_override": "manual thermostat change",
+        "override_confirm_pending": "unconfirmed thermostat change",
+        "paused_by_door": "door/window open",
+        "open_sensor": "door/window open",
+    }.get(p.get("reason", ""), p.get("reason") or "hold")
+    mode = p.get("mode", "")
+    settings = f"resumes once it clears ({mode})" if mode else "resumes once it clears"
+    return f"Occupancy -- comfort restore deferred ({why})", settings
+
+
+def _render_hvac_output_stall(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1048 change 9: off-target for hours and no equipment ran in the needed direction."""
+    heating = p.get("direction") != "cool"
+    side, equipment = ("below", "heating") if heating else ("above", "cooling")
+    hours = p.get("hours")
+    label = f"House is {side} the comfort band and the {equipment} hasn't run" + (
+        f" for {hours} hours" if hours is not None else ""
+    )
+    parts: list[str] = []
+    with contextlib.suppress(TypeError, ValueError):
+        if p.get("indoor_f") is not None:
+            parts.append(f"indoor {format_temp(float(p['indoor_f']), unit)}")
+        if p.get("edge_f") is not None:
+            parts.append(f"band edge {format_temp(float(p['edge_f']), unit)}")
+    if p.get("thermostat_mode"):
+        parts.append(f"thermostat mode {p['thermostat_mode']}")
+    if p.get("thermostat_action"):
+        parts.append(f"action {p['thermostat_action']}")
+    return label, ", ".join(parts)
+
+
+def _render_hvac_output_stall_recovered(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1048 change 9: the off-target stall ended (back in band, or equipment ran)."""
+    how = "equipment ran" if p.get("reason") == "equipment_ran" else "back in the comfort band"
+    minutes = p.get("minutes_down")
+    detail = how + (f", alerted {minutes} min ago" if minutes is not None else "")
+    return "House no longer stalled off-target", detail
+
+
 def _render_setpoint_rejected(p: dict, unit: str) -> tuple[str, str]:
     commanded = p.get("commanded")
     reported = p.get("reported")
@@ -2337,6 +2379,10 @@ def _render_fan_cancel(p: dict, unit: str) -> tuple[str, str]:
     fan_device = p.get("fan_device", "fan")
     settings = f"{fan_device}: {fan_before}->{fan_after}" if fan_before and fan_after else ""
     trigger = p.get("trigger")
+    if trigger == "physical_drift_correction" and p.get("readback"):
+        if p.get("retry"):
+            return "Fan switch ignored the on-command -- AC released, retrying once", settings
+        return "Fan switch ignored the on-command again -- giving up, AC released", settings
     if trigger == "physical_drift_correction":
         return "Fan ownership corrected -- stale flag cleared (was already off)", settings
     if trigger == "timer_boundary_settle":
@@ -2907,6 +2953,9 @@ EVENT_RENDERERS: dict[str, Callable[[dict, str], tuple[str, str]]] = {
     "hvac_mode_not_applied": _render_hvac_mode_not_applied,
     "hvac_mode_applied_recovered": _render_hvac_mode_applied_recovered,
     "hvac_command_recovered": _render_hvac_command_recovered,
+    "hvac_output_stall": _render_hvac_output_stall,
+    "occupancy_restore_deferred": _render_occupancy_restore_deferred,
+    "hvac_output_stall_recovered": _render_hvac_output_stall_recovered,
     "setpoint_nudge": _render_setpoint_nudge,
     "override_cleared": _render_override_cleared,
     "override_confirmed": _render_override_confirmed,
@@ -3030,6 +3079,9 @@ _NO_DEDUP: frozenset[str] = frozenset(
         "hvac_mode_not_applied",
         "hvac_mode_applied_recovered",
         "hvac_command_recovered",
+        "hvac_output_stall",
+        "hvac_output_stall_recovered",
+        "occupancy_restore_deferred",
         "ceiling_guard_fired",
         "incident_detected",
         "setpoint_rejected",
