@@ -1088,7 +1088,7 @@
         return;
       }
       renderZoneSelector(data.zones, data.zone_count);
-      const unitSym = data.unit === 'celsius' ? '°C' : '°F';
+      const unitSym = unitSymbol(data.unit);
       const grid = document.getElementById('status-grid');
       const dayType = data.day_type || 'unknown';
       const trendArrow = data.trend_direction === 'warming' ? '\u2191'
@@ -2140,7 +2140,7 @@
 
   const envConf = tm.confidence_k_passive || 'none';
   const hvacConf = tm.confidence || 'none';
-  const unitLabel = tm.unit === 'celsius' ? '°C' : '°F';
+  const unitLabel = unitSymbol(tm.unit);
 
   function makeDots(conf) {
     const filled = { none: 0, low: 1, medium: 2, high: 4 }[conf] ?? 0;
@@ -2483,7 +2483,7 @@
   async function loadAutomationState() {
     try {
       const data = await apiFetch('automation_state');
-      const unitSym = data.unit === 'celsius' ? '°C' : '°F';
+      const unitSym = unitSymbol(data.unit);
       const el = document.getElementById('automation-state');
 
       let sensorRows = '';
@@ -2550,7 +2550,7 @@
                   const eve = c.window_opportunity_evening
                     ? 'Yes (' + (c.window_opportunity_evening_start || '') + '+)'
                     : 'No';
-                  const winThreshold = data.unit === 'celsius' ? `${Math.round((80 - 32) * 5 / 9)}\u00b0C` : '80\u00b0F';
+                  const winThreshold = (data.unit === 'celsius' ? Math.round((80 - 32) * 5 / 9) : 80) + unitSymbol(data.unit);
                   return '<tr><td>Morning Window Opportunity</td><td>' + morn + '<span class="kv-desc">Today low \u2264 ' + winThreshold + '</span></td></tr>'
                        + '<tr><td>Evening Window Opportunity</td><td>' + eve + '<span class="kv-desc">Tomorrow low \u2264 ' + winThreshold + '</span></td></tr>';
                 } else if (dt === 'warm' || dt === 'mild') {
@@ -2580,7 +2580,7 @@
     if (!el) return;
     try {
       const data = await apiFetch('engines');
-      const unitSym = data.unit === 'celsius' ? '°C' : '°F';
+      const unitSym = unitSymbol(data.unit);
 
       function engineRow(key, label, unit) {
         const info = data[key];
@@ -2625,7 +2625,7 @@
 
   function renderRecord(rec, rangeLow, rangeHigh, unit) {
     if (!rec) return '<p style="color:var(--text-secondary);font-size:0.85rem">No data available.</p>';
-    const unitSym = unit === 'celsius' ? '°C' : '°F';
+    const unitSym = unitSymbol(unit);
     return `
       <table class="kv-table">
         <tr><td>Date</td><td>${rec.date}</td></tr>
@@ -2644,7 +2644,7 @@
 
   function renderTomorrowPlan(plan, unit) {
     if (!plan) return '<p style="color:var(--text-secondary);font-size:0.85rem">No forecast data yet.</p>';
-    const unitSym = unit === 'celsius' ? '°C' : '°F';
+    const unitSym = unitSymbol(unit);
     return `
       <table class="kv-table">
         <tr><td>Date</td><td>${plan.date}</td></tr>
@@ -2692,7 +2692,7 @@
   async function loadLearning() {
     try {
       const data = await apiFetch('learning');
-      const unitSym = data.unit === 'celsius' ? '°C' : '°F';
+      const unitSym = unitSymbol(data.unit);
 
       // Suggestions (also rendered independently via loadSuggestions)
       const suggestions = data.suggestions || [];
@@ -2795,7 +2795,7 @@
         html += `<div class="settings-group"><h3>${catLabel}</h3>`;
         items.forEach(s => {
           const displayValue = s.value == null ? '<span style="color:var(--text-secondary)">not set</span>'
-            : escapeHtml(String(s.value));
+            : escapeHtml(String(s.value)) + (s.unit ? escapeHtml(s.unit) : '');
           html += `
             <div class="setting-row">
               <div class="setting-info">
@@ -3262,6 +3262,11 @@
     }
     content.innerHTML = html;
     if (actions) actions.style.display = 'flex';
+  }
+
+  // Display symbol for a configured temperature unit ('celsius' | 'fahrenheit').
+  function unitSymbol(unit) {
+    return unit === 'celsius' ? '°C' : '°F';
   }
 
   function escapeHtml(text) {

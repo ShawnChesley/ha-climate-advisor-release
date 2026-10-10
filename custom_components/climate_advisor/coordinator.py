@@ -289,7 +289,9 @@ from .temperature import (
     ha_system_unit,
     is_sensor_stale,
     next_fallback_episode,
+    read_attribute_temp_f,
     read_sensor_state_f,
+    read_state_temp_f,
     reminder_due,
     to_fahrenheit,
     unit_key_from_attr,
@@ -616,7 +618,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._chart_log = ChartStateLog(
             Path(hass.config.config_dir), max_days=CHART_LOG_MAX_DAYS, entry_id=self._entry_id
         )
-        self.learning = LearningEngine(Path(hass.config.config_dir), entry_id=self._entry_id)
+        self.learning = LearningEngine(
+            Path(hass.config.config_dir), entry_id=self._entry_id, temp_unit=config.get("temp_unit", "fahrenheit")
+        )
         # Issue #757 Phase 6 Step 8: this used to construct two live AutomationEngine
         # instances (_engine_a/_engine_b) behind a runtime-switchable primary/shadow
         # routing (automation_engine/shadow_automation_engine properties, Issue #727/
@@ -3405,6 +3409,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # to compare CA's computed target against the REAL thermostat right now, not
         # against a snapshot that can be up to ~30 min old.
         _target_temp = _cs.attributes.get("temperature") if _cs else None
+        # Issue #1048: the effective-target computation works in internal degF, so it needs the
+        # setpoint converted from the thermostat's unit. data["target_temp*"] below stay raw
+        # (thermostat-native) — their only consumer (ai_skills_context) prints them as such.
+        _target_temp_f = read_state_temp_f(_cs, "temperature", self.config.get("temp_unit", "fahrenheit"))
         _target_temp_low = _cs.attributes.get("target_temp_low") if _cs else None
         _target_temp_high = _cs.attributes.get("target_temp_high") if _cs else None
 
@@ -3693,7 +3701,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # not exposed as a sensor (Issue #1001) and has no other consumer.
         _effective_target_temp, _ = self._compute_effective_target_now(
             hvac_mode=hvac_mode,
-            target_temp=_target_temp,
+            target_temp=_target_temp_f,
             fan_status=_fan_status_uc,
         )
 
@@ -5528,7 +5536,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._pre_cool_trigger_dt = trigger_time
         self._pre_cool_target = pre_cool_target
         self._pre_cool_status = (
-            f"Pre-cool scheduled ({pre_cool_target:.0f}°F @ {trigger_time.strftime('%I:%M %p').lstrip('0')})"
+            f"Pre-cool scheduled ({format_temp(pre_cool_target, self.config.get('temp_unit', 'fahrenheit'))} "
+            f"@ {trigger_time.strftime('%I:%M %p').lstrip('0')})"
         )
 
     async def _async_pre_cool_trigger(self, now: datetime) -> None:
@@ -6412,7 +6421,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             _setpoint_changed = (_new_high != _old_high) or (_new_low != _old_low)
             # Use the cooling (high) setpoint as the representative value for override_details
             new_temp, old_temp = _new_high, _old_high
+            _sp_attr = "target_temp_high"
         else:
+            _sp_attr = "temperature"
             new_temp = new_state.attributes.get("temperature")
             old_temp = old_state.attributes.get("temperature")
             _setpoint_changed = new_temp != old_temp
@@ -6436,10 +6447,19 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # A single event that changes both setpoint and fan_mode has one root cause; two
             # simultaneous grace periods from one event would confuse the automation engine.
             _setpoint_override_detected = True
+            # Issue #1048: override records are stored in internal °F (read through the unit-aware
+            # helper), so every consumer converts once at its display boundary.
+            _ov_unit = self.config.get("temp_unit", "fahrenheit")
+            old_val = new_val = None
+            old_setpoint_f = new_setpoint_f = None
             try:
-                old_val = float(old_temp)
-                new_val = float(new_temp)
-                magnitude = round(new_val - old_val, 1)
+                old_val = old_setpoint_f = read_attribute_temp_f(old_state, _sp_attr, _ov_unit)[0]
+                new_val = new_setpoint_f = read_attribute_temp_f(new_state, _sp_attr, _ov_unit)[0]
+                if old_val is None or new_val is None:
+                    raise ValueError("setpoint not numeric")
+                old_val = round(old_val, 2)
+                new_val = round(new_val, 2)
+                magnitude = round(new_val - old_val, 2)
                 # Issue #583: increment the counter only after the append below is guaranteed
                 # to succeed, so manual_overrides and len(override_details) can never diverge.
                 self._today_record.manual_overrides += 1
@@ -6501,8 +6521,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     classification_mode=(
                         self._current_classification.hvac_mode if self._current_classification else None
                     ),
-                    old_setpoint_f=old_temp,
-                    new_setpoint_f=new_temp,
+                    old_setpoint_f=old_setpoint_f,
+                    new_setpoint_f=new_setpoint_f,
                 )
                 self._feed_override_grace_fsm_on_detect("handle_manual_override")
         elif _fan_cancel_in_this_event and _setpoint_changed:
@@ -7741,12 +7761,16 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         _climate_id = self.config.get("climate_entity", "")
         _cs_sw = self.hass.states.get(_climate_id) if _climate_id else None
         if _cs_sw is not None:
-            _sp = _cs_sw.attributes.get("target_temperature")
-            if _sp is None:
-                _sp = _cs_sw.attributes.get("target_temp_low" if session_mode == "heat" else "target_temp_high")
-            if _sp is not None:
-                with contextlib.suppress(ValueError, TypeError):
-                    obs["setpoint_f"] = round(float(_sp), 1)
+            # Issue #1048: climate entities expose "temperature" (not "target_temperature"); read it
+            # unit-aware so setpoint_f is really °F.
+            _sp_unit = self.config.get("temp_unit", "fahrenheit")
+            _sp_f = read_state_temp_f(_cs_sw, "temperature", _sp_unit)
+            if _sp_f is None:
+                _sp_f = read_state_temp_f(
+                    _cs_sw, "target_temp_low" if session_mode == "heat" else "target_temp_high", _sp_unit
+                )
+            if _sp_f is not None:
+                obs["setpoint_f"] = round(_sp_f, 1)
 
         self._pending_observations[obs_type] = obs
         await self._executor_job(self.learning.save_state)
@@ -11382,7 +11406,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     c.window_opportunity_evening_end.isoformat() if c and c.window_opportunity_evening_end else None
                 ),
                 "pre_condition": c.pre_condition if c else None,
-                "pre_condition_target": display_temp(c.pre_condition_target, unit) if c else None,
+                "pre_condition_target": display_delta(c.pre_condition_target, unit)
+                if c
+                else None,  # a delta, not a temperature
                 "setback_modifier": display_delta(c.setback_modifier or 0, unit) if c else None,
                 "today_low": (display_temp(c.today_low, unit) if c else None),
                 "tomorrow_low": (display_temp(c.tomorrow_low, unit) if c else None),

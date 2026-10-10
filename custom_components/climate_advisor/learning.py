@@ -61,6 +61,7 @@ from .const import (
     WEATHER_BIAS_MAX_OBS,
 )
 from .storage_paths import migrate_legacy_storage_file, resolve_entry_scoped_path
+from .temperature import format_temp_delta
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -932,7 +933,7 @@ class LearningState:
 class LearningEngine:
     """Tracks patterns and generates adaptive suggestions."""
 
-    def __init__(self, storage_path: Path, entry_id: str = "") -> None:
+    def __init__(self, storage_path: Path, entry_id: str = "", temp_unit: str = "fahrenheit") -> None:
         """Initialize the learning engine.
 
         Args:
@@ -940,6 +941,8 @@ class LearningEngine:
             entry_id: Owning config entry's entry_id, for multi-zone storage
                 scoping (Issue #796). Empty string keeps the legacy unscoped
                 path — see `storage_paths.resolve_entry_scoped_path`.
+            temp_unit: The user's configured display unit ("fahrenheit"/"celsius"), used only to
+                word temperatures in suggestion text (Issue #1048). All stored values stay degF.
 
         Note: Call load_state() after construction to read persisted data
         from disk.  This is intentionally not done in __init__ because
@@ -948,6 +951,7 @@ class LearningEngine:
         """
         self._storage_dir = storage_path
         self._entry_id = entry_id
+        self._temp_unit = temp_unit
         self._db_path = resolve_entry_scoped_path(storage_path, LEARNING_DB_FILE, entry_id)
         self._state = LearningState()
         self._last_suggestion_keys: list[str] = []
@@ -2036,7 +2040,7 @@ class LearningEngine:
                             pass
 
                     direction_word = "up" if up_count >= down_count else "down"
-                    detail = f"mostly {direction_word} by about {avg_mag:.0f}\u00b0F"
+                    detail = f"mostly {direction_word} by about {format_temp_delta(avg_mag, self._temp_unit)}"
                     if hour_counts:
                         peak_hour = max(hour_counts, key=hour_counts.get)  # type: ignore[arg-type]
                         peak_time = f"{peak_hour}:00" if peak_hour >= 10 else f" {peak_hour}:00"
@@ -2187,7 +2191,8 @@ class LearningEngine:
                     "forecast_bias_significant",
                     (
                         f"I've noticed your weather service consistently forecasts highs about "
-                        f"{magnitude}\u00b0F {direction} than what actually occurs at your location. "
+                        f"{format_temp_delta(magnitude, self._temp_unit, 1)} {direction} than what actually occurs "
+                        "at your location. "
                         "I'm now applying a correction to improve forecasting accuracy — this helps "
                         "pre-heat and pre-cool decisions account for your local conditions."
                     ),

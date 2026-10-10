@@ -70,7 +70,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
     VERSION,
 )
-from .temperature import display_delta, display_temp
+from .temperature import FAHRENHEIT, UNIT_SYMBOL, display_delta, display_temp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -783,15 +783,29 @@ class ClimateAdvisorConfigView(HomeAssistantView):
                 elif transform == "temp_source_label" and isinstance(value, str):
                     value = _temp_source_display(coordinator, key, value, _TEMP_SOURCE_LABELS.get(value, value), config)
 
-                settings.append(
-                    {
-                        "key": key,
-                        "value": value,
-                        "label": meta["label"],
-                        "description": meta["description"],
-                        "category": meta["category"],
-                    }
-                )
+                # Issue #1048: temperature settings are stored in internal degF. Absolute ones are shown
+                # in the user's unit; the "degrees of tolerance" deltas keep their entry unit (degF),
+                # matching the settings screen where they are typed. `unit` lives in the response (not
+                # CONFIG_METADATA) because it depends on the installation's configured unit.
+                setting_unit: str | None = None
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if transform == "temp_abs":
+                        user_unit = config.get("temp_unit", FAHRENHEIT)
+                        value = display_temp(value, user_unit)
+                        setting_unit = UNIT_SYMBOL.get(user_unit, UNIT_SYMBOL[FAHRENHEIT])
+                    elif transform == "temp_delta":
+                        setting_unit = UNIT_SYMBOL[FAHRENHEIT]
+
+                entry = {
+                    "key": key,
+                    "value": value,
+                    "label": meta["label"],
+                    "description": meta["description"],
+                    "category": meta["category"],
+                }
+                if setting_unit is not None:
+                    entry["unit"] = setting_unit
+                settings.append(entry)
 
             return self.json({"settings": settings})
 
