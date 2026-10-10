@@ -178,6 +178,17 @@ UNMAPPED_PRODUCTION_EVENTS: frozenset[str] = frozenset(
         "fan_blind_started",
         "fan_blind_stopped",
         "fan_blind_recovered",
+        # Issue #1049: hvac_mode_not_applied / hvac_mode_applied_recovered / hvac_command_recovered
+        # are read-back visibility rows (the thermostat is / is no longer ignoring a mode
+        # command, or accepts commands again after failures). They never command HVAC and the
+        # deciding events the engine emitted still map. Registering them unmapped cannot hide a
+        # real failure: whether the thermostat ended in the right mode is asserted through live
+        # engine state (engine_state._thermostat_hvac_mode, as the #1048 scenario does), not
+        # through these rows; left unmapped they would hit the 'unknown:<type>' catch-all and
+        # shadow a real outcome under last-decision-wins.
+        "hvac_mode_not_applied",
+        "hvac_mode_applied_recovered",
+        "hvac_command_recovered",
     }
 )
 

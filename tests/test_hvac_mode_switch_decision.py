@@ -161,7 +161,7 @@ class TestEngineModeSwitchBeforeWrite:
         with caplog.at_level(logging.WARNING, logger="custom_components.climate_advisor.automation"):
             asyncio.run(engine._set_temperature(70.0, reason="t", mode="heat"))
         assert set(_services(engine)) == {"set_hvac_mode"}
-        assert emitted == []
+        assert [n for n, _ in emitted] == ["hvac_mode_not_applied"], "visible, but not a failure incident"
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     def test_timeout_is_unknown_not_failed_and_the_setpoint_still_goes_out(self):

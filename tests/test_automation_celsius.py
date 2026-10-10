@@ -284,8 +284,9 @@ class TestSetpointValidation:
         ):
             asyncio.run(engine._set_temperature(72.0, reason="heat setback"))
 
-            assert len(captured_callbacks) == 1
-            _, callback = captured_callbacks[0]
+            _validation = [c for c in captured_callbacks if c[0] == 10]  # 10 s setpoint check (not the 130 s recheck)
+            assert len(_validation) == 1
+            _, callback = _validation[0]
 
             # Fire the callback inside the patch context so _LOGGER is still mocked
             callback(None)
@@ -330,8 +331,9 @@ class TestSetpointValidation:
         ):
             asyncio.run(engine._set_temperature(72.0, reason="heat setback"))
 
-            assert len(captured_callbacks) == 1
-            _, callback = captured_callbacks[0]
+            _validation = [c for c in captured_callbacks if c[0] == 10]  # 10 s setpoint check (not the 130 s recheck)
+            assert len(_validation) == 1
+            _, callback = _validation[0]
 
             # Fire the callback inside the patch context so _LOGGER is still mocked
             callback(None)

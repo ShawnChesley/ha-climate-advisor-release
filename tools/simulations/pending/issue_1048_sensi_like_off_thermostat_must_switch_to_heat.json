@@ -43,7 +43,6 @@
       "field": "engine_state._thermostat_hvac_mode",
       "value": "heat",
       "track": "logic",
-      "simulator_support": false,
       "reason": "The thermostat itself (not CA's command log) must end up in heat: a Sensi-like device ignores hvac_mode inside set_temperature, so only an explicit climate.set_hvac_mode(heat) can turn heating on."
     }
   ],

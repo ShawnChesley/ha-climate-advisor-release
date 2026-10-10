@@ -60,6 +60,12 @@ def _make_engine(config_overrides: dict | None = None) -> AutomationEngine:
     hass.services.async_call = AsyncMock()
     hass.async_create_task = MagicMock(side_effect=_consume_coroutine)
     hass.states = MagicMock()
+    # Issue #1049: a thermostat that advertises no cool mode cannot be armed (and the pre-cool
+    # result now says so honestly), so the stub must be capable.
+    _climate = MagicMock()
+    _climate.state = "cool"
+    _climate.attributes = {"hvac_modes": ["off", "heat", "cool"], "supported_features": 1}
+    hass.states.get.return_value = _climate
 
     config = {
         "comfort_heat": 70.0,

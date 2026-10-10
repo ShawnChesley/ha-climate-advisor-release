@@ -223,13 +223,13 @@ class TestWarmDayBandArming:
         Issue #301: dual-setpoint (heat_cool) path removed. CA sends a single cool command
         to avoid Ecobee comfort-program reassertion. No separate set_hvac_mode call.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
+        engine = _make_engine(comfort_heat=70.0, current_mode="off")
         c = _make_classification(day_type="warm", hvac_mode="off")
         asyncio.run(engine.apply_classification(c))
 
         # No separate set_hvac_mode call
         hvac = _hvac_calls(engine)
-        assert len(hvac) == 0
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         # Single call (Issue #301)
         temp = _temp_calls(engine)
@@ -258,16 +258,18 @@ class TestWarmDayBandArming:
         assert "target_temp_high" not in data
 
     def test_idempotent_mode_still_issues_single_call(self):
-        """Thermostat already in heat_cool → ONE set_temperature call still issued (Issue #301).
+        """Thermostat held in heat_cool → one explicit switch to cool, then ONE set_temperature (Issues #301/#1048).
 
-        The single call always includes hvac_mode so HA deduplication is bypassed.
+        heat_cool is a real mode different from the commanded cool, so CA switches first (Sensi/
+        ecobee ignore the hvac_mode kwarg); the single setpoint call still carries hvac_mode so
+        HA deduplication is bypassed.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
+        engine = _make_engine(comfort_heat=70.0, current_mode="heat_cool")
         c = _make_classification(day_type="warm", hvac_mode="off")
         asyncio.run(engine.apply_classification(c))
 
         hvac = _hvac_calls(engine)
-        assert len(hvac) == 0
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(engine)
         # Single call even in steady-state (Issue #301)
@@ -281,12 +283,12 @@ class TestWarmDayBandArming:
 
         Issue #301: same single-call pattern regardless of day type.
         """
-        engine = _make_engine(comfort_heat=70.0, current_mode="cool")
+        engine = _make_engine(comfort_heat=70.0, current_mode="off")
         c = _make_classification(day_type="hot", hvac_mode="cool")
         asyncio.run(engine.apply_classification(c))
 
         hvac = _hvac_calls(engine)
-        assert len(hvac) == 0
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(engine)
         # Single call (Issue #301)
@@ -321,7 +323,7 @@ class TestWarmDayBandArming:
         """
         engine = _make_engine(
             comfort_heat=70.0,
-            current_mode="cool",
+            current_mode="off",
             hvac_modes=["off", "cool"],
             supported_features=1,
         )
@@ -329,7 +331,7 @@ class TestWarmDayBandArming:
         asyncio.run(engine.apply_classification(c))
 
         hvac = _hvac_calls(engine)
-        assert len(hvac) == 0  # no separate set_hvac_mode call
+        assert [c.args[2]["hvac_mode"] for c in hvac] == ["cool"]  # explicit switch first (Issue #1048)
 
         temp = _temp_calls(engine)
         # Single call (Issue #301)

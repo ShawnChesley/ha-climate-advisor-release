@@ -285,6 +285,9 @@ def _make_automation_engine(config_overrides: dict | None = None) -> AutomationE
         notify_service=config["notify_service"],
         config=config,
     )
+    # Issue #1049: these tests count/capture async_call_later for grace timers; the mode
+    # read-back recheck's own scheduling is covered in test_hvac_mode_alignment.py.
+    engine._schedule_mode_alignment_recheck = MagicMock()
     return engine
 
 

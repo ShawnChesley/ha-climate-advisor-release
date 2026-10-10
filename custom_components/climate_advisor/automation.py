@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -236,7 +236,12 @@ from .override_grace_lifecycle import (
     OverrideConfirmState,
     OverrideGraceLifecycleState,
 )
-from .setpoint_verify_decision import SetpointVerifyOutcome, decide_setpoint_verify
+from .setpoint_verify_decision import (
+    ModeAlignmentOutcome,
+    SetpointVerifyOutcome,
+    decide_mode_alignment,
+    decide_setpoint_verify,
+)
 from .temperature import (
     format_temp,
     format_temp_delta,
@@ -285,6 +290,41 @@ class HvacCommandResult(Enum):
     WHF_BLOCKED = "whf_blocked"
     FAILED = "failed"
     UNCONFIRMED = "unconfirmed"
+    SUPERSEDED = "superseded"  # a newer write replaced this one while its mode command was in flight
+
+
+def hvac_outcome_label(result: HvacCommandResult | None) -> str:
+    """Activity Log ``outcome`` for an event that follows a write (Issue #1049, change 5).
+
+    ``sent`` -- the command reached the thermostat (accepted, or answer still unknown);
+    ``blocked`` -- whole-house fan owns the thermostat; ``dry_run``; ``failed``;
+    ``superseded`` -- a newer write replaced it; ``not_sent`` -- no write was attempted at all.
+    """
+    if result is None:
+        return "not_sent"
+    return {
+        HvacCommandResult.EXECUTED: "sent",
+        HvacCommandResult.UNCONFIRMED: "sent",
+        HvacCommandResult.WHF_BLOCKED: "blocked",
+        HvacCommandResult.DRY_RUN: "dry_run",
+        HvacCommandResult.FAILED: "failed",
+        HvacCommandResult.SUPERSEDED: "superseded",
+    }[result]
+
+
+@dataclass(frozen=True)
+class HvacWriteRecord:
+    """New facts about the last climate write that no other field carries (Issue #1049).
+
+    The commanded mode itself is NOT duplicated here: read ``_last_commanded_hvac_mode``.
+    ``episode_reason`` / ``mismatch_since`` are the ``next_fallback_episode`` state for the
+    "thermostat did not take the requested mode" episode.
+    """
+
+    result: HvacCommandResult | None = None
+    apply_skip_reason: str | None = None  # why the last read-back check did not evaluate
+    mismatch_since: datetime | None = None  # first read-back miss of the open mismatch
+    episode_reason: str | None = None  # announced requested mode (None = no open episode)
 
 
 class ClimateCallOutcome(Enum):
@@ -310,6 +350,9 @@ class ClimateCallResult:
 
 # Seconds to wait for a blocking climate service call before treating the answer as unknown.
 CLIMATE_CALL_TIMEOUT_S = 10
+
+# Seconds after a write before the second read-back mode check (cloud echo lag is 30-120 s).
+MODE_ALIGNMENT_RECHECK_S = 130
 
 
 # Issue #664: moved to const.py (GRACE_TRIGGERS_PROTECTING_OVERRIDE) as the single source of
@@ -797,6 +840,8 @@ class AutomationEngine:
     _mode_switch_marker: tuple[str, datetime] | None = None
     _manual_override_active: bool = False
     _override_confirm_pending: bool = False
+    _hvac_write_record: HvacWriteRecord = HvacWriteRecord()
+    _mode_align_recheck_cancel: Any | None = None
     _last_mode_switch_result: HvacCommandResult | None = None
 
     def __init__(
@@ -3121,7 +3166,7 @@ class AutomationEngine:
                 self._revisit_cancel = None
             _LOGGER.debug("apply_classification: revisit canceled — 30-min cycle handles re-evaluation")
 
-    async def _apply_comfort_band(self, band: ComfortBand, *, reason: str) -> None:
+    async def _apply_comfort_band(self, band: ComfortBand, *, reason: str) -> HvacCommandResult | None:
         """Arm the thermostat with the comfort band (always single-setpoint).
 
         Issue #858: caches ``band`` on entry (before any early return below) so
@@ -3183,7 +3228,7 @@ class AutomationEngine:
                 ),
                 notify_type="door_window_pause",
             )
-            return
+            return None  # paused instead of armed: no write attempted
 
         caps = self._get_thermostat_capabilities()
 
@@ -3201,7 +3246,7 @@ class AutomationEngine:
         _effective_active = {"cool": "ceiling", "heat": "floor"}.get(_resolved_mode, band.active)
 
         if _effective_active == "ceiling" and caps.supports_cool:
-            await self._set_temperature(band.ceiling, reason=reason, mode="cool")
+            _write_result = await self._set_temperature(band.ceiling, reason=reason, mode="cool")
             _cmd_shape = "cool"
             _target = band.ceiling
             # Issue #827: _resolve_comfort_family_via_fsm() above already armed
@@ -3212,7 +3257,7 @@ class AutomationEngine:
             # to preserve, unlike _set_temperature_for_mode()'s two equivalent
             # branches below.)
         elif _effective_active == "floor" and caps.supports_heat:
-            await self._set_temperature(band.floor, reason=reason, mode="heat")
+            _write_result = await self._set_temperature(band.floor, reason=reason, mode="heat")
             _cmd_shape = "heat"
             _target = band.floor
         else:
@@ -3225,7 +3270,7 @@ class AutomationEngine:
                 _effective_active,
                 list(caps.modes),
             )
-            return
+            return None
 
         # Issue #444, revised by Issue #591/#590 Finding D: _set_temperature() above is always
         # called (unconditional thermostat re-assertion) — only the human-facing ANNOUNCEMENT
@@ -3237,14 +3282,27 @@ class AutomationEngine:
         # periodic re-announcement heartbeat — the visible confirmation is silent after the
         # first announcement until the band actually changes; the underlying thermostat
         # command is unaffected and still fires every cycle.
-        _signature = (band.active, _cmd_shape, round(_target, 2))
+        # Issue #1049 (change 5): the announcement states what actually happened to the write
+        # (sent / blocked / dry_run / failed / superseded) and is part of the dedupe signature, so
+        # a failed arm followed by a successful one is announced separately. The log never says
+        # "applied" for a write that was not sent.
+        _outcome = hvac_outcome_label(_write_result)
+        # Name the edge the thermostat was actually armed with when the comfort-family FSM
+        # overrode the band's own active edge (band.reason describes the band, not the override).
+        _band_reason = (
+            band.reason
+            if _effective_active == band.active
+            else f"{band.reason} -- {_effective_active} edge used ({_cmd_shape} at {_target:.0f}F)"
+        )
+        _signature = (band.active, _cmd_shape, round(_target, 2), _outcome)
         if self._recent_duplicate("comfort_band_applied", _signature):
             _LOGGER.debug(
-                "comfort_band_applied event suppressed — identical band (%s %.1f°F) already announced",
+                "comfort_band_applied event suppressed — identical band (%s %.1f°F, %s) already announced",
                 _cmd_shape,
                 _target,
+                _outcome,
             )
-            return
+            return _write_result
 
         if self._emit_event_callback:
             self._emit_event_callback(
@@ -3254,10 +3312,12 @@ class AutomationEngine:
                     "ceiling": band.ceiling,
                     "active": _effective_active,
                     "mode": _cmd_shape,
-                    "reason": band.reason,
+                    "reason": _band_reason,
+                    "outcome": _outcome,
                     "indoor_f": self._get_indoor_temp_f(),
                 },
             )
+        return _write_result
 
     def _log_whf_write_blocked(self, reason: str) -> None:
         """Log the routine WHF/AC mode-ownership handoff at INFO (Issue #874).
@@ -3378,10 +3438,129 @@ class AutomationEngine:
             mode,
             step.minutes_down,
         )
-        self._emit_engine_incident(
-            "hvac_command_recovered",
-            {"hvac_mode": mode, "climate_entity": self.climate_entity, "minutes_down": step.minutes_down},
+        if self._emit_event_callback:
+            self._emit_event_callback(
+                "hvac_command_recovered",
+                {"hvac_mode": mode, "climate_entity": self.climate_entity, "minutes_down": step.minutes_down},
+            )
+
+    def _update_write_record(self, **changes: Any) -> None:
+        """Replace the frozen ``HvacWriteRecord`` with an updated copy (Issue #1049)."""
+        self._hvac_write_record = replace(self._hvac_write_record, **changes)
+
+    def _note_mode_rejected(self, mode: str, err: BaseException | None) -> None:
+        """Surface an HA-validation-rejected mode command without opening a failure episode (Issue #1049).
+
+        A mode the thermostat does not offer is a configuration fact, not an outage: it must be
+        visible (one Activity Log row, windowed so a 30-minute cycle does not repeat it hourly)
+        but must not start a ``hvac_command_failed`` episode or a recovery cycle.
+        """
+        self._update_write_record(result=HvacCommandResult.FAILED)
+        if not self._emit_event_callback or self._recent_duplicate(
+            "hvac_mode_not_applied", ("rejected", mode), window_seconds=3600
+        ):
+            return
+        _state = self.hass.states.get(self.climate_entity)
+        self._emit_event_callback(
+            "hvac_mode_not_applied",
+            {
+                "kind": "rejected",
+                "requested_mode": mode,
+                "actual_mode": getattr(_state, "state", None),
+                "climate_entity": self.climate_entity,
+                "error": str(err),
+            },
         )
+
+    def _check_mode_alignment(self, my_seq: int, *, announce: bool) -> ModeAlignmentOutcome:
+        """Read back whether the thermostat is in the mode last requested (Issue #1049, change 2).
+
+        ``announce=False`` (the early 10 s check) only starts the mismatch clock -- cloud
+        thermostats echo a mode change 30-120 s late, so a miss at 10 s proves nothing.
+        ``announce=True`` (the >=130 s re-check) opens a once-per-episode ``hvac_mode_not_applied``
+        via ``next_fallback_episode`` and closes it with ``hvac_mode_applied_recovered`` when the
+        thermostat is finally in the requested mode.
+        """
+        state = self.hass.states.get(self.climate_entity)
+        live = getattr(state, "state", None) if state is not None else None
+        requested = self._last_commanded_hvac_mode
+        outcome = decide_mode_alignment(
+            current_write_seq=self._write_seq,
+            check_write_seq=my_seq,
+            requested_mode=requested,
+            live_state=live,
+            manual_override_active=bool(self._manual_override_active),
+            override_confirm_pending=bool(self._override_confirm_pending),
+            paused_by_door=bool(self._paused_by_door),
+            whf_owns_hvac=bool(self._whf_owns_hvac()),
+            dry_run=bool(self.dry_run),
+            command_in_progress=bool(self._hvac_command_pending or self._temp_command_pending),
+        )
+        rec = self._hvac_write_record
+        now = dt_util.now()
+        if outcome in (ModeAlignmentOutcome.STALE, ModeAlignmentOutcome.NOT_APPLICABLE):
+            return outcome
+        if outcome is ModeAlignmentOutcome.UNREADABLE or outcome.value.startswith("excluded_"):
+            self._update_write_record(apply_skip_reason=outcome.value)
+            return outcome
+        if outcome is ModeAlignmentOutcome.ALIGNED:
+            step = next_fallback_episode(None, rec.episode_reason, rec.mismatch_since, now)
+            self._update_write_record(apply_skip_reason=None, mismatch_since=None, episode_reason=step.announced)
+            if step.kind == "recovered":
+                _LOGGER.info(
+                    "HVAC mode now applied — thermostat is in %s (was not following for %s min)",
+                    requested,
+                    step.minutes_down,
+                )
+                if self._emit_event_callback:
+                    self._emit_event_callback(
+                        "hvac_mode_applied_recovered",
+                        {
+                            "requested_mode": requested,
+                            "climate_entity": self.climate_entity,
+                            "minutes_down": step.minutes_down,
+                        },
+                    )
+            return outcome
+        # MISALIGNED
+        since = rec.mismatch_since or now
+        self._update_write_record(apply_skip_reason=None, mismatch_since=since)
+        if not announce:
+            return outcome
+        step = next_fallback_episode(requested, rec.episode_reason, since, now)
+        self._update_write_record(episode_reason=step.announced, mismatch_since=step.since)
+        if step.kind in ("fallback", "changed"):
+            _LOGGER.warning(
+                "HVAC mode not applied — requested %s but thermostat reports %r (entity=%s). "
+                "The thermostat may be ignoring mode commands.",
+                requested,
+                live,
+                self.climate_entity,
+            )
+            if self._emit_event_callback:
+                self._emit_event_callback(
+                    "hvac_mode_not_applied",
+                    {
+                        "kind": "not_obeyed",
+                        "requested_mode": requested,
+                        "actual_mode": live,
+                        "climate_entity": self.climate_entity,
+                    },
+                )
+        return outcome
+
+    def _schedule_mode_alignment_recheck(self, my_seq: int) -> None:
+        """Schedule the >=130 s read-back mode check in its own cancel slot (Issue #1049)."""
+        if self._mode_align_recheck_cancel:
+            self._mode_align_recheck_cancel()
+            self._mode_align_recheck_cancel = None
+
+        @callback
+        def _recheck(_now: Any) -> None:
+            self._mode_align_recheck_cancel = None
+            self._check_mode_alignment(my_seq, announce=True)
+
+        self._mode_align_recheck_cancel = async_call_later(self.hass, MODE_ALIGNMENT_RECHECK_S, _recheck)
 
     async def _set_hvac_mode(self, mode: str, *, reason: str) -> HvacCommandResult:
         """Set the thermostat HVAC mode and report what happened (Issue #1049)."""
@@ -3414,6 +3593,7 @@ class AutomationEngine:
         # (bumping the shared write sequence makes them stale) -- otherwise a retry scheduled
         # before a door/window pause or an Off would turn heat back on through the open window.
         self._write_seq += 1
+        _mode_seq = self._write_seq
         self._hvac_command_pending = True
         self._hvac_command_time = dt_util.now()
         self._last_commanded_hvac_mode = mode
@@ -3430,9 +3610,11 @@ class AutomationEngine:
             self._restamp_climate_command_times(temp=False)
             if _call.outcome is ClimateCallOutcome.REJECTED:
                 self._mode_switch_marker = None
+                self._note_mode_rejected(mode, _call.error)
                 return HvacCommandResult.FAILED
             if _call.outcome is ClimateCallOutcome.FAILED:
                 self._mode_switch_marker = None
+                self._update_write_record(result=HvacCommandResult.FAILED)
                 # Issue #805: this is the single write point for hvac_mode (Fix 1b) -- an
                 # invalid/removed climate_entity must not raise uncaught here (it would abort
                 # the whole coordinator update cycle). The entity-health sweep tells the user
@@ -3443,6 +3625,9 @@ class AutomationEngine:
             if _call.outcome is ClimateCallOutcome.OK:
                 self._note_hvac_command_ok(mode)
             self._mode_switch_marker = (mode, dt_util.now())
+            self._update_write_record(result=HvacCommandResult.EXECUTED if _call.ok else HvacCommandResult.UNCONFIRMED)
+            # Read back later (Off direction included): did the thermostat actually take it?
+            self._schedule_mode_alignment_recheck(_mode_seq)
             _LOGGER.info("Set HVAC mode to %s — %s role=%s", mode, reason, self.role)
             self._record_action(f"Set HVAC to {mode}", reason)
             # When taking HVAC offline, assert fan_mode=auto to clear any post-heat
@@ -3530,11 +3715,13 @@ class AutomationEngine:
         if _call.outcome is ClimateCallOutcome.FAILED:
             self._mode_switch_marker = None
             self._last_mode_switch_result = HvacCommandResult.FAILED
+            self._update_write_record(result=HvacCommandResult.FAILED)
             self._note_hvac_command_failed(mode, _call.error)
             return False
         if _call.outcome is ClimateCallOutcome.REJECTED:
             self._mode_switch_marker = None
             self._last_mode_switch_result = HvacCommandResult.FAILED
+            self._note_mode_rejected(mode, _call.error)
             return False
         if _call.outcome is ClimateCallOutcome.TIMEOUT:
             # State unknown, not failed: re-read for the log and carry on; the read-back check
@@ -3549,6 +3736,7 @@ class AutomationEngine:
         else:
             self._note_hvac_command_ok(mode)
             self._last_mode_switch_result = HvacCommandResult.EXECUTED
+        self._update_write_record(result=self._last_mode_switch_result)
         self._mode_switch_marker = (mode, dt_util.now())
         self._record_action(f"Set HVAC to {mode}", "mode switch before setpoint write")
         if self._write_seq != my_seq:
@@ -3563,7 +3751,7 @@ class AutomationEngine:
         reason: str,
         mode: str = "cool",
         skip_setpoint_sanity_check: bool = False,
-    ) -> None:
+    ) -> HvacCommandResult:
         """Set the thermostat target temperature with hvac_mode in a single call.
 
         Args:
@@ -3603,7 +3791,7 @@ class AutomationEngine:
                     "hvac_write_blocked_whf_active",
                     {"attempted_mode": mode, "reason": reason},
                 )
-            return
+            return HvacCommandResult.WHF_BLOCKED
         unit = self.config.get("temp_unit", "fahrenheit")
         # Convert internal °F to user's unit before sending to HA climate entity
         service_temp = from_fahrenheit(temperature, unit)
@@ -3615,7 +3803,7 @@ class AutomationEngine:
                 reason,
                 self.role,
             )
-            return
+            return HvacCommandResult.DRY_RUN
         # Check setpoint is appropriate for commanded mode. Skipped for intentional
         # target-override writes (Issue #786 post-implementation audit, Fix 3) — TOU
         # pre-conditioning banks a cool-mode setpoint down toward comfort_heat (or below
@@ -3657,7 +3845,7 @@ class AutomationEngine:
             # Issue #1049 change 1: make the mode real first (Sensi/ecobee ignore the hvac_mode
             # kwarg below). _my_seq was captured above, before this await.
             if not await self._ensure_hvac_mode_for_write(mode, _my_seq):
-                return
+                return HvacCommandResult.SUPERSEDED if self._write_seq != _my_seq else HvacCommandResult.FAILED
             # Issue #1049: awaited via _call_climate (blocking, non-cancelling wait) so a
             # rejection is visible instead of swallowed by a non-blocking call.
             _call = await self._call_climate(
@@ -3673,7 +3861,7 @@ class AutomationEngine:
             self._restamp_climate_command_times()
             if _call.outcome is ClimateCallOutcome.REJECTED:
                 # Out-of-range / mode-not-offered: skipped quietly (no incident, no verify).
-                return
+                return HvacCommandResult.FAILED
             if _call.outcome is ClimateCallOutcome.FAILED:
                 # Issue #805: this is the single write point for temperature+mode (Fix 1b) --
                 # an invalid/removed climate_entity must not raise uncaught here, which would
@@ -3682,7 +3870,7 @@ class AutomationEngine:
                 # be scheduled against a value never actually sent. Announced once per
                 # episode (Issue #1049); setpoint_f is internal F, never the display unit.
                 self._note_hvac_command_failed(mode, _call.error, setpoint_f=temperature)
-                return
+                return HvacCommandResult.FAILED
             if _call.outcome is ClimateCallOutcome.OK:
                 self._note_hvac_command_ok(mode)
         finally:
@@ -3695,6 +3883,11 @@ class AutomationEngine:
             # just without the no-setpoint/override-active branches, which never apply here
             # (pending_setpoint_single/_mode are always set by this point, and this check
             # doesn't consider manual override).
+            # Issue #1049 change 2: read back the MODE before anything can exit on a missing
+            # temperature -- Sensi reports ``temperature: null`` while Off, so NO_READING below
+            # would otherwise hide a thermostat that never switched on. (The 10 s check only
+            # starts the mismatch clock; the >=130 s re-check announces.)
+            self._check_mode_alignment(_my_seq, announce=False)
             state = self.hass.states.get(self.climate_entity)
             reported = read_state_temp_f(state, "temperature", unit)
             outcome = decide_setpoint_verify(
@@ -3844,6 +4037,7 @@ class AutomationEngine:
             self.hass.async_create_task(_check_single_setpoint_accepted())
 
         self._setpoint_retry_cancel = async_call_later(self.hass, 10, _schedule_check)
+        self._schedule_mode_alignment_recheck(_my_seq)
         _LOGGER.info(
             "Set temperature to %s (mode=%s) — zone=%s %s role=%s",
             format_temp(temperature, unit),
@@ -3853,6 +4047,7 @@ class AutomationEngine:
             self.role,
         )
         self._record_action(f"Set temp to {format_temp(temperature, unit)} (mode={mode})", reason)
+        return HvacCommandResult.EXECUTED if _call.ok else HvacCommandResult.UNCONFIRMED
 
     async def _set_temperature_for_mode(
         self,
@@ -3861,7 +4056,7 @@ class AutomationEngine:
         reason: str,
         target_override: float | None = None,
         skip_setpoint_sanity_check: bool = False,
-    ) -> None:
+    ) -> HvacCommandResult | None:
         """Set temperature based on the classification and current period.
 
         Safety net: redirects to setback handlers when occupancy is away/vacation
@@ -3903,7 +4098,7 @@ class AutomationEngine:
             else:
                 _LOGGER.info("Vacation mode — redirecting to deep setback instead of comfort (%s)", reason)
                 await self.handle_occupancy_vacation()
-            return
+            return None  # redirected to setback: this call wrote no comfort setpoint
 
         # Issue #827: route through the same comfort-family FSM _apply_comfort_band()
         # uses — one decision point, not a second parallel implementation. This call
@@ -3930,7 +4125,7 @@ class AutomationEngine:
 
         if _resolved_mode == "heat":
             floor_target = target_override if target_override is not None else float(self.config["comfort_heat"])
-            await self._set_temperature(
+            _write_result = await self._set_temperature(
                 floor_target, reason=reason, mode="heat", skip_setpoint_sanity_check=skip_setpoint_sanity_check
             )
             # Issue #827: kept here (unlike the now-redundant equivalent in
@@ -3941,16 +4136,16 @@ class AutomationEngine:
             # every cycle doesn't continuously push the (informational-only, post-
             # #827) dwell-clock timestamp forward on mere reassertion.
             self._arm_comfort_family("heating", dt_util.now(), only_if_changed=True)
-            return
+            return _write_result
         elif _resolved_mode == "cool":
             ceiling_target = target_override if target_override is not None else float(self.config["comfort_cool"])
-            await self._set_temperature(
+            _write_result = await self._set_temperature(
                 ceiling_target, reason=reason, mode="cool", skip_setpoint_sanity_check=skip_setpoint_sanity_check
             )
             self._arm_comfort_family("cooling", dt_util.now(), only_if_changed=True)
-            return
+            return _write_result
         else:
-            return
+            return None
 
     async def apply_tou_precondition(self, classification: DayClassification, target: float, schedule_id: str) -> None:
         """Drive the setpoint toward the resolved TOU banking target ahead of a scheduled
@@ -4019,7 +4214,7 @@ class AutomationEngine:
             schedule_id,
             classification.hvac_mode,
         )
-        await self._set_temperature_for_mode(
+        _tou_result = await self._set_temperature_for_mode(
             classification,
             reason=f"tou_precondition schedule={schedule_id}",
             target_override=target,
@@ -4033,7 +4228,8 @@ class AutomationEngine:
         # always issues every cycle this phase is active) — same shape as
         # _apply_comfort_band()'s own comfort_band_applied dedup.
         if not should_defer_to_occupancy_setback(self._occupancy_mode):
-            _signature = (schedule_id, classification.hvac_mode, round(target, 2))
+            _tou_outcome = hvac_outcome_label(_tou_result)
+            _signature = (schedule_id, classification.hvac_mode, round(target, 2), _tou_outcome)
             if self._emit_event_callback and not self._recent_duplicate("tou_precondition_applied", _signature):
                 self._emit_event_callback(
                     "tou_precondition_applied",
@@ -4041,6 +4237,7 @@ class AutomationEngine:
                         "schedule_id": schedule_id,
                         "target": target,
                         "mode": classification.hvac_mode,
+                        "outcome": _tou_outcome,
                     },
                 )
 
@@ -4106,14 +4303,15 @@ class AutomationEngine:
             schedule_id,
             mode,
         )
-        await self._set_temperature(
+        _tou_av_result = await self._set_temperature(
             target,
             reason=f"tou_av_precondition schedule={schedule_id}",
             mode=mode,
             skip_setpoint_sanity_check=True,
         )
 
-        _signature = (schedule_id, mode, round(target, 2))
+        _tou_av_outcome = hvac_outcome_label(_tou_av_result)
+        _signature = (schedule_id, mode, round(target, 2), _tou_av_outcome)
         if self._emit_event_callback and not self._recent_duplicate("tou_av_precondition_applied", _signature):
             self._emit_event_callback(
                 "tou_av_precondition_applied",
@@ -4122,6 +4320,7 @@ class AutomationEngine:
                     "target": target,
                     "mode": mode,
                     "occupancy": self._occupancy_mode,
+                    "outcome": _tou_av_outcome,
                 },
             )
 
@@ -7894,6 +8093,13 @@ class AutomationEngine:
             reason=f"pre-cool — thermal mass banking (target {pre_cool_target:.0f}°F)",
         )
 
+        _pre_cool_result = await self._apply_comfort_band(
+            _pre_cool_band,
+            reason=f"pre-cool [{_sleep_band.floor:.0f}/{pre_cool_target:.0f}]",
+        )
+        # Issue #1049 (change 5): announce AFTER the write, with its real outcome -- the
+        # event/log used to claim "applied" before anything was sent.
+        _pre_cool_outcome = hvac_outcome_label(_pre_cool_result)
         if self._emit_event_callback:
             self._emit_event_callback(
                 "pre_cool_applied",
@@ -7904,19 +8110,23 @@ class AutomationEngine:
                     "floor": floor,
                     "indoor": indoor_temp,
                     "nat_vent_suppressed": False,
+                    "outcome": _pre_cool_outcome,
                 },
             )
 
+        if _pre_cool_outcome == "sent":
+            _LOGGER.info(
+                "Pre-cool setpoint applied: cool ceiling %.1f°F (heat floor unchanged at %.1f°F)",
+                pre_cool_target,
+                _sleep_band.floor,
+            )
+            return f"applied: {pre_cool_target:.1f}°F"
         _LOGGER.info(
-            "Pre-cool setpoint applied: cool ceiling %.1f°F (heat floor unchanged at %.1f°F)",
+            "Pre-cool setpoint NOT applied (%s): cool ceiling %.1f°F was intended",
+            _pre_cool_outcome,
             pre_cool_target,
-            _sleep_band.floor,
         )
-        await self._apply_comfort_band(
-            _pre_cool_band,
-            reason=f"pre-cool [{_sleep_band.floor:.0f}/{pre_cool_target:.0f}]",
-        )
-        return f"applied: {pre_cool_target:.1f}°F"
+        return f"not applied ({_pre_cool_outcome}): {pre_cool_target:.1f}°F"
 
     async def handle_morning_wakeup(self, indoor_temp: float | None = None) -> None:
         """Restore comfort for morning wake-up."""
@@ -9906,10 +10116,16 @@ class AutomationEngine:
         _old_mode_cg = _cs_cg.state if _cs_cg else None
         _old_setpoint_raw_cg = _cs_cg.attributes.get("temperature") if _cs_cg else None
         _old_setpoint_f_cg = to_fahrenheit(_old_setpoint_raw_cg, _unit) if _old_setpoint_raw_cg is not None else None
-        await self._set_hvac_mode(
-            "cool",
-            reason=(f"ODE ceiling guard — breach predicted at {_breach_ts.strftime('%H:%M')}"),
-        )
+        # Issue #1049: the comfort-band write earlier in this cycle already switched the
+        # thermostat to cool (explicit mode switch, change 1) -- do not send a second
+        # identical set_hvac_mode moments later.
+        if self._mode_switch_marker_recent("cool"):
+            _LOGGER.debug("ODE ceiling guard: mode already switched to cool this cycle -- skipping duplicate mode call")
+        else:
+            await self._set_hvac_mode(
+                "cool",
+                reason=(f"ODE ceiling guard — breach predicted at {_breach_ts.strftime('%H:%M')}"),
+            )
         await self._set_temperature(
             _comfort_cool_cg,
             reason="ODE ceiling guard — target comfort_cool",
@@ -12817,6 +13033,9 @@ class AutomationEngine:
         if self._setpoint_retry_cancel:
             self._setpoint_retry_cancel()
             self._setpoint_retry_cancel = None
+        if self._mode_align_recheck_cancel:
+            self._mode_align_recheck_cancel()
+            self._mode_align_recheck_cancel = None
         if self._fan_on_verify_cancel:
             self._fan_on_verify_cancel()
             self._fan_on_verify_cancel = None

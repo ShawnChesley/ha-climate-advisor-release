@@ -145,7 +145,10 @@ class TestHvacCommandResult:
         emitted = []
         engine._emit_event_callback = lambda n, d: emitted.append((n, d))
         assert asyncio.run(engine._set_hvac_mode("heat_cool", reason="t")) is HvacCommandResult.FAILED
-        assert emitted == []
+        # Visible as one Activity Log row, but NOT an hvac_command_failed incident / episode.
+        assert [n for n, _ in emitted] == ["hvac_mode_not_applied"]
+        assert emitted[0][1]["kind"] == "rejected"
+        assert engine._hvac_cmd_fail_announced is None
 
     def test_unconfirmed_on_timeout(self):
         engine = _make_engine()
@@ -168,19 +171,19 @@ class TestEpisodeGating:
 
         for _ in range(3):
             asyncio.run(engine._set_hvac_mode("heat", reason="t"))
-        classes = [d["incident_class"] for _, d in emitted]
-        assert classes == ["hvac_command_failed"], "repeat failures within one episode must not re-announce"
+        assert [(n, d.get("incident_class")) for n, d in emitted] == [("incident_detected", "hvac_command_failed")], (
+            "repeat failures within one episode must not re-announce"
+        )
 
         engine.hass.services.async_call.side_effect = None
         asyncio.run(engine._set_temperature(72.0, reason="t", mode="heat"))
-        classes = [d["incident_class"] for _, d in emitted]
-        assert classes == ["hvac_command_failed", "hvac_command_recovered"]
+        assert [n for n, _ in emitted] == ["incident_detected", "hvac_command_recovered"]
         assert "minutes_down" in emitted[-1][1]
 
         # A new failure after recovery opens a new episode.
         engine.hass.services.async_call.side_effect = RuntimeError("again")
         asyncio.run(engine._set_hvac_mode("heat", reason="t"))
-        assert [d["incident_class"] for _, d in emitted][-1] == "hvac_command_failed"
+        assert emitted[-1][1]["incident_class"] == "hvac_command_failed"
         assert len(emitted) == 3
 
     def test_success_with_no_open_episode_emits_nothing(self):
