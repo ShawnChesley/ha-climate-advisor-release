@@ -191,6 +191,7 @@ from .fan_toggle_rate_limit import (
     decide_fan_toggle_rate_limit,
 )
 from .hvac_action import is_hvac_compressor_active
+from .incident_payload import build_incident_payload, is_climate_validation_error
 from .indoor_temp import resolve_indoor_temp_f
 from .lifecycle_dispatcher import LifecycleDispatcher
 from .lifecycle_events import LifecycleEvent, LifecycleEventType
@@ -238,6 +239,7 @@ from .temperature import (
     format_temp,
     format_temp_delta,
     from_fahrenheit,
+    next_fallback_episode,
     read_state_temp_f,
     to_fahrenheit,
 )
@@ -264,6 +266,48 @@ class FanCommandResult(Enum):
     OVERRIDDEN = "overridden"
     DISABLED = "disabled"
     SUPPRESSED = "suppressed"  # Issue #835: hvac_fan_restrict_mode blocked activation
+
+
+class HvacCommandResult(Enum):
+    """Outcome of ``_set_hvac_mode()`` (Issue #1049, Part of #1048).
+
+    Sibling of ``FanCommandResult``. ``_set_hvac_mode()`` previously returned ``None`` on every
+    path, so no caller could tell "the thermostat accepted the mode" from "the command was
+    blocked, dry-run, or failed" — the invisibility at the heart of #1048 (Sensi ignored the
+    mode, nothing noticed). ``UNCONFIRMED`` is a blocking call whose answer did not arrive in
+    time: the thermostat's state is *unknown*, which is deliberately not ``FAILED``.
+    """
+
+    EXECUTED = "executed"
+    DRY_RUN = "dry_run"
+    WHF_BLOCKED = "whf_blocked"
+    FAILED = "failed"
+    UNCONFIRMED = "unconfirmed"
+
+
+class ClimateCallOutcome(Enum):
+    """Classification of one awaited ``climate.*`` service call (``_call_climate``)."""
+
+    OK = "ok"
+    TIMEOUT = "timeout"  # no answer in time — state unknown, NOT a failure
+    REJECTED = "rejected"  # HA validation (out of range / mode not offered) — skip quietly
+    FAILED = "failed"  # real failure (entity missing, integration error, ...)
+
+
+@dataclass(frozen=True)
+class ClimateCallResult:
+    """Result of ``AutomationEngine._call_climate``."""
+
+    outcome: ClimateCallOutcome
+    error: BaseException | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome is ClimateCallOutcome.OK
+
+
+# Seconds to wait for a blocking climate service call before treating the answer as unknown.
+CLIMATE_CALL_TIMEOUT_S = 10
 
 
 # Issue #664: moved to const.py (GRACE_TRIGGERS_PROTECTING_OVERRIDE) as the single source of
@@ -740,6 +784,12 @@ class AutomationEngine:
     # AttributeError. Normal construction always overwrites this with an instance
     # attribute in __init__ below.
     role: str = "production"
+
+    # Issue #1049: class-level defaults for attributes first read by the climate-command
+    # helpers below, so engines built via object.__new__ (skipping __init__) still work.
+    _write_seq: int = 0
+    _hvac_cmd_fail_announced: str | None = None
+    _hvac_cmd_fail_since: datetime | None = None
 
     def __init__(
         self,
@@ -3215,8 +3265,118 @@ class AutomationEngine:
             reason,
         )
 
-    async def _set_hvac_mode(self, mode: str, *, reason: str) -> None:
-        """Set the thermostat HVAC mode."""
+    async def _call_climate(self, service: str, data: dict[str, Any], label: str) -> ClimateCallResult:
+        """Await one ``climate.<service>`` call and classify the outcome (Issue #1049).
+
+        Modelled on ``_call_fan_service_with_context``. The call is ``blocking=True`` so a
+        rejection actually reaches us (non-blocking calls swallow the integration's error --
+        Sensi/ecobee behaviour behind #1048), but the wait is non-cancelling:
+        ``wait_for(shield(task))`` times out *without* cancelling the in-flight service call,
+        so a slow cloud thermostat is reported as ``TIMEOUT`` (state unknown) rather than being
+        torn down mid-command or mislabelled a failure. HA parameter-validation errors
+        (``REJECTED``: out-of-range setpoint, mode not offered) are classified apart from real
+        failures so callers can skip them quietly. ``label`` is the caller's log prefix (it
+        keeps the ``HVAC command failed`` / ``Temperature command failed`` ERROR wording and
+        the entity id that existing tests and log searches rely on).
+        """
+        task = asyncio.ensure_future(self.hass.services.async_call("climate", service, data, blocking=True))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), CLIMATE_CALL_TIMEOUT_S)
+        except TimeoutError:
+            # The shielded call keeps running; make sure a late exception is retrieved.
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+            _LOGGER.warning(
+                "%s: no answer from thermostat within %ds -- state unknown, not treating as failed (service=%s)",
+                label,
+                CLIMATE_CALL_TIMEOUT_S,
+                service,
+            )
+            return ClimateCallResult(ClimateCallOutcome.TIMEOUT)
+        except Exception as err:
+            if is_climate_validation_error(err):
+                _LOGGER.warning(
+                    "%s: rejected by Home Assistant validation, skipped (service=%s): %s", label, service, err
+                )
+                return ClimateCallResult(ClimateCallOutcome.REJECTED, err)
+            _LOGGER.error("%s: %s", label, err)
+            return ClimateCallResult(ClimateCallOutcome.FAILED, err)
+        return ClimateCallResult(ClimateCallOutcome.OK)
+
+    def _restamp_climate_command_times(self, *, temp: bool = True) -> None:
+        """Refresh the CA-command timestamps after an awaited climate call (Issue #1049).
+
+        The stamps taken *before* a call go stale while a blocking call waits for a slow cloud
+        thermostat (echoes arrive ~25 s later), which would let the echo escape the 30 s
+        own-command guards (coordinator echo/override checks, the bedtime recent-write skip).
+        One helper keeps ``_temp_command_time``, ``_last_commanded_hvac_time`` and
+        ``_hvac_command_time`` moving together. ``temp=False`` for a bare mode command, which
+        has never stamped ``_temp_command_time``.
+        """
+        _now = dt_util.now()
+        if temp:
+            self._temp_command_time = _now
+        self._last_commanded_hvac_time = _now
+        self._hvac_command_time = _now
+
+    def _emit_engine_incident(self, incident_class: str, extra: dict[str, Any]) -> None:
+        """Emit an engine-side ``incident_detected`` via the shared payload builder (Issue #1049)."""
+        if not self._emit_event_callback:
+            return
+        self._emit_event_callback(
+            "incident_detected",
+            build_incident_payload(
+                incident_class,
+                dt_util.now().isoformat(),
+                comfort_heat=self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
+                comfort_cool=self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
+                occupancy_mode=getattr(self, "_occupancy_mode", None),
+                extra=extra,
+            ),
+        )
+
+    def _note_hvac_command_failed(
+        self, mode: str, err: BaseException | None, *, setpoint_f: float | None = None
+    ) -> None:
+        """Announce ``hvac_command_failed`` once per failure episode (Issue #1049).
+
+        Repeated failures (every 30-minute cycle against a dead thermostat) previously emitted
+        one incident each. Episode state uses the shared ``next_fallback_episode`` transition;
+        the ERROR log line is still written for every failure by ``_call_climate``.
+        """
+        step = next_fallback_episode("failed", self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since, dt_util.now())
+        self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since = step.announced, step.since
+        if step.kind == "none":
+            _LOGGER.debug("hvac_command_failed episode already announced -- suppressing repeat (mode=%s)", mode)
+            return
+        extra: dict[str, Any] = {
+            "hvac_mode": mode,
+            "climate_entity": self.climate_entity,
+            "error": str(err),
+        }
+        if setpoint_f is not None:
+            extra["setpoint_f"] = setpoint_f  # internal F (never the display unit)
+        self._emit_engine_incident("hvac_command_failed", extra)
+
+    def _note_hvac_command_ok(self, mode: str) -> None:
+        """Close an open ``hvac_command_failed`` episode with a recovery note (Issue #1049)."""
+        if self._hvac_cmd_fail_announced is None:
+            return
+        step = next_fallback_episode(None, self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since, dt_util.now())
+        self._hvac_cmd_fail_announced, self._hvac_cmd_fail_since = step.announced, step.since
+        if step.kind != "recovered":
+            return
+        _LOGGER.info(
+            "HVAC command recovered -- thermostat accepted a command again (mode=%s down=%s min)",
+            mode,
+            step.minutes_down,
+        )
+        self._emit_engine_incident(
+            "hvac_command_recovered",
+            {"hvac_mode": mode, "climate_entity": self.climate_entity, "minutes_down": step.minutes_down},
+        )
+
+    async def _set_hvac_mode(self, mode: str, *, reason: str) -> HvacCommandResult:
+        """Set the thermostat HVAC mode and report what happened (Issue #1049)."""
         # Issue #392 Fix 1b: structural choke-point guard — WHF/AC mutual exclusion is
         # enforced here rather than by convention at every one of the ~13 call sites.
         if mode != "off" and self._whf_owns_hvac():
@@ -3238,10 +3398,14 @@ class AutomationEngine:
                     "hvac_write_blocked_whf_active",
                     {"attempted_mode": mode, "reason": reason},
                 )
-            return
+            return HvacCommandResult.WHF_BLOCKED
         if self.dry_run:
             _LOGGER.info("[DRY RUN] Would set HVAC mode to %s — %s role=%s", mode, reason, self.role)
-            return
+            return HvacCommandResult.DRY_RUN
+        # Issue #1049: a real mode command supersedes any pending verify/retry/nudge closure
+        # (bumping the shared write sequence makes them stale) -- otherwise a retry scheduled
+        # before a door/window pause or an Off would turn heat back on through the open window.
+        self._write_seq += 1
         self._hvac_command_pending = True
         self._hvac_command_time = dt_util.now()
         self._last_commanded_hvac_mode = mode
@@ -3250,11 +3414,24 @@ class AutomationEngine:
         if _cs_reaffirm and _cs_reaffirm.state == mode:
             _LOGGER.debug("_set_hvac_mode: thermostat already %r — re-affirming", mode)
         try:
-            await self.hass.services.async_call(
-                "climate",
+            _call = await self._call_climate(
                 "set_hvac_mode",
                 {"entity_id": self.climate_entity, "hvac_mode": mode},
+                f"HVAC command failed — mode={mode} entity={self.climate_entity}",
             )
+            self._restamp_climate_command_times(temp=False)
+            if _call.outcome is ClimateCallOutcome.REJECTED:
+                return HvacCommandResult.FAILED
+            if _call.outcome is ClimateCallOutcome.FAILED:
+                # Issue #805: this is the single write point for hvac_mode (Fix 1b) -- an
+                # invalid/removed climate_entity must not raise uncaught here (it would abort
+                # the whole coordinator update cycle). The entity-health sweep tells the user
+                # the thermostat is gone; this path only makes sure the failure is contained
+                # and announced once per episode (Issue #1049).
+                self._note_hvac_command_failed(mode, _call.error)
+                return HvacCommandResult.FAILED
+            if _call.outcome is ClimateCallOutcome.OK:
+                self._note_hvac_command_ok(mode)
             _LOGGER.info("Set HVAC mode to %s — %s role=%s", mode, reason, self.role)
             self._record_action(f"Set HVAC to {mode}", reason)
             # When taking HVAC offline, assert fan_mode=auto to clear any post-heat
@@ -3290,29 +3467,9 @@ class AutomationEngine:
                             _LOGGER.debug("Asserted fan_mode=%s alongside hvac_mode=off", _off_value)
                         except Exception:
                             _LOGGER.debug("Could not assert fan_mode=%s — non-critical", _off_value, exc_info=True)
-        except Exception as err:
-            # Issue #805: this is the single write point for hvac_mode (Fix 1b) — an
-            # invalid/removed climate_entity must not raise uncaught here, which would
-            # abort the whole coordinator update cycle (forecast/classification/learning
-            # bookkeeping too, not just this command). The entity-health sweep is the
-            # channel that tells the user the thermostat is gone; this handler's only
-            # job is making sure that fact doesn't also crash the cycle that hits it.
-            _LOGGER.error("HVAC command failed — mode=%s entity=%s: %s", mode, self.climate_entity, err)
-            if self._emit_event_callback:
-                self._emit_event_callback(
-                    "incident_detected",
-                    {
-                        "incident_class": "hvac_command_failed",
-                        "incident_id": dt_util.now().isoformat(),
-                        "hvac_mode": mode,
-                        "comfort_heat": self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
-                        "comfort_cool": self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
-                        "climate_entity": self.climate_entity,
-                        "error": str(err),
-                    },
-                )
         finally:
             self._hvac_command_pending = False
+        return HvacCommandResult.EXECUTED if _call.ok else HvacCommandResult.UNCONFIRMED
 
     async def _set_temperature(
         self,
@@ -3386,35 +3543,13 @@ class AutomationEngine:
                 "SETPOINT INCONSISTENCY: cool mode but target %.1fF is below comfort_heat threshold",
                 temperature,
             )
-            if self._emit_event_callback:
-                self._emit_event_callback(
-                    "incident_detected",
-                    {
-                        "incident_class": "setpoint_mode_inconsistency",
-                        "incident_id": dt_util.now().isoformat(),
-                        "hvac_mode": mode,
-                        "setpoint_f": temperature,
-                        "comfort_heat": self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
-                        "comfort_cool": self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
-                    },
-                )
+            self._emit_engine_incident("setpoint_mode_inconsistency", {"hvac_mode": mode, "setpoint_f": temperature})
         elif mode == "heat" and temperature > (self.config.get("comfort_cool", DEFAULT_COMFORT_COOL) + 1.0):
             _LOGGER.error(
                 "SETPOINT INCONSISTENCY: heat mode but target %.1fF is above comfort_cool threshold",
                 temperature,
             )
-            if self._emit_event_callback:
-                self._emit_event_callback(
-                    "incident_detected",
-                    {
-                        "incident_class": "setpoint_mode_inconsistency",
-                        "incident_id": dt_util.now().isoformat(),
-                        "hvac_mode": mode,
-                        "setpoint_f": temperature,
-                        "comfort_heat": self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
-                        "comfort_cool": self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
-                    },
-                )
+            self._emit_engine_incident("setpoint_mode_inconsistency", {"hvac_mode": mode, "setpoint_f": temperature})
         # Set state tracking BEFORE the write so the validation callback always
         # compares against the intended final setpoint.
         _now = dt_util.now()
@@ -3434,45 +3569,33 @@ class AutomationEngine:
             # Single call: hvac_mode + temperature together.  Including hvac_mode in every
             # call bypasses HA deduplication (the mode key makes each call distinct) and
             # ensures the thermostat is always in the correct mode.
-            await self.hass.services.async_call(
-                "climate",
+            # Issue #1049: awaited via _call_climate (blocking, non-cancelling wait) so a
+            # rejection is visible instead of swallowed by a non-blocking call.
+            _call = await self._call_climate(
                 "set_temperature",
                 {
                     "entity_id": self.climate_entity,
                     "hvac_mode": mode,
                     "temperature": service_temp,
                 },
+                f"Temperature command failed — target={format_temp(temperature, unit)} "
+                f"mode={mode} entity={self.climate_entity}",
             )
-        except Exception as err:
-            # Issue #805: this is the single write point for temperature+mode (Fix 1b) —
-            # an invalid/removed climate_entity must not raise uncaught here, which would
-            # abort the whole coordinator update cycle. The entity-health sweep is the
-            # channel that tells the user the thermostat is gone; this handler's only job
-            # is making sure that fact doesn't also crash the cycle that hits it. Return
-            # immediately — the setpoint-verify/retry logic below assumes the write
-            # succeeded and must not be scheduled against a value never actually sent.
-            _LOGGER.error(
-                "Temperature command failed — target=%s mode=%s entity=%s: %s",
-                format_temp(temperature, unit),
-                mode,
-                self.climate_entity,
-                err,
-            )
-            if self._emit_event_callback:
-                self._emit_event_callback(
-                    "incident_detected",
-                    {
-                        "incident_class": "hvac_command_failed",
-                        "incident_id": dt_util.now().isoformat(),
-                        "hvac_mode": mode,
-                        "setpoint_f": service_temp,
-                        "comfort_heat": self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
-                        "comfort_cool": self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
-                        "climate_entity": self.climate_entity,
-                        "error": str(err),
-                    },
-                )
-            return
+            self._restamp_climate_command_times()
+            if _call.outcome is ClimateCallOutcome.REJECTED:
+                # Out-of-range / mode-not-offered: skipped quietly (no incident, no verify).
+                return
+            if _call.outcome is ClimateCallOutcome.FAILED:
+                # Issue #805: this is the single write point for temperature+mode (Fix 1b) --
+                # an invalid/removed climate_entity must not raise uncaught here, which would
+                # abort the whole coordinator update cycle. Return immediately -- the
+                # setpoint-verify/retry logic below assumes the write succeeded and must not
+                # be scheduled against a value never actually sent. Announced once per
+                # episode (Issue #1049); setpoint_f is internal F, never the display unit.
+                self._note_hvac_command_failed(mode, _call.error, setpoint_f=temperature)
+                return
+            if _call.outcome is ClimateCallOutcome.OK:
+                self._note_hvac_command_ok(mode)
         finally:
             self._temp_command_pending = False
 
@@ -3556,21 +3679,28 @@ class AutomationEngine:
                             self._emit_event_callback(
                                 "setpoint_nudge",
                                 {
-                                    "nudge_value": _nudge_temp,
+                                    "nudge_value": _nudge_temp_f,  # internal F (renderer converts)
                                     "real_target": _retry_temp,
                                     "mode": _retry_mode,
                                     "reject_streak": self._setpoint_reject_streak,
                                 },
                             )
-                        await self.hass.services.async_call(
-                            "climate",
+                        self._restamp_climate_command_times()
+                        _nudge_call = await self._call_climate(
                             "set_temperature",
                             {
                                 "entity_id": self.climate_entity,
                                 "hvac_mode": _retry_mode,
                                 "temperature": _nudge_temp,
                             },
+                            f"Temperature nudge failed — target={format_temp(_nudge_temp_f, unit)} "
+                            f"mode={_retry_mode} entity={self.climate_entity}",
                         )
+                        self._restamp_climate_command_times()
+                        if _nudge_call.outcome in (ClimateCallOutcome.FAILED, ClimateCallOutcome.REJECTED):
+                            if _nudge_call.outcome is ClimateCallOutcome.FAILED:
+                                self._note_hvac_command_failed(_retry_mode, _nudge_call.error, setpoint_f=_nudge_temp_f)
+                            return  # no nudge landed -- do not schedule the real-target follow-up
 
                         async def _send_real_target(_later: Any) -> None:
                             if not decide_scheduled_write_seq_current(

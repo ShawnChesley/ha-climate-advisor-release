@@ -508,6 +508,7 @@ class TestHandleAllDoorsWindowsClosed:
             "climate",
             "set_hvac_mode",
             {"entity_id": "climate.thermostat", "hvac_mode": "cool"},
+            blocking=True,
         )
 
 
@@ -614,6 +615,7 @@ class TestHandleAllDoorsWindowsClosedZeroDurationGrace:
             "climate",
             "set_hvac_mode",
             {"entity_id": "climate.thermostat", "hvac_mode": "heat"},
+            blocking=True,
         )
 
 
@@ -1022,7 +1024,7 @@ class TestPauseForDoorWindowActionSplit:
         assert result is False  # hvac_already_off=False -- was actively turned off
         assert engine._pre_pause_mode == "cool"
         engine.hass.services.async_call.assert_any_call(
-            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}
+            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}, blocking=True
         )
 
     def test_action_returns_true_when_already_off(self):
@@ -1752,7 +1754,7 @@ class TestRePauseForOpenSensorFsmAuthoritative:
         assert engine._paused_entity == "re-check"
         assert engine._paused_since is not None
         engine.hass.services.async_call.assert_any_call(
-            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}
+            "climate", "set_hvac_mode", {"entity_id": "climate.thermostat", "hvac_mode": "off"}, blocking=True
         )
 
 

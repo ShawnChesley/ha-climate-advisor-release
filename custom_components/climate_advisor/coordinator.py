@@ -251,6 +251,7 @@ from .fan_status import (
     resolve_untracked_fan_status,
 )
 from .hvac_action import is_hvac_action_active, is_hvac_compressor_active
+from .incident_payload import build_incident_payload
 from .indoor_temp import IndoorTempReading, resolve_indoor_temp_with_provenance
 from .invariant_watchdog import run_invariant_checks
 from .learning import DailyRecord, LearningEngine, compute_k_passive_blocks, compute_k_passive_endpoint
@@ -9741,15 +9742,16 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             _resolved_heat, _resolved_cool = self._resolve_active_comfort_band()
             comfort_heat = _resolved_heat if comfort_heat is None else comfort_heat
             comfort_cool = _resolved_cool if comfort_cool is None else comfort_cool
-        payload: dict = {
-            "incident_class": incident_class,
-            "incident_id": incident_id,
-            "comfort_cool": comfort_cool,
-            "comfort_heat": comfort_heat,
-            "occupancy_mode": (self.automation_engine._occupancy_mode if self.automation_engine else None),
-        }
-        if extra:
-            payload.update(extra)
+        # Issue #1049: one shared payload builder (incident_payload.py) for this emitter and
+        # the engine's — no second _emit_incident.
+        payload = build_incident_payload(
+            incident_class,
+            incident_id,
+            comfort_heat=comfort_heat,
+            comfort_cool=comfort_cool,
+            occupancy_mode=(self.automation_engine._occupancy_mode if self.automation_engine else None),
+            extra=extra,
+        )
         self._emit_event("incident_detected", payload)
 
     def _is_nat_vent_tolerated_deviation(self, indoor: float, comfort_heat: float, comfort_cool: float) -> bool:
