@@ -109,6 +109,7 @@ def _make_real_coordinator(*, whf_physically_on, fan_mode, is_duplicate: bool = 
     coord.automation_engine._recent_duplicate = MagicMock(return_value=is_duplicate)
     coord.automation_engine._notify = MagicMock(side_effect=lambda *a, **kw: _noop())
     coord._run_invariant_watchdog = types.MethodType(ClimateAdvisorCoordinator._run_invariant_watchdog, coord)
+    coord._notify_in_background = types.MethodType(ClimateAdvisorCoordinator._notify_in_background, coord)
     return coord
 
 

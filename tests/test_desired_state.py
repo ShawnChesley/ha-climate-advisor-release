@@ -38,6 +38,7 @@ from custom_components.climate_advisor.desired_state import (
     decide_fan_cycle_on,
     decide_fan_thermo_backstop,
     decide_grace_start,
+    decide_open_sensor_hold,
     decide_override_confirm,
     decide_revisit,
     decide_scheduled_band_gate,
@@ -460,3 +461,27 @@ class TestDecideScheduledWriteSeqCurrent:
 
     def test_false_when_a_newer_command_superseded_it(self):
         assert decide_scheduled_write_seq_current(current_write_seq=6, target_write_seq=5) is False
+
+
+class TestDecideOpenSensorHold:
+    """Issue #1048 Phase 2: the one open-window predicate (all 16 input combinations)."""
+
+    def test_full_truth_table(self):
+        import itertools
+
+        for nat, whf, debounce, open_ in itertools.product((False, True), repeat=4):
+            expected = open_ and not debounce and not nat and not whf
+            assert (
+                decide_open_sensor_hold(
+                    natural_vent_active=nat,
+                    whf_owns_hvac=whf,
+                    debounce_pending=debounce,
+                    any_sensor_open=open_,
+                )
+                is expected
+            ), (nat, whf, debounce, open_)
+
+    def test_only_hold_case_is_settled_open_sensor_with_no_owner(self):
+        assert decide_open_sensor_hold(
+            natural_vent_active=False, whf_owns_hvac=False, debounce_pending=False, any_sensor_open=True
+        )

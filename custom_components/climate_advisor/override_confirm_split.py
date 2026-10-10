@@ -2,7 +2,7 @@
 Block 5 Phase 3).
 
 Reimplements the one piece of ``start_override_confirmation()``'s inner
-``_confirm_override_expired()`` closure (automation.py:1550-1608) that is not yet pure:
+``_confirm_override_expired()`` closure (automation.py, `start_override_confirmation()`) that is not yet pure:
 whether the confirmation window's expiry formally confirms the override (PATH A) or
 discards it as self-resolved (PATH B).
 
@@ -17,6 +17,8 @@ moment, a distinct question. The event emission (``override_confirmed`` /
 from __future__ import annotations
 
 from enum import Enum
+
+from .const import is_unavailable_state
 
 
 class OverrideConfirmPathOutcome(Enum):
@@ -48,7 +50,7 @@ def decide_override_confirm_path(
     if setpoint_override:
         return OverrideConfirmPathOutcome.CONFIRM
 
-    if current_mode not in ("unavailable", "unknown") and current_mode != classification_mode:
+    if not is_unavailable_state(current_mode) and current_mode != classification_mode:
         return OverrideConfirmPathOutcome.CONFIRM
 
     return OverrideConfirmPathOutcome.DISCARD_SELF_RESOLVED

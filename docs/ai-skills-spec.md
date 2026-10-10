@@ -224,7 +224,7 @@ available by default. The `Narration`/`Default (non-deep)` column below reflects
 |---|---|---|---|---|
 | `current_state` | 0 | ✅ | `CURRENT STATE` | `coordinator.data` + fresh HVAC runtime |
 | `hvac_entity` | 0 | ✅ | `HVAC ENTITY` | `hass.states.get(climate_entity_id)` — `hvac_mode` and `current_temperature` |
-| `state_cross_validation` | 0 | ✅ | `STATE CROSS-VALIDATION` | HVAC mode/action contradiction check + comfort-band deadband/swing check — ported from the retired activity context (Issue #563) |
+| `state_cross_validation` | 0 | ✅ | `STATE CROSS-VALIDATION` | HVAC mode/action contradiction check + comfort-band deadband/swing check — ported from the retired activity context (Issue #563); **unit-aware since Issue #1050**: the thermostat's `current_temperature` is read through `read_attribute_temp_f()` (internal °F, no hand-applied x5/9), all comparisons run in °F, and the `[FLAG]`/`[OK]` text, margins and deadbands are rendered in the user's unit with `format_temp` / `format_temp_delta` (a Celsius home no longer sees "Indoor 19.0F < comfort_heat 71.6F -- below by 52.6F") |
 | `last_briefing` | 1 | ✅ | `LAST BRIEFING` | `coordinator._last_briefing` — the most recently rendered daily briefing text, verbatim |
 | `learning` | 1 | ✅ | `LEARNING — *` (5 sub-sections) | Compliance summary, thermal model, weather bias, active suggestions (full text + evidence, unfiltered), last N daily records |
 | `thermal_pipeline` | 1 | ✅ | `THERMAL OBSERVATION PIPELINE` | Per-type committed/rejected counts, top reason codes, pending observations, `NEVER LEARNED` / `*** PIPELINE FAILURE ***` markers |
@@ -326,6 +326,8 @@ bounded, lower-jargon input distinct from that raw table.
 **Ranking and relevance:** `build_known_fixes_context()` calls `async_search_fix_history()`, which ranks by relevance to the investigation's `focus` keyword (when given) rather than recency alone. Always-included entries: not-yet-deployed fixes (`version_fixed > current`) + the 15 most recent by count. A matching fix from three releases ago outranks an unrelated fix from last release (the old recency-only window couldn't do this).
 
 **Rendering fallback:** Each entry renders its `user_summary` field when present, falling back to `title` — internal refactors with no occupant-facing outcome omit the summary.
+
+**Unit-aware context text (Issue #1050, Part of #1048).** Every temperature the providers print follows the zone's `temp_unit` and is built from internal °F through the shared helpers, never an `F` literal: `config` (comfort band, setbacks via `display_temp`, symbol from `UNIT_SYMBOL`), `current_state` / daily-record lines, `state_cross_validation` (above), `override_details` (`#n  t  old -> new  (+mag, direction)` via `format_temp` / `format_temp_delta`; the stored `old_temp` / `new_temp` / `magnitude` are internal °F) and the investigator's repeated-setpoint-rejection note (`display_temp` + `UNIT_SYMBOL`). New activity-log renderers receive `unit` as their second argument and must do the same -- see [temperature-conversion.md](temperature-conversion.md#display-sites-and-reason-strings-issue-1050-part-of-1048). Event payload fields named `*_f` stay °F.
 
 ### Config Provider
 

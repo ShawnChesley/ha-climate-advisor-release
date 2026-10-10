@@ -11,6 +11,8 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
+from .const import UNAVAILABLE_STATES
+
 FAHRENHEIT = "fahrenheit"
 CELSIUS = "celsius"
 
@@ -187,6 +189,17 @@ def next_fallback_episode(
     return EpisodeStep("recovered", None, None, minutes)
 
 
+def reminder_due(last: datetime | None, now: datetime, interval_s: float) -> bool:
+    """Pure reminder/debounce rule: True when nothing was sent yet or ``interval_s`` has elapsed.
+
+    The shared "is it time to (re)send" predicate for the coordinator's owner-alert paths:
+    the entity-health daily reminder and the comfort stall alert's 12 h reminder. (The
+    blind-fan push debounce still uses its own inline check -- tracked in issue #1058.) The
+    caller owns storing ``now`` as the new last-sent time when it acts.
+    """
+    return last is None or (now - last).total_seconds() >= interval_s
+
+
 def read_sensor_state_f(state, unit: str) -> tuple[float | None, str | None]:
     """Read a temperature sensor/input_number entity's *state* as internal Fahrenheit (Issue #1032).
 
@@ -202,7 +215,7 @@ def read_sensor_state_f(state, unit: str) -> tuple[float | None, str | None]:
     if state is None:
         return None, "entity_missing"
     raw = getattr(state, "state", None)
-    if raw in ("unavailable", "unknown"):
+    if raw in UNAVAILABLE_STATES:
         return None, "unavailable"
     try:
         parsed = float(raw)

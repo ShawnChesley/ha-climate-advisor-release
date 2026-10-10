@@ -22,6 +22,7 @@ from .ai_skills_context import (
 from .ai_skills_context import (
     build_version_context as _build_version_context_async,
 )
+from .temperature import UNIT_SYMBOL, display_temp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ INVESTIGATION PROCEDURE
    - Override counts that are implausibly high (>50 in a short window)
    - Timestamps that are in the future, in the wrong timezone, or precede the system installation
    - Zeroed counters that should accumulate over time (runtime, observation counts)
-   - Thermal rates (heating/cooling Â°F per hour) outside physically plausible bounds
+   - Thermal rates (heating/cooling °F per hour) outside physically plausible bounds
    - Weather bias corrections that exceed the configured cap
 4. Check the SYSTEM LOG RECORDS section for any captured WARNING/ERROR log entries (these are\
  real logger output, not CA event-log entries whose type merely happens to contain the word\
@@ -101,7 +102,7 @@ INVESTIGATION PROCEDURE
  in supplied data" rather than generating the hypothesis.
 11. TRACE AUTOMATION ACTIONS TO THEIR CAUSE, DON'T DESCRIBE STATE IN ISOLATION: When fan_status\
  is active while hvac_mode is off, explicitly trace the fan state to the logged automation\
- action that caused it (e.g., "Fan activated â€" natural ventilation: outdoor X°F <= threshold"),\
+ action that caused it (e.g., "Fan activated — natural ventilation: outdoor X°F <= threshold"),\
  using the ACTIVITY TIMELINE and event log sections. Two specific patterns are expected,\
  benign behavior, not incongruities:
    - grace_started with trigger=dashboard_resume: the user manually resumed automation from the\
@@ -566,6 +567,7 @@ def investigation_fallback(coordinator: Any, **kwargs: Any) -> dict[str, Any]:
             event_log_setpoint, hours_setpoint, now_utc_setpoint, limit=200
         )
         rejected_by_value: dict[float, list[str]] = {}
+        _setpoint_unit = (getattr(coordinator, "config", None) or {}).get("temp_unit", "fahrenheit")
         nudged_values: set[float] = set()
         for entry in filtered_events_setpoint:
             etype = str(entry.get("type", ""))
@@ -589,8 +591,9 @@ def investigation_fallback(coordinator: Any, **kwargs: Any) -> dict[str, Any]:
             if commanded_val in nudged_values:
                 # Already being addressed by a corrective nudge — not a new problem.
                 continue
+            _setpoint_s = f"{display_temp(commanded_val, _setpoint_unit):g}{UNIT_SYMBOL.get(_setpoint_unit, '°F')}"
             data_quality_parts.append(
-                f"Setpoint {commanded_val:g}°F rejected {len(timestamps)} times without"
+                f"Setpoint {_setpoint_s} rejected {len(timestamps)} times without"
                 " resolving — possible device-level command deduplication"
             )
     except Exception:

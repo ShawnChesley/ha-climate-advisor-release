@@ -8,7 +8,8 @@
 |---|---|---|
 | What is the priority order when multiple toggles are ON simultaneously? | GUEST beats VACATION beats HOME/AWAY. Guest+vacation ON simultaneously resolves to GUEST (full comfort, no deep setback). | [Priority Resolution](#priority-resolution) |
 | What triggers the 15-minute grace timer and what cancels it? | Any transition into AWAY mode starts the timer. Any subsequent toggle change to HOME, GUEST, or VACATION cancels it before setback fires. | [State Transitions](#state-transitions) |
-| Does `handle_occupancy_home()` clear the manual override flag? | No. `handle_occupancy_home()` restores comfort temperatures but does not clear `_manual_override_active`. Override is cleared only at bedtime and morning wakeup. | [Manual Override Interaction](#manual-override-interaction) |
+| What does arriving home do while a manual override, an unconfirmed change, a door pause or an open window is in effect? | `handle_occupancy_home()` never clears `_manual_override_active`, and (Issue #1050) it no longer forces comfort over it either: the restore is deferred (`occupancy_restore_deferred`) and the push says comfort resumes once the reason clears. Nat-vent/WHF ownership is not a hold. | [`handle_occupancy_home()`](#handlers) |
+| Does leaving home clear a manual override? | Yes. `handle_occupancy_away()` / `handle_occupancy_vacation()` clear a confirmed manual override, and since Issue #1050 also cancel an unconfirmed (confirm-pending) change, then apply the setback. A door pause still suppresses the setback and clears nothing. | [Manual Override Interaction](#manual-override-interaction) |
 | What setback temperature does VACATION mode apply vs AWAY? | VACATION adds an extra 3°F beyond AWAY: heat target drops an additional `VACATION_SETBACK_EXTRA`, cool target rises an additional `VACATION_SETBACK_EXTRA`. | [Setback Temperature Formulas](#setback-temperature-formulas) |
 | What happens to occupancy state if HA restarts mid-away-grace-period? | `occupancy_mode` is restored from `climate_advisor_state.json`; `occupancy_away_since` is also restored. However, the 15-minute grace timer is NOT re-armed on restart — the mode is synced to the engine via `set_occupancy_mode()` but the away timer callback is lost. | [Persistence](#persistence) |
 | What does `_set_temperature_for_mode()` do when called in AWAY or VACATION mode? | It is a safety net: it intercepts the call and redirects to `handle_occupancy_away()` or `handle_occupancy_vacation()` respectively, so no comfort temperature is ever applied while away. | [_set_temperature_for_mode() Safety Net](#_set_temperature_for_mode-safety-net) |
@@ -132,13 +133,13 @@ Invoked for both HOME and GUEST modes (coordinator routes GUEST through this sam
 
 1. Sets `self._occupancy_mode = OCCUPANCY_HOME`
 2. If no current classification (`_current_classification` is None): return (no HVAC action)
-3. If `c.hvac_mode` is `"heat"` or `"cool"`: call `_set_temperature_for_mode()` to restore comfort temperature
+3. If `c.hvac_mode` is `"heat"` or `"cool"`: call `_set_temperature_for_mode()` to restore comfort temperature -- **unless a restore hold applies (Issue #1050, #1048 change 18)**: `_occupancy_restore_hold_reason()` returns, in priority order, `manual_override` (`_manual_override_active`), `override_confirm_pending` (`_override_confirm_pending`), `paused_by_door` (`_paused_by_door`) or `open_sensor` (`desired_state.decide_open_sensor_hold()`: an open, debounced sensor that neither nat-vent nor a WHF session owns). When held, `HomeDecision.restore` is False and `restore_deferred_reason` is set: no restore write, no `occupancy_comfort_restored` event, INFO `Occupancy home -- restore deferred: reason=... mode=...`, and an `occupancy_restore_deferred` event `{mode, reason, indoor_f}` (windowed 600 s). Nat-vent/WHF ownership is **not** a hold -- arrival behavior during nat-vent is unchanged. The restore resumes through the normal paths once the reason clears (grace expiry, close/resume, next 30-min cycle); `occupancy_restore_hold_reason()` exposes the still-held reason to the chart (the target band keeps showing the setback) and clears itself
 4. **Notification suppression check 1 — proximity:** if indoor temp is already closer to comfort than to setback (`abs(indoor - comfort) < abs(indoor - setback)`), record notification timestamp and return without sending. `HomeDecision` carries `indoor_temp_f` (Issue #1036) — the `HomeInputs.indoor_temp_f` the decision was made from — and the shell's log line and the `occupancy_comfort_restored` event use that value instead of re-reading the sensor after the restore `await` (a re-read could be `None` if the thermostat dropped out and crashed the `%.1f` formatting). Set on every non-NONE outcome; `None` default
 5. **Notification suppression check 2 — debounce:** if a welcome-home notification was sent within `CONF_WELCOME_HOME_DEBOUNCE` seconds, return without sending
 6. Record `_last_welcome_home_notified = now`
-7. Send notification: `"Welcome home! Restoring comfort temperature. Should feel normal in about 20–30 minutes."` via `_notify(..., notification_type="occupancy_home")`
+7. Send notification: `"Welcome home! Restoring comfort temperature. Should feel normal in about 20–30 minutes."` via `_notify(..., notification_type="occupancy_home")`; when the restore was deferred (step 3) the text is instead `"Welcome home! Comfort temperature will resume once {your manual thermostat change | your pending thermostat change | the open door/window} clears."`
 
-**Does NOT clear `_manual_override_active`.** If a manual override is active when the user returns, comfort restore via `_set_temperature_for_mode()` still runs (override flag is only checked in `apply_classification()`).
+**Does NOT clear `_manual_override_active`.** Before Issue #1050 a manual override active when the user returned did not stop the comfort restore (the override flag was only checked in `apply_classification()`); that was the occupant-visible gap this change closes -- the restore now defers to the override (step 3) instead of overwriting the user's own setting. Only bedtime, morning wakeup and the away/vacation handlers clear the override.
 
 ### `handle_occupancy_away()` (`automation.py:L6712`)
 
@@ -150,7 +151,7 @@ Invoked after the 15-minute grace timer expires, and also called by `apply_class
 
 1. Sets `self._occupancy_mode` to `OCCUPANCY_AWAY`/`OCCUPANCY_VACATION`.
 2. If `_paused_by_door`: suppress (log info, emit `occupancy_setback_suppressed_paused` with windowed dedup), return — override is NOT cleared in this branch.
-3. If `_manual_override_active`: clear it via `clear_manual_override(reason="occupancy_away"/"occupancy_vacation")` — this happens regardless of whether a classification exists yet (see step 4).
+3. If `_manual_override_active` **or `_override_confirm_pending`** (Issue #1050: `AwayVacationInputs.override_confirm_pending`; `clear_override = manual_override_active or override_confirm_pending`): clear it via `clear_manual_override(reason="occupancy_away"/"occupancy_vacation")` — leaving home with an unconfirmed manual change cancels it and applies the setback. This happens regardless of whether a classification exists yet (see step 4).
 4. If no current classification: (away only) log WARNING; return.
 5. Otherwise, compute the setback band via `select_comfort_band(c, config, occupancy_mode=..., in_sleep_window=False, aggressive_savings=...)` and arm it via `_apply_comfort_band()` (both floor/ceiling edges, thermostat self-arbitrates) — emit `occupancy_setback` with windowed (600s) dedup (Issue #591).
 6. **No notification sent** (away/vacation transitions are silent; only the HOME transition notifies).
@@ -244,9 +245,9 @@ The manual-override-first ordering means: if both `_manual_override_active` and 
 |---|---|
 | `handle_bedtime()` (HOME/GUEST only) | Yes — calls `clear_manual_override()` |
 | `handle_morning_wakeup()` (HOME/GUEST only) | Yes — calls `clear_manual_override()` |
-| `handle_occupancy_home()` | **No** |
-| `handle_occupancy_away()` | **No** |
-| `handle_occupancy_vacation()` | **No** |
+| `handle_occupancy_home()` | **No** (and it defers its own restore while the override is active, Issue #1050) |
+| `handle_occupancy_away()` | **Yes** -- also cancels an unconfirmed (confirm-pending) change (Issue #1050); not when `_paused_by_door` (suppressed branch) |
+| `handle_occupancy_vacation()` | **Yes** -- same as away |
 | Toggle entity state change | **No** |
 
 **No direct occupancy override mechanism exists.** Occupancy mode is determined solely by the toggle entity states evaluated in `_compute_occupancy_mode()`. There is no API or service call to force-set the occupancy mode independently of the toggle entities.

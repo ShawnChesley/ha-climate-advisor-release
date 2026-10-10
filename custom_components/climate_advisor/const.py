@@ -6,7 +6,7 @@ DOMAIN = "climate_advisor"
 
 # Integration version — MUST match manifest.json "version" field.
 # A test in tests/test_version_sync.py enforces this.
-VERSION = "0.7.93"
+VERSION = "0.7.94"
 
 GITHUB_REPO = "gunkl/ClimateAdvisor"
 GITHUB_REPO_URL = "https://github.com/gunkl/ClimateAdvisor"
@@ -204,6 +204,15 @@ def is_availability_recovery(old_state: Any) -> bool:
     that is a reconnect, not an occupant override (Issue #1049).
     """
     return old_state is not None and is_unavailable_state(getattr(old_state, "state", None))
+
+
+# Issue #1048 change 9 -- "house off-target with no equipment running" stall alert.
+# Outside the active comfort band by more than this margin ...
+COMFORT_STALL_MARGIN_F = 1.0
+# ... continuously for this long, with no heating/cooling equipment run in the needed direction ...
+COMFORT_STALL_SUSTAIN_SECONDS = 3 * 3600
+# ... raises one owner alert, repeated no more often than this while it persists.
+COMFORT_STALL_REMINDER_SECONDS = 12 * 3600
 
 
 # Occupancy toggle configuration
@@ -600,6 +609,7 @@ CONFIG_METADATA = {
             " Used for morning wake-up and occupancy-home restores."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "comfort_cool": {
         "label": "Comfort Cool",
@@ -608,6 +618,7 @@ CONFIG_METADATA = {
             " The economizer uses this as the threshold for window cooling decisions."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "setback_heat": {
         "label": "Setback Heat",
@@ -616,6 +627,7 @@ CONFIG_METADATA = {
             " Lower values save more energy but take longer to recover when you return."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "setback_cool": {
         "label": "Setback Cool",
@@ -624,6 +636,7 @@ CONFIG_METADATA = {
             " Higher values save more energy but take longer to cool down when you return."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "notify_service": {
         "label": "Notification Service",
@@ -896,6 +909,7 @@ CONFIG_METADATA = {
             " than when you leave the house."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "sleep_cool": {
         "label": "Sleep Temperature (Cool)",
@@ -905,6 +919,7 @@ CONFIG_METADATA = {
             " than when you leave the house."
         ),
         "category": "setpoints",
+        "display_transform": "temp_abs",
     },
     "briefing_time": {
         "label": "Briefing Time",
@@ -968,9 +983,10 @@ CONFIG_METADATA = {
         "category": "advanced",
     },
     "max_setback_depth_f": {
-        "label": "Maximum Setback Depth (°F)",
+        "label": "Maximum Setback Depth",
         "description": "Largest overnight setback the adaptive engine may compute.",
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_mode_switch_min_interval_s": {
         "label": "Minimum Time Between Heat/Cool Switches (sec)",
@@ -982,44 +998,49 @@ CONFIG_METADATA = {
         "category": "advanced",
     },
     "comfort_deadband_hot_f": {
-        "label": "Comfort Deadband — Hot Days (°F)",
+        "label": "Comfort Deadband — Hot Days",
         "description": (
             "On a hot day, how far indoor temp must drop below the comfort floor before the"
             " comfort-family FSM escalates to heat (the against-grain direction on a hot day)."
         ),
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_deadband_warm_f": {
-        "label": "Comfort Deadband — Warm Days (°F)",
+        "label": "Comfort Deadband — Warm Days",
         "description": (
             "On a warm day, how far indoor temp must drop below the comfort floor before the"
             " comfort-family FSM escalates to heat."
         ),
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_deadband_mild_f": {
-        "label": "Comfort Deadband — Mild/Off Days (°F)",
+        "label": "Comfort Deadband — Mild/Off Days",
         "description": (
             "On a mild or off-classified day, how far indoor temp must move past a comfort edge"
             " before the comfort-family FSM escalates against the day's native direction."
         ),
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_deadband_cool_f": {
-        "label": "Comfort Deadband — Cool Days (°F)",
+        "label": "Comfort Deadband — Cool Days",
         "description": (
             "On a cool day, how far indoor temp must rise above the comfort ceiling before the"
             " comfort-family FSM escalates to cooling."
         ),
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_deadband_cold_f": {
-        "label": "Comfort Deadband — Cold Days (°F)",
+        "label": "Comfort Deadband — Cold Days",
         "description": (
             "On a cold day, how far indoor temp must rise above the comfort ceiling before the"
             " comfort-family FSM escalates to cooling (the against-grain direction on a cold day)."
         ),
         "category": "advanced",
+        "display_transform": "temp_delta",
     },
     "comfort_family_recency_window_min": {
         "label": "Recent Activity Window for Deadband (min)",
@@ -1047,6 +1068,7 @@ CONFIG_METADATA = {
             "Days whose forecast high is at or above this temperature are classified as Hot. Default: 85°F / 29°C."
         ),
         "category": "advanced",
+        "display_transform": "temp_abs",
     },
     "threshold_warm": {
         "label": "Warm Day Threshold",
@@ -1055,6 +1077,7 @@ CONFIG_METADATA = {
             " classified as Warm. Default: 75°F / 24°C."
         ),
         "category": "advanced",
+        "display_transform": "temp_abs",
     },
     "threshold_mild": {
         "label": "Mild Day Threshold",
@@ -1063,6 +1086,7 @@ CONFIG_METADATA = {
             " classified as Mild. Default: 60°F / 16°C."
         ),
         "category": "advanced",
+        "display_transform": "temp_abs",
     },
     "threshold_cool": {
         "label": "Cool Day Threshold",
@@ -1071,6 +1095,7 @@ CONFIG_METADATA = {
             " classified as Cool; below is Cold. Default: 45°F / 7°C."
         ),
         "category": "advanced",
+        "display_transform": "temp_abs",
     },
     "briefing_notifications_enabled": {
         "label": "Send Daily Briefing Notifications (This Zone)",

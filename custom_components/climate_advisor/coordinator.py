@@ -52,6 +52,8 @@ from .automation import (
 from .briefing import generate_briefing
 from .chart_log import ChartStateLog
 from .classifier import DayClassification, ForecastSnapshot, classify_day
+from .comfort_family_decision import _native_family
+from .comfort_stall_decision import StallReason, decide_comfort_stall, stall_margins
 from .confirmed_transition import is_confirmed, resolve_candidate_since
 from .const import (
     _VENT_SPLIT_TYPES,
@@ -90,6 +92,9 @@ from .const import (
     BRIEFING_NAT_VENT_CUTOFF_DRIFT_THRESHOLD_MINUTES,
     BRIEFING_TODAY_HIGH_DRIFT_THRESHOLD_F,
     CHART_LOG_MAX_DAYS,
+    COMFORT_STALL_MARGIN_F,
+    COMFORT_STALL_REMINDER_SECONDS,
+    COMFORT_STALL_SUSTAIN_SECONDS,
     CONF_AI_API_KEY,
     CONF_AI_ENABLED,
     CONF_AUTOMATION_GRACE_PERIOD,
@@ -243,10 +248,12 @@ from .const import (
     VACATION_SETBACK_EXTRA,
     VERSION,
     is_availability_recovery,
+    is_unavailable_state,
 )
 from .entity_health import run_entity_health_sweep
 from .fan_mode_resolver import is_thermostat_fan_physically_active
 from .fan_status import (
+    fan_entity_on,
     is_ca_fan_running,
     parse_remote_speed_event,
     parse_remote_timer_event,
@@ -280,14 +287,19 @@ from .scheduler import (
 from .state import StatePersistence
 from .temperature import (
     convert_delta,
+    display_delta,
+    display_temp,
     find_temperature_crossing,
     format_temp,
+    format_temp_delta,
     free_cooling_direction_ok,
-    from_fahrenheit,
     ha_system_unit,
     is_sensor_stale,
     next_fallback_episode,
+    read_attribute_temp_f,
     read_sensor_state_f,
+    read_state_temp_f,
+    reminder_due,
     to_fahrenheit,
     unit_key_from_attr,
     unit_mismatch,
@@ -563,6 +575,19 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         "fan_only": ("_thermostat_fan_only_on_since", "thermostat_fan_only_runtime_minutes"),
     }
 
+    # Issue #1048 change 9: comfort stall alert state. Class-level defaults (immutable or
+    # lazily created) so coordinators built via object.__new__ in tests still work. Not
+    # persisted -- a restart restarts the 3 h clock, matching confirmed_transition.py.
+    _equipment_last_active: dict[str, datetime] | None = None  # "heat"/"cool" -> last hvac_action seen
+    _stall_direction: str | None = None
+    _stall_since: datetime | None = None
+    _stall_announced_direction: str | None = None
+    _stall_announced_at: datetime | None = None
+    _stall_last_push: datetime | None = None
+    # Loop-computed once per cycle; read (never recomputed) by the executor-thread chart path.
+    _occupancy_restore_held_cache: bool = False
+    _stall_status: dict[str, str] | None = None  # the open hvac_control_issues entry, else None
+
     def __init__(self, hass: HomeAssistant, config: dict[str, Any], entry_id: str = "") -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -613,7 +638,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._chart_log = ChartStateLog(
             Path(hass.config.config_dir), max_days=CHART_LOG_MAX_DAYS, entry_id=self._entry_id
         )
-        self.learning = LearningEngine(Path(hass.config.config_dir), entry_id=self._entry_id)
+        self.learning = LearningEngine(
+            Path(hass.config.config_dir), entry_id=self._entry_id, temp_unit=config.get("temp_unit", "fahrenheit")
+        )
         # Issue #757 Phase 6 Step 8: this used to construct two live AutomationEngine
         # instances (_engine_a/_engine_b) behind a runtime-switchable primary/shadow
         # routing (automation_engine/shadow_automation_engine properties, Issue #727/
@@ -2192,7 +2219,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
     def _is_toggle_on(self, entity_id: str, invert: bool) -> bool:
         """Check if a toggle entity is effectively ON, respecting invert."""
         state = self.hass.states.get(entity_id)
-        if not state or state.state in ("unavailable", "unknown"):
+        if not state or is_unavailable_state(state.state):
             if state:
                 _LOGGER.warning(
                     "Occupancy toggle %s is %s — treating as OFF",
@@ -2517,15 +2544,22 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self._door_open_timers.clear()
             self._door_open_timer_expiry.clear()
 
-    def _is_sensor_open(self, entity_id: str) -> bool:
-        """Check if a door/window sensor is in the 'open' state, respecting polarity."""
-        inverted = self.config.get(CONF_SENSOR_POLARITY_INVERTED, False)
-        state = self.hass.states.get(entity_id)
+    def _state_is_open(self, state: Any) -> bool:
+        """Return True when an HA contact-sensor State (or None) reads 'open', respecting polarity.
+
+        Shared by ``_is_sensor_open`` (the live read) and ``_async_door_window_changed``
+        (the event's ``old_state``) so both agree on what "open" means (Issue #1048
+        change 19) — an unavailable/unknown/missing state is never open.
+        """
         if not state:
             return False
-        if inverted:
+        if self.config.get(CONF_SENSOR_POLARITY_INVERTED, False):
             return state.state == "off"
         return state.state == "on"
+
+    def _is_sensor_open(self, entity_id: str) -> bool:
+        """Check if a door/window sensor is in the 'open' state, respecting polarity."""
+        return self._state_is_open(self.hass.states.get(entity_id))
 
     def _is_recent_hvac_command(self, threshold_seconds: float = 3.0) -> bool:
         """Check if an HVAC command was issued very recently (race guard)."""
@@ -3402,6 +3436,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # to compare CA's computed target against the REAL thermostat right now, not
         # against a snapshot that can be up to ~30 min old.
         _target_temp = _cs.attributes.get("temperature") if _cs else None
+        # Issue #1048: the effective-target computation works in internal degF, so it needs the
+        # setpoint converted from the thermostat's unit. data["target_temp*"] below stay raw
+        # (thermostat-native) — their only consumer (ai_skills_context) prints them as such.
+        _target_temp_f = read_state_temp_f(_cs, "temperature", self.config.get("temp_unit", "fahrenheit"))
         _target_temp_low = _cs.attributes.get("target_temp_low") if _cs else None
         _target_temp_high = _cs.attributes.get("target_temp_high") if _cs else None
 
@@ -3690,7 +3728,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # not exposed as a sensor (Issue #1001) and has no other consumer.
         _effective_target_temp, _ = self._compute_effective_target_now(
             hvac_mode=hvac_mode,
-            target_temp=_target_temp,
+            target_temp=_target_temp_f,
             fan_status=_fan_status_uc,
         )
 
@@ -4206,7 +4244,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             return
         climate_id = self.config.get("climate_entity", "")
         state = self.hass.states.get(climate_id) if climate_id else None
-        if state is None or state.state in ("unavailable", "unknown"):
+        if state is None or is_unavailable_state(state.state):
             return
         self._climate_unit_checked = True
         raw = state.attributes.get("temperature_unit")
@@ -4262,7 +4300,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if not entity_id:
                 continue
             state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown"):
+            if state is None or is_unavailable_state(state.state):
                 continue
             checked.add(role)
             sensor_unit = unit_mismatch(state.attributes.get("unit_of_measurement"), configured)
@@ -4288,7 +4326,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             return None
 
         # Entity exists but isn't reporting data yet (common after restart)
-        if weather_state.state in ("unavailable", "unknown"):
+        if is_unavailable_state(weather_state.state):
             _LOGGER.debug(
                 "Weather entity %s is %s — treating as not ready",
                 weather_entity,
@@ -5180,8 +5218,23 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 pre_cool_trigger_h=_pc_trigger_h,
                 pre_cool_target=_pc_target,
                 tou_precondition_window=self._tou_precondition_window_tuple(),
+                restore_hold=self._occupancy_restore_held_cache,
             )
         )
+
+    def _occupancy_restore_held(self) -> bool:
+        """True while the engine is holding a deferred arrival-home comfort restore (Issue #1050).
+
+        EVENT LOOP ONLY: the engine accessor reads ``hass.states`` and self-clears its pending
+        marker. ``get_chart_data()`` runs in an executor thread (api.py) and reaches the band
+        builder, so it must never call this -- it reads ``_occupancy_restore_held_cache``, which
+        this method refreshes once per cycle from ``_resolve_target_band_schedule()``.
+        """
+        engine = getattr(self, "automation_engine", None)
+        accessor = getattr(engine, "occupancy_restore_hold_reason", None)
+        held = callable(accessor) and isinstance(accessor(), str)
+        self._occupancy_restore_held_cache = held
+        return held
 
     def _resolve_target_band_schedule(self) -> None:
         """Resolve and cache this cycle's target-band schedule (Issue #514) — cached on
@@ -5209,6 +5262,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         ``_build_target_band_for()`` directly, since it must reflect the exact moment a
         chart request arrives, not the last 30-min cycle's snapshot.
         """
+        self._occupancy_restore_held()  # refresh the loop-side cache the executor path reads
         self._target_band_schedule = self._build_target_band_for(
             dt_util.now(),
             self.automation_engine._thermal_model if self.automation_engine else None,
@@ -5525,7 +5579,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._pre_cool_trigger_dt = trigger_time
         self._pre_cool_target = pre_cool_target
         self._pre_cool_status = (
-            f"Pre-cool scheduled ({pre_cool_target:.0f}°F @ {trigger_time.strftime('%I:%M %p').lstrip('0')})"
+            f"Pre-cool scheduled ({format_temp(pre_cool_target, self.config.get('temp_unit', 'fahrenheit'))} "
+            f"@ {trigger_time.strftime('%I:%M %p').lstrip('0')})"
         )
 
     async def _async_pre_cool_trigger(self, now: datetime) -> None:
@@ -5775,6 +5830,31 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 cancel()
                 _LOGGER.info("Contact sensor closed: %s — debounce cancelled", entity_id)
 
+            # Issue #1048 change 19: a closed->closed (or unavailable->closed) re-report
+            # carries no information. After an HA restart every contact sensor re-registers
+            # and fires one of these, which flooded the Activity Log with ~48 identical
+            # "all sensors closed" rows. Skip only when nothing could need clearing: the
+            # prior state exists and was not open, the engine is not paused by a door (a
+            # persisted pause must still clear after a restart), nat-vent is inactive and no
+            # fan session is live (handle_all_doors_windows_closed() also ends those).
+            # old_state=None (no prior state at all) always proceeds.
+            _old_state = event.data.get("old_state")
+            _engine = self.automation_engine
+            if (
+                _old_state is not None
+                and not self._state_is_open(_old_state)
+                and not _engine._paused_by_door
+                and not _engine._natural_vent_active
+                and not _engine._fan_active
+                and not _engine._fan_override_active
+            ):
+                _LOGGER.debug(
+                    "Contact sensor closed re-report skipped: %s (was %s) — nothing paused or ventilating",
+                    entity_id,
+                    getattr(_old_state, "state", "none"),
+                )
+                return
+
             # Check if ALL monitored sensors are now closed
             all_closed = all(not self._is_sensor_open(s) for s in self._resolved_sensors)
             if all_closed:
@@ -5874,6 +5954,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         old_state = event.data.get("old_state")
         if not new_state or not old_state:
             return
+
+        # Issue #1048 change 9: remember when heating/cooling equipment was last seen active
+        # (per direction) for the comfort stall alert. Before any early return so a short
+        # cycle between two 30-min coordinator updates is never missed.
+        self._note_equipment_activity(new_state.attributes.get("hvac_action"), old_state.attributes.get("hvac_action"))
 
         # Bug 1 (Issue #321): Suppress override detection during startup coalescing window
         if self._suppress_during_startup_coalescing(f"thermostat override detection for {new_state.state}"):
@@ -5976,7 +6061,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # The existing elif below guards with `not _manual_override_active`, so this
             # branch fires first and handles the re-override case.
             old_state.state != new_state.state
-            and new_state.state not in ("unavailable", "unknown")
+            and not is_unavailable_state(new_state.state)
             and not _is_availability_recovery
             and self.automation_engine._manual_override_active
             and new_state.state != self.automation_engine._manual_override_mode
@@ -6025,7 +6110,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self._feed_override_grace_fsm_on_detect("handle_manual_override")
         elif (
             old_state.state != new_state.state
-            and new_state.state not in ("unavailable", "unknown")
+            and not is_unavailable_state(new_state.state)
             and not _is_availability_recovery
             and not self.automation_engine._manual_override_active
             and not self.automation_engine._hvac_command_pending
@@ -6402,14 +6487,20 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         _setpoint_override_detected = False
         if new_state.state == "heat_cool":
-            _new_high = new_state.attributes.get("target_temp_high")
-            _old_high = old_state.attributes.get("target_temp_high")
-            _new_low = new_state.attributes.get("target_temp_low")
-            _old_low = old_state.attributes.get("target_temp_low")
-            _setpoint_changed = (_new_high != _old_high) or (_new_low != _old_low)
-            # Use the cooling (high) setpoint as the representative value for override_details
-            new_temp, old_temp = _new_high, _old_high
+            # Issue #1048: heat_cool exposes a low and a high setpoint. Record whichever one(s)
+            # actually changed (the larger move when both did); the old code always read the high
+            # setpoint, so a low-only change was logged as magnitude 0.
+            _sp_attrs = [
+                _a
+                for _a in ("target_temp_high", "target_temp_low")
+                if new_state.attributes.get(_a) != old_state.attributes.get(_a)
+            ]
+            _setpoint_changed = bool(_sp_attrs)
+            _sp_attr = _sp_attrs[0] if _sp_attrs else "target_temp_high"
+            new_temp, old_temp = new_state.attributes.get(_sp_attr), old_state.attributes.get(_sp_attr)
         else:
+            _sp_attr = "temperature"
+            _sp_attrs = [_sp_attr]
             new_temp = new_state.attributes.get("temperature")
             old_temp = old_state.attributes.get("temperature")
             _setpoint_changed = new_temp != old_temp
@@ -6433,10 +6524,23 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # A single event that changes both setpoint and fan_mode has one root cause; two
             # simultaneous grace periods from one event would confuse the automation engine.
             _setpoint_override_detected = True
+            # Issue #1048: override records are stored in internal °F (read through the unit-aware
+            # helper), so every consumer converts once at its display boundary.
+            _ov_unit = self.config.get("temp_unit", "fahrenheit")
+            old_val = new_val = None
+            old_setpoint_f = new_setpoint_f = None
             try:
-                old_val = float(old_temp)
-                new_val = float(new_temp)
-                magnitude = round(new_val - old_val, 1)
+                _pairs: list[tuple[float, float]] = []
+                for _a in _sp_attrs:
+                    _o = read_attribute_temp_f(old_state, _a, _ov_unit)[0]
+                    _n = read_attribute_temp_f(new_state, _a, _ov_unit)[0]
+                    if _o is not None and _n is not None:
+                        _pairs.append((round(_o, 2), round(_n, 2)))
+                if not _pairs:
+                    raise ValueError("setpoint not numeric")
+                old_val, new_val = max(_pairs, key=lambda _p: abs(_p[1] - _p[0]))
+                old_setpoint_f, new_setpoint_f = old_val, new_val
+                magnitude = round(new_val - old_val, 2)
                 # Issue #583: increment the counter only after the append below is guaranteed
                 # to succeed, so manual_overrides and len(override_details) can never diverge.
                 self._today_record.manual_overrides += 1
@@ -6498,8 +6602,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     classification_mode=(
                         self._current_classification.hvac_mode if self._current_classification else None
                     ),
-                    old_setpoint_f=old_temp,
-                    new_setpoint_f=new_temp,
+                    old_setpoint_f=old_setpoint_f,
+                    new_setpoint_f=new_setpoint_f,
                 )
                 self._feed_override_grace_fsm_on_detect("handle_manual_override")
         elif _fan_cancel_in_this_event and _setpoint_changed:
@@ -6817,7 +6921,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         decision, not two.
         """
         new_state = event.data.get("new_state")
-        if not new_state or new_state.state in ("unknown", "unavailable"):
+        if not new_state or is_unavailable_state(new_state.state):
             return
 
         # Issue #495: dedup on the event's own timestamp (the entity's `state` field IS the
@@ -7030,7 +7134,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
-        if state is None or state.state in ("unknown", "unavailable"):
+        if state is None or is_unavailable_state(state.state):
             return None
         return state.state
 
@@ -7065,7 +7169,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if not remote_entity_id:
                 return None
             state = self.hass.states.get(remote_entity_id)
-            if state is None or state.state in ("unknown", "unavailable"):
+            if state is None or is_unavailable_state(state.state):
                 _LOGGER.debug(
                     "RF timer provenance: fan_remote_entity %s unavailable at startup — nothing to resume",
                     remote_entity_id,
@@ -7236,7 +7340,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         when falling back.
 
         Returns:
-            True/False if the fan is physically running (feedback mode), None if command-only.
+            True/False if the fan is physically running (feedback mode). None means UNKNOWN and
+            must never be read as off (Issue #1050, #1048 change 21): command-only mode, an
+            unavailable/unknown/missing command entity, an ``assumed_state`` entity, or no fan
+            entity configured at all.
         """
         if not self._fan_state_feedback_enabled():
             _LOGGER.debug("_get_fan_physical_state: returning None — fan_state_feedback=False (command-only mode)")
@@ -7244,9 +7351,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         fan_state_entity_id = self.config.get(CONF_FAN_STATE_ENTITY)
         if fan_state_entity_id:
             state = self.hass.states.get(fan_state_entity_id)
-            if state is not None and state.state not in ("unavailable", "unknown"):
+            state_on = fan_entity_on(state)
+            if state_on is not None:
                 self._fan_state_entity_unavailable_warned = False  # reset on success
-                return state.state.lower() in ("on", "true")
+                return state_on
             # Unavailable or missing — warn once then fall back
             if not self._fan_state_entity_unavailable_warned:
                 _LOGGER.warning(
@@ -7257,10 +7365,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # Fallback: read the fan command entity
         fan_entity_id = self.config.get(CONF_FAN_ENTITY)
         if fan_entity_id:
-            fan_state = self.hass.states.get(fan_entity_id)
-            if fan_state is not None:
-                return fan_state.state.lower() in ("on", "true")
-        return False
+            return fan_entity_on(self.hass.states.get(fan_entity_id))
+        return None
 
     def _run_invariant_watchdog(self, *, hvac_action: str | None) -> list:
         """Check hard system invariants and alert on any violation (Issue #749).
@@ -7284,15 +7390,38 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             ):
                 continue
             self._emit_event("invariant_violation", {"invariant": violation.name, "detail": violation.detail})
-            self.hass.async_create_task(
-                self.automation_engine._notify(
-                    f"{violation.detail} Climate Advisor is stepping in to prevent this, but"
-                    " flagging it because it should never happen.",
-                    "Climate Advisor — invariant violated",
-                    notification_type="invariant_violation",
-                )
+            self._notify_in_background(
+                "Climate Advisor — invariant violated",
+                f"{violation.detail} Climate Advisor is stepping in to prevent this, but"
+                " flagging it because it should never happen.",
+                "invariant_violation",
             )
         return violations
+
+    def _notify_in_background(self, title: str, message: str, notification_type: str, *, email: bool = True) -> None:
+        """Fire-and-forget owner notification (Issue #1050, change 26).
+
+        The one place the coordinator sends an alert without awaiting it: a task, so a notify
+        failure can never abort the update cycle that detected the problem (logged as a WARNING
+        instead). ``email=False`` skips the email channel for this alert (push still follows
+        its per-event preference). No-op before the automation engine exists.
+        """
+        engine = self.automation_engine
+        if engine is None:
+            return
+
+        async def _send() -> None:
+            try:
+                if email:
+                    await engine._notify(message, title, notification_type=notification_type)
+                else:
+                    await engine._notify(message, title, notification_type=notification_type, email=False)
+            except Exception:
+                _LOGGER.warning(
+                    "Background notification failed: type=%s title=%s", notification_type, title, exc_info=True
+                )
+
+        self.hass.async_create_task(_send())
 
     def _run_entity_health_check(self) -> list:
         """Detect missing/unavailable configured entities and notify on new outages (Issue #805).
@@ -7333,7 +7462,13 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         for issue in issues:
             current_keys.add(issue.config_key)
             tracked = self._entity_health_state.get(issue.config_key)
-            if tracked is None:
+            step = next_fallback_episode(
+                issue.status,
+                tracked["status"] if tracked else None,
+                tracked["first_seen"] if tracked else None,
+                now,
+            )
+            if step.kind == "fallback":
                 # ok -> missing/unavailable transition — a brand new outage.
                 self._entity_health_state[issue.config_key] = {
                     "status": issue.status,
@@ -7342,8 +7477,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 }
                 to_notify.append(issue)
             else:
+                # "none"/"changed" (missing <-> unavailable): same outage, only the reminder rule applies.
                 tracked["status"] = issue.status
-                if (now - tracked["last_notified"]).total_seconds() >= _ENTITY_HEALTH_REMINDER_SECONDS:
+                if reminder_due(tracked["last_notified"], now, _ENTITY_HEALTH_REMINDER_SECONDS):
                     tracked["last_notified"] = now
                     to_notify.append(issue)
 
@@ -7382,14 +7518,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 "Devices & Services."
             )
 
-        if self.automation_engine is not None:
-            self.hass.async_create_task(
-                self.automation_engine._notify(
-                    message,
-                    "Climate Advisor — entity not found",
-                    notification_type="entity_health",
-                )
-            )
+        self._notify_in_background("Climate Advisor — entity not found", message, "entity_health")
 
     def _should_run_untracked_fan_backstop(self, is_untracked: bool) -> bool:
         """Whether the periodic ``backstop_30min`` untracked-fan reconcile should fire now.
@@ -7715,12 +7844,16 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         _climate_id = self.config.get("climate_entity", "")
         _cs_sw = self.hass.states.get(_climate_id) if _climate_id else None
         if _cs_sw is not None:
-            _sp = _cs_sw.attributes.get("target_temperature")
-            if _sp is None:
-                _sp = _cs_sw.attributes.get("target_temp_low" if session_mode == "heat" else "target_temp_high")
-            if _sp is not None:
-                with contextlib.suppress(ValueError, TypeError):
-                    obs["setpoint_f"] = round(float(_sp), 1)
+            # Issue #1048: climate entities expose "temperature" (not "target_temperature"); read it
+            # unit-aware so setpoint_f is really °F.
+            _sp_unit = self.config.get("temp_unit", "fahrenheit")
+            _sp_f = read_state_temp_f(_cs_sw, "temperature", _sp_unit)
+            if _sp_f is None:
+                _sp_f = read_state_temp_f(
+                    _cs_sw, "target_temp_low" if session_mode == "heat" else "target_temp_high", _sp_unit
+                )
+            if _sp_f is not None:
+                obs["setpoint_f"] = round(_sp_f, 1)
 
         self._pending_observations[obs_type] = obs
         await self._executor_job(self.learning.save_state)
@@ -9818,6 +9951,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if mins is not None:
                 detail += f" for {mins} min"
             issues.append({"issue": "command_failing", "detail": detail})
+        # Issue #1048 change 9: the comfort stall entry. Hidden while a mode-not-obeyed
+        # episode is open -- that entry already says why the equipment is not running.
+        stall = self._stall_status
+        if isinstance(stall, dict) and stall and not any(i["issue"] == "mode_not_obeyed" for i in issues):
+            issues.append(dict(stall))
         return issues
 
     def _thermostat_incident_context(self) -> dict[str, Any]:
@@ -9846,6 +9984,192 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             rec = getattr(ae, "_hvac_write_record", None)
             ctx["last_command_result"] = hvac_outcome_label(getattr(rec, "result", None))
         return ctx
+
+    def _note_equipment_activity(self, *actions: Any, now: datetime | None = None) -> None:
+        """Stamp "heating/cooling equipment was active" for the direction(s) in ``actions``.
+
+        The per-direction runtime signal the comfort stall alert needs (Issue #1048 change 9).
+        ``hvac_runtime_minutes`` sums heat and cool and is only flushed at session end, so it
+        cannot answer "has heating run recently?"; this records the last equipment-active
+        ``hvac_action`` per direction instead. Only ``hvac_action`` counts (a thermostat
+        mode of heat/cool says nothing about the equipment).
+        """
+        for action in actions:
+            direction = {"heating": "heat", "cooling": "cool"}.get(action.lower()) if isinstance(action, str) else None
+            if direction is None:
+                continue
+            if self._equipment_last_active is None:
+                self._equipment_last_active = {}
+            self._equipment_last_active[direction] = now or dt_util.now()
+
+    def _update_comfort_stall(
+        self, indoor: float | None, comfort_heat: float | None, comfort_cool: float | None, now: datetime
+    ) -> None:
+        """Track and announce "off-target for hours with no equipment running" (Issue #1048 change 9).
+
+        Occupant outcome: a house left cold (or hot) by a thermostat that never starts the
+        equipment now raises a push alert (not email) after 3 h, repeating every 12 h, instead
+        of going unnoticed for days. Decision lives in ``decide_comfort_stall`` (pure); this
+        shell owns the clock state, the Activity Log events, the push and the Status entry
+        (``hvac_control_issues``). Suppressed -- but the clock keeps running -- while a
+        mode-not-obeyed episode is open, because that entry already explains the idle equipment.
+        """
+        ae = self.automation_engine
+        if ae is None:
+            return
+        state = self.hass.states.get(ae.climate_entity)
+        state_str = getattr(state, "state", None)
+        raw_attrs = getattr(state, "attributes", None)
+        attrs: dict[str, Any] = raw_attrs if isinstance(raw_attrs, dict) else {}
+        action = attrs.get("hvac_action")
+        action = action if isinstance(action, str) and action else None
+        modes = attrs.get("hvac_modes")
+        self._note_equipment_activity(action, now=now)
+
+        in_tolerance = (
+            indoor is not None
+            and comfort_heat is not None
+            and comfort_cool is not None
+            and self._is_nat_vent_tolerated_deviation(indoor, comfort_heat, comfort_cool)
+        )
+        # Only a direction CA itself would act on counts: against the day's grain the margin
+        # includes the day-type comfort-family deadband (see stall_margins).
+        _day_type = getattr(self._current_classification, "day_type", None) if self._current_classification else None
+        _heat_margin, _cool_margin = stall_margins(
+            _native_family(_day_type),
+            ae._comfort_deadband_for_day_type(_day_type),
+            COMFORT_STALL_MARGIN_F,
+        )
+        decision = decide_comfort_stall(
+            indoor=indoor,
+            comfort_heat=comfort_heat,
+            comfort_cool=comfort_cool,
+            now=now,
+            heat_margin_f=_heat_margin,
+            cool_margin_f=_cool_margin,
+            sustain_seconds=COMFORT_STALL_SUSTAIN_SECONDS,
+            previous_direction=self._stall_direction,
+            previous_since=self._stall_since,
+            last_active=dict(self._equipment_last_active or {}),
+            thermostat_available=state is not None and not is_unavailable_state(state_str),
+            has_hvac_action=action is not None,
+            hvac_modes=modes if isinstance(modes, (list, tuple)) else None,
+            manual_control=bool(getattr(ae, "_manual_override_active", False))
+            or bool(getattr(ae, "_override_confirm_pending", False)),
+            sensor_open=self._any_sensor_open() or bool(getattr(ae, "_paused_by_door", False)),
+            startup_coalescing=bool(self._startup_coalesce_active),
+            nat_vent_tolerated=in_tolerance,
+        )
+        self._stall_direction = decision.direction
+        self._stall_since = decision.since
+
+        if decision.reason is StallReason.EXCLUDED:
+            # Quiet: hide the Status entry; keep any announcement so recovery is still reported.
+            self._stall_status = None
+            _LOGGER.debug("Comfort stall check skipped: excluded_by=%s", decision.excluded_by)
+            return
+
+        announced = self._stall_announced_direction
+        if announced is not None:
+            # An announced episode closes ONLY on a real recovery: back in the band (or the
+            # house crossed to the opposite side), or heating/cooling equipment actually ran in
+            # the announced direction after the alert. A PENDING tick that merely follows an
+            # exclusion (thermostat unavailable, window opened...) is NOT a recovery -- the
+            # 3 h pending clock restarts but the episode, its reminder cadence and its
+            # "already announced" state carry on (no false recovery row, no second alert).
+            recovered_by: str | None = None
+            if decision.reason is StallReason.IN_BAND or (
+                decision.direction is not None and decision.direction != announced
+            ):
+                recovered_by = "in_band"
+            else:
+                _ran = (self._equipment_last_active or {}).get(announced)
+                if _ran is not None and self._stall_announced_at is not None and _ran > self._stall_announced_at:
+                    recovered_by = "equipment_ran"
+            if recovered_by is not None:
+                minutes = (
+                    round((now - self._stall_announced_at).total_seconds() / 60) if self._stall_announced_at else None
+                )
+                _LOGGER.info(
+                    "Comfort stall recovered: direction=%s reason=%s minutes=%s", announced, recovered_by, minutes
+                )
+                self._emit_event(
+                    "hvac_output_stall_recovered",
+                    {"direction": announced, "reason": recovered_by, "minutes_down": minutes},
+                )
+                self._stall_announced_direction = None
+                self._stall_announced_at = None
+                self._stall_last_push = None
+                announced = None
+                # hvac_control_issues was computed earlier in this cycle: refresh once (on the
+                # transition only, so no loop) so Status drops the entry now, not 30 min later.
+                self.hass.async_create_task(self.async_request_refresh())
+        if decision.reason is not StallReason.STALLED:
+            self._stall_status = None
+            return
+
+        # Confirmed stall.
+        direction = decision.direction or "heat"
+        if indoor is None or comfort_heat is None or comfort_cool is None:
+            return  # unreachable: the decision excludes missing inputs
+        unit = self.config.get("temp_unit", "fahrenheit")
+        edge = comfort_heat if direction == "heat" else comfort_cool
+        elapsed_s = (now - (decision.effective_since or now)).total_seconds()
+        hours = max(1, round(elapsed_s / 3600))
+        side = "below" if direction == "heat" else "above"
+        equipment = "heating" if direction == "heat" else "cooling"
+        gap_txt = format_temp_delta(abs(indoor - edge), unit, 1)
+        mode_txt = state_str if isinstance(state_str, str) else "unknown"
+        diag = f"thermostat mode {mode_txt}, action {action}"
+        self._stall_status = None
+        if any(i["issue"] == "mode_not_obeyed" for i in self._compute_hvac_control_issues()):
+            _LOGGER.info(
+                "Comfort stall alert held: direction=%s hours=%d -- a mode-not-obeyed episode is open", direction, hours
+            )
+            return
+        self._stall_status = {
+            "issue": "output_stall",
+            "detail": (
+                f"House has been {gap_txt} {side} the comfort band for {hours} h with no {equipment} running ({diag})"
+            ),
+        }
+        message = (
+            f"The house is {gap_txt} {side} your comfort band ({format_temp(edge, unit)}) and the {equipment}"
+            f" hasn't run for {hours} hours ({diag})."
+        )
+        if announced != direction:
+            _LOGGER.warning(
+                "Comfort stall detected: direction=%s indoor=%.1fF edge=%.1fF hours=%d thermostat_mode=%s action=%s",
+                direction,
+                indoor,
+                edge,
+                hours,
+                mode_txt,
+                action,
+            )
+            self._emit_event(
+                "hvac_output_stall",
+                {
+                    "direction": direction,
+                    "indoor_f": indoor,
+                    "edge_f": edge,
+                    "hours": hours,
+                    "thermostat_mode": mode_txt,
+                    "thermostat_action": action,
+                },
+            )
+            self._stall_announced_direction = direction
+            self._stall_announced_at = now
+            self._stall_last_push = now
+            self._notify_in_background("Climate Advisor — house off-target", message, "hvac_output_stall", email=False)
+            # Same lag as the recovery path: refresh once on the open transition only.
+            self.hass.async_create_task(self.async_request_refresh())
+        elif reminder_due(self._stall_last_push, now, COMFORT_STALL_REMINDER_SECONDS):
+            _LOGGER.info("Comfort stall reminder: direction=%s hours=%d", direction, hours)
+            self._stall_last_push = now
+            self._notify_in_background(
+                "Climate Advisor — house still off-target", message, "hvac_output_stall", email=False
+            )
 
     def _is_nat_vent_tolerated_deviation(self, indoor: float, comfort_heat: float, comfort_cool: float) -> bool:
         """True if this comfort-band deviation is expected nat-vent cycling tolerance, not a violation.
@@ -9954,6 +10278,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # used for both the violation-detection comparison below and the incident payload
         # stamped by _emit_incident() so a reviewer sees the band that was actually active.
         comfort_heat, comfort_cool = self._resolve_active_comfort_band()
+        # Issue #1048 change 9: isolated -- a bug in the stall tracker must never abort the
+        # incident scan (or the update cycle) that is detecting a different problem.
+        try:
+            self._update_comfort_stall(indoor, comfort_heat, comfort_cool, now)
+        except Exception:
+            _LOGGER.warning("Comfort stall tracking failed", exc_info=True)
         if (
             indoor
             and comfort_cool
@@ -10990,7 +11320,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 actual_outdoor.append({"time": _ts, "temp": _outdoor})
 
         def _conv(v: float | None) -> float | None:
-            return round(from_fahrenheit(v, unit), 1) if v is not None else None
+            return display_temp(v, unit)
 
         actual_outdoor = [{"time": p["time"], "temp": _conv(p["temp"])} for p in actual_outdoor]
         actual_indoor = [{"time": p["time"], "temp": _conv(p["temp"])} for p in actual_indoor]
@@ -11181,8 +11511,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 "observation_count_vent_window": thermal_model.get("observation_count_vent_window", 0),
                 "observation_count_vent_fan": thermal_model.get("observation_count_vent_fan", 0),
                 "observation_count_solar": thermal_model.get("observation_count_solar", 0),
-                "swing_heat": round(convert_delta(thermal_model.get("swing_heat_f_display", 1.5), unit), 2),
-                "swing_cool": round(convert_delta(thermal_model.get("swing_cool_f_display", 1.5), unit), 2),
+                "swing_heat": display_delta(thermal_model.get("swing_heat_f_display", 1.5), unit, 2),
+                "swing_cool": display_delta(thermal_model.get("swing_cool_f_display", 1.5), unit, 2),
                 "swing_heat_measured": thermal_model.get("swing_heat_f") is not None,
                 "swing_cool_measured": thermal_model.get("swing_cool_f") is not None,
                 "observation_count_swing_heat": thermal_model.get("observation_count_swing_heat", 0),
@@ -11336,7 +11666,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             "classification": {
                 "day_type": c.day_type if c else None,
                 "trend_direction": c.trend_direction if c else None,
-                "trend_magnitude": round(convert_delta(c.trend_magnitude, unit), 1) if c else None,
+                "trend_magnitude": display_delta(c.trend_magnitude, unit) if c else None,
                 "hvac_mode": c.hvac_mode if c else None,
                 "windows_recommended": c.windows_recommended if c else None,
                 "window_open_time": (c.window_open_time.isoformat() if c and c.window_open_time else None),
@@ -11356,16 +11686,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     c.window_opportunity_evening_end.isoformat() if c and c.window_opportunity_evening_end else None
                 ),
                 "pre_condition": c.pre_condition if c else None,
-                "pre_condition_target": (
-                    round(from_fahrenheit(c.pre_condition_target, unit), 1)
-                    if c and c.pre_condition_target is not None
-                    else None
-                ),
-                "setback_modifier": round(convert_delta(c.setback_modifier or 0, unit), 1) if c else None,
-                "today_low": (round(from_fahrenheit(c.today_low, unit), 1) if c and c.today_low is not None else None),
-                "tomorrow_low": (
-                    round(from_fahrenheit(c.tomorrow_low, unit), 1) if c and c.tomorrow_low is not None else None
-                ),
+                "pre_condition_target": display_delta(c.pre_condition_target, unit)
+                if c
+                else None,  # a delta, not a temperature
+                "setback_modifier": display_delta(c.setback_modifier or 0, unit) if c else None,
+                "today_low": (display_temp(c.today_low, unit) if c else None),
+                "tomorrow_low": (display_temp(c.tomorrow_low, unit) if c else None),
             },
             "last_action_time": ae._last_action_time,
             "last_action_reason": ae._last_action_reason,
@@ -12026,6 +12352,7 @@ def _compute_target_band_schedule(
     pre_cool_trigger_h: float | None = None,
     pre_cool_target: float | None = None,
     tou_precondition_window: tuple[datetime, datetime, float, str] | None = None,
+    restore_hold: bool = False,
 ) -> list[dict]:
     """Compute the dynamic target band (lower/upper) for each hourly timestamp.
 
@@ -12055,6 +12382,12 @@ def _compute_target_band_schedule(
     computed value would otherwise not exactly match the commanded setpoint (mandatory
     Chart Coverage rule — the chart must never show a band conflicting with what the
     engine actually commands).
+
+    ``restore_hold`` (Issue #1050, #1048 change 18): an arrival-home comfort restore is being
+    HELD by the engine (manual override, unconfirmed change, door pause or open window), so
+    the thermostat is still on the away setback. Home timestamps today that are not after
+    ``now`` then show the setback band, so the chart never claims comfort the engine is not
+    commanding. Later hours show the normal schedule (the hold is expected to clear).
     """
     comfort_heat = float(config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
     comfort_cool = float(config.get("comfort_cool", DEFAULT_COMFORT_COOL))
@@ -12101,7 +12434,7 @@ def _compute_target_band_schedule(
         if occupancy_mode == OCCUPANCY_VACATION:
             lower = setback_heat_eff - VACATION_SETBACK_EXTRA
             upper = setback_cool_eff + VACATION_SETBACK_EXTRA
-        elif occupancy_mode == OCCUPANCY_AWAY and ts_date == now_date:
+        elif ts_date == now_date and (occupancy_mode == OCCUPANCY_AWAY or (restore_hold and ts <= now)):
             lower = setback_heat_eff
             upper = setback_cool_eff
         else:

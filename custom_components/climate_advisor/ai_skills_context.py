@@ -57,7 +57,7 @@ from .const import (
 from .coordinator import _REJECTION_LOG_CAP
 from .fan_status import is_ca_fan_running
 from .hvac_action import is_hvac_action_active
-from .temperature import format_temp, format_temp_delta
+from .temperature import UNIT_SYMBOL, display_temp, format_temp, format_temp_delta, read_attribute_temp_f
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1194,16 +1194,23 @@ async def build_config_context(hass: Any, coordinator: Any, **kwargs: Any) -> st
         cfg: dict[str, Any] = dict(coordinator.config or {})
         cfg.pop("ai_api_key", None)
 
-        _comfort_heat = cfg.get("comfort_heat", "unknown")
-        _comfort_cool = cfg.get("comfort_cool", "unknown")
+        # Issue #1048: config temperatures are internal degF; show them in the user's unit.
+        _cfg_unit = cfg.get("temp_unit", "fahrenheit")
+
+        def _cfg_temp(key: str) -> Any:
+            v = cfg.get(key, "unknown")
+            return f"{display_temp(v, _cfg_unit):g}" if isinstance(v, (int, float)) else v
+
+        _comfort_heat = _cfg_temp("comfort_heat")
+        _comfort_cool = _cfg_temp("comfort_cool")
         lines = [
             "=== CONFIGURATION ===",
             f"  comfort_heat (lower bound): {_comfort_heat} — indoor must be >= this to be in comfort band",
             f"  comfort_cool (upper bound): {_comfort_cool} — indoor must be <= this to be in comfort band",
-            f"  comfort_band: [{_comfort_heat}, {_comfort_cool}]°F"
+            f"  comfort_band: [{_comfort_heat}, {_comfort_cool}]{UNIT_SYMBOL.get(_cfg_unit, '°F')}"
             " — temperature T is in-band only if comfort_heat <= T <= comfort_cool",
-            f"  setback_heat:    {cfg.get('setback_heat', 'unknown')}",
-            f"  setback_cool:    {cfg.get('setback_cool', 'unknown')}",
+            f"  setback_heat:    {_cfg_temp('setback_heat')}",
+            f"  setback_cool:    {_cfg_temp('setback_cool')}",
             f"  wake_time:       {cfg.get('wake_time', 'unknown')}",
             f"  sleep_time:      {cfg.get('sleep_time', 'unknown')}",
             f"  briefing_time:   {cfg.get('briefing_time', 'unknown')}",
@@ -1433,6 +1440,7 @@ def _build_daily_summaries(coordinator: Any, hours: float) -> list[str]:
     """Return context lines for historical daily records when hours > 36."""
     try:
         days_back = max(1, int(hours / 24))
+        _ds_unit = (getattr(coordinator, "config", None) or {}).get("temp_unit", "fahrenheit")
         today_str = datetime.date.today().isoformat()
         cutoff_date = (datetime.date.today() - datetime.timedelta(days=days_back)).isoformat()
         records: list[dict] = (
@@ -1461,11 +1469,11 @@ def _build_daily_summaries(coordinator: Any, hours: float) -> list[str]:
             overrides = int(r.get("manual_overrides", 0) or 0)
             viol_min = int(r.get("comfort_violations_minutes", 0) or 0)
             avg_in = r.get("avg_indoor_temp")
-            avg_in_str = f"{avg_in:.1f}F" if isinstance(avg_in, (int, float)) else "n/a"
+            avg_in_str = format_temp(avg_in, _ds_unit, 1) if isinstance(avg_in, (int, float)) else "n/a"
             obs_high = r.get("observed_high_f")
             obs_low = r.get("observed_low_f")
             hl_str = (
-                f"{obs_high:.0f}F/{obs_low:.0f}F"
+                f"{format_temp(obs_high, _ds_unit)}/{format_temp(obs_low, _ds_unit)}"
                 if isinstance(obs_high, (int, float)) and isinstance(obs_low, (int, float))
                 else "n/a"
             )
@@ -1819,9 +1827,10 @@ def _render_classification_applied(p: dict, unit: str) -> tuple[str, str]:
     margin = p.get("threshold_margin_f")
     if today_high is not None and threshold is not None and margin is not None:
         with contextlib.suppress(TypeError, ValueError):
+            margin_s = f"{'+' if margin >= 0 else '-'}{format_temp_delta(abs(margin), unit, 1)}"
             settings_parts.append(
                 f"today's high {format_temp(today_high, unit)} vs. {day_type} threshold "
-                f"{format_temp(threshold, unit)} ({margin:+.1f}°F)"
+                f"{format_temp(threshold, unit)} ({margin_s})"
             )
     trend_mag = p.get("trend_magnitude")
     if trend_mag is not None:
@@ -1854,6 +1863,48 @@ def _render_hvac_command_recovered(p: dict, unit: str) -> tuple[str, str]:
     """Issue #1049: the thermostat accepted a climate command again after failures."""
     minutes = p.get("minutes_down")
     return "Thermostat accepting commands again", (f"down {minutes} min" if minutes is not None else "")
+
+
+def _render_occupancy_restore_deferred(p: dict, unit: str) -> tuple[str, str]:
+    # Issue #1050 (#1048 change 18): arriving home while a hold is active -- the comfort restore waits.
+    why = {
+        "manual_override": "manual thermostat change",
+        "override_confirm_pending": "unconfirmed thermostat change",
+        "paused_by_door": "door/window open",
+        "open_sensor": "door/window open",
+    }.get(p.get("reason", ""), p.get("reason") or "hold")
+    mode = p.get("mode", "")
+    settings = f"resumes once it clears ({mode})" if mode else "resumes once it clears"
+    return f"Occupancy -- comfort restore deferred ({why})", settings
+
+
+def _render_hvac_output_stall(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1048 change 9: off-target for hours and no equipment ran in the needed direction."""
+    heating = p.get("direction") != "cool"
+    side, equipment = ("below", "heating") if heating else ("above", "cooling")
+    hours = p.get("hours")
+    label = f"House is {side} the comfort band and the {equipment} hasn't run" + (
+        f" for {hours} hours" if hours is not None else ""
+    )
+    parts: list[str] = []
+    with contextlib.suppress(TypeError, ValueError):
+        if p.get("indoor_f") is not None:
+            parts.append(f"indoor {format_temp(float(p['indoor_f']), unit)}")
+        if p.get("edge_f") is not None:
+            parts.append(f"band edge {format_temp(float(p['edge_f']), unit)}")
+    if p.get("thermostat_mode"):
+        parts.append(f"thermostat mode {p['thermostat_mode']}")
+    if p.get("thermostat_action"):
+        parts.append(f"action {p['thermostat_action']}")
+    return label, ", ".join(parts)
+
+
+def _render_hvac_output_stall_recovered(p: dict, unit: str) -> tuple[str, str]:
+    """Issue #1048 change 9: the off-target stall ended (back in band, or equipment ran)."""
+    how = "equipment ran" if p.get("reason") == "equipment_ran" else "back in the comfort band"
+    minutes = p.get("minutes_down")
+    detail = how + (f", alerted {minutes} min ago" if minutes is not None else "")
+    return "House no longer stalled off-target", detail
 
 
 def _render_setpoint_rejected(p: dict, unit: str) -> tuple[str, str]:
@@ -2328,6 +2379,20 @@ def _render_fan_cancel(p: dict, unit: str) -> tuple[str, str]:
     fan_device = p.get("fan_device", "fan")
     settings = f"{fan_device}: {fan_before}->{fan_after}" if fan_before and fan_after else ""
     trigger = p.get("trigger")
+    if trigger == "physical_drift_correction" and p.get("readback"):
+        # session_kept False = the windows had closed so the ventilation session ended and the AC
+        # suppression was released; otherwise the session (and the AC suppression) stays.
+        released = p.get("session_kept") is False
+        if p.get("retry"):
+            if released:
+                return "Fan switch ignored the on-command -- ventilation ended, AC released", settings
+            return "Fan switch ignored the on-command -- retrying once", settings
+        if released:
+            return "Fan switch ignored the on-command again -- giving up on the fan, AC released", settings
+        return (
+            "Fan switch ignored the on-command again -- giving up on the fan (AC stays off while windows are open)",
+            settings,
+        )
     if trigger == "physical_drift_correction":
         return "Fan ownership corrected -- stale flag cleared (was already off)", settings
     if trigger == "timer_boundary_settle":
@@ -2865,7 +2930,7 @@ def _render_comfort_family_switch(p: dict, unit: str) -> tuple[str, str]:
     label = f"Switched to {resolved_family}" if resolved_family else "Comfort family switched"
     detail_parts = [p.get("reason", "")]
     if deadband is not None:
-        detail_parts.append(f"deadband applied: {deadband}°F")
+        detail_parts.append(f"deadband applied: {format_temp_delta(deadband, unit, 1)}")
     mins_cool = p.get("minutes_since_cooling_ended")
     mins_heat = p.get("minutes_since_heating_ended")
     if mins_cool is not None:
@@ -2898,6 +2963,9 @@ EVENT_RENDERERS: dict[str, Callable[[dict, str], tuple[str, str]]] = {
     "hvac_mode_not_applied": _render_hvac_mode_not_applied,
     "hvac_mode_applied_recovered": _render_hvac_mode_applied_recovered,
     "hvac_command_recovered": _render_hvac_command_recovered,
+    "hvac_output_stall": _render_hvac_output_stall,
+    "occupancy_restore_deferred": _render_occupancy_restore_deferred,
+    "hvac_output_stall_recovered": _render_hvac_output_stall_recovered,
     "setpoint_nudge": _render_setpoint_nudge,
     "override_cleared": _render_override_cleared,
     "override_confirmed": _render_override_confirmed,
@@ -3021,6 +3089,9 @@ _NO_DEDUP: frozenset[str] = frozenset(
         "hvac_mode_not_applied",
         "hvac_mode_applied_recovered",
         "hvac_command_recovered",
+        "hvac_output_stall",
+        "hvac_output_stall_recovered",
+        "occupancy_restore_deferred",
         "ceiling_guard_fired",
         "incident_detected",
         "setpoint_rejected",
@@ -3542,12 +3613,15 @@ async def build_state_cross_validation_context(hass: Any, coordinator: Any, **kw
     hvac_action = data.get(ATTR_HVAC_ACTION, "unknown")
     fan_status = data.get(ATTR_FAN_STATUS, "unknown")
 
+    _temp_unit = options.get("temp_unit", "fahrenheit")
     climate_entity_id: str = options.get("climate_entity", "")
-    current_temp: Any = "unknown"
+    # Issue #1048: read the thermostat's reading through the unit-aware helper so it is compared
+    # with comfort_heat/comfort_cool (internal degF) in the same unit.
+    current_temp_f: float | None = None
     if climate_entity_id:
         climate_state = hass.states.get(climate_entity_id) if hass is not None else None
         if climate_state is not None:
-            current_temp = climate_state.attributes.get("current_temperature", "unknown")
+            current_temp_f = read_attribute_temp_f(climate_state, "current_temperature", _temp_unit)[0]
 
     state_flags: list[str] = []
     if hvac_mode == "off" and is_hvac_action_active(hvac_action):
@@ -3560,7 +3634,6 @@ async def build_state_cross_validation_context(hass: Any, coordinator: Any, **kw
 
     _swing_heat_f = THERMAL_SWING_DEFAULT_F
     _swing_cool_f = THERMAL_SWING_DEFAULT_F
-    _temp_unit = options.get("temp_unit", "fahrenheit")
     learning = getattr(coordinator, "learning", None)
     if learning is not None and callable(getattr(learning, "get_thermal_model", None)):
         try:
@@ -3569,26 +3642,34 @@ async def build_state_cross_validation_context(hass: Any, coordinator: Any, **kw
             _thermal = learning.get_thermal_model(learning_health=_health)
             _swing_heat_f = _thermal.get("swing_heat_f_display", THERMAL_SWING_DEFAULT_F)
             _swing_cool_f = _thermal.get("swing_cool_f_display", THERMAL_SWING_DEFAULT_F)
-            if _temp_unit == "celsius":
-                _swing_heat_f *= 5.0 / 9.0
-                _swing_cool_f *= 5.0 / 9.0
         except Exception:
             pass
 
     try:
         ch = float(options.get("comfort_heat", "unknown"))
         cc = float(options.get("comfort_cool", "unknown"))
-        ct = float(current_temp)
+        if current_temp_f is None:
+            raise ValueError("no indoor reading")
+        ct = current_temp_f
+        # All comparisons are in internal degF; only the rendered text is in the user's unit.
+        _ct_s = format_temp(ct, _temp_unit, 1)
         if (ch - ct) > _swing_heat_f:
             state_flags.append(
-                f"[FLAG] Indoor {ct}F < comfort_heat {ch}F -- below by {ch - ct:.1f}F (deadband: {_swing_heat_f:.1f}F)"
+                f"[FLAG] Indoor {_ct_s} < comfort_heat {format_temp(ch, _temp_unit, 1)} -- "
+                f"below by {format_temp_delta(ch - ct, _temp_unit, 1)} "
+                f"(deadband: {format_temp_delta(_swing_heat_f, _temp_unit, 1)})"
             )
         elif (ct - cc) > _swing_cool_f:
             state_flags.append(
-                f"[FLAG] Indoor {ct}F > comfort_cool {cc}F -- above by {ct - cc:.1f}F (deadband: {_swing_cool_f:.1f}F)"
+                f"[FLAG] Indoor {_ct_s} > comfort_cool {format_temp(cc, _temp_unit, 1)} -- "
+                f"above by {format_temp_delta(ct - cc, _temp_unit, 1)} "
+                f"(deadband: {format_temp_delta(_swing_cool_f, _temp_unit, 1)})"
             )
         else:
-            state_flags.append(f"[OK] Indoor {ct}F is within comfort band [{ch}-{cc}F]")
+            state_flags.append(
+                f"[OK] Indoor {_ct_s} is within comfort band "
+                f"[{format_temp(ch, _temp_unit, 1)}-{format_temp(cc, _temp_unit, 1)}]"
+            )
     except (ValueError, TypeError):
         pass
 
@@ -3616,14 +3697,19 @@ async def build_override_details_context(hass: Any, coordinator: Any, **kwargs: 
 
         lines.append(f"  Setpoint override count: {override_count}")
         if override_details:
+            # Issue #1048: override_details are stored in internal degF; render in the user's unit.
+            _ov_unit = (getattr(coordinator, "config", None) or {}).get("temp_unit", "fahrenheit")
             for i, d in enumerate(override_details, 1):
                 t = d.get("time", "??:??")
-                old_t = d.get("old_temp", "?")
-                new_t = d.get("new_temp", "?")
+                old_t = d.get("old_temp")
+                new_t = d.get("new_temp")
                 direction = d.get("direction", "?")
-                magnitude = d.get("magnitude", "?")
+                magnitude = d.get("magnitude")
                 sign = "+" if direction == "up" else "-"
-                lines.append(f"  #{i}  {t}  {old_t}F -> {new_t}F  ({sign}{magnitude}F, {direction})")
+                old_s = format_temp(old_t, _ov_unit, 1) if isinstance(old_t, (int, float)) else "?"
+                new_s = format_temp(new_t, _ov_unit, 1) if isinstance(new_t, (int, float)) else "?"
+                mag_s = format_temp_delta(magnitude, _ov_unit, 1) if isinstance(magnitude, (int, float)) else "?"
+                lines.append(f"  #{i}  {t}  {old_s} -> {new_s}  ({sign}{mag_s}, {direction})")
         else:
             lines.append("  (no setpoint overrides recorded today)")
 

@@ -14,7 +14,7 @@ dependency-free utility module imported by both ``coordinator.py`` and
 
 from __future__ import annotations
 
-from .const import REMOTE_SPEED_TOKENS, REMOTE_TIMER_EVENT_HOURS
+from .const import REMOTE_SPEED_TOKENS, REMOTE_TIMER_EVENT_HOURS, is_unavailable_state
 
 FAN_STATUS_ACTIVE_VALUES: frozenset[str] = frozenset(
     {
@@ -41,6 +41,32 @@ def is_ca_fan_running(fan_status: str) -> bool:
     in that state to be misreported as a contradiction.
     """
     return fan_status in FAN_STATUS_ACTIVE_VALUES
+
+
+def fan_entity_on(state) -> bool | None:
+    """Whether a fan/switch entity's state reads "on": True / False, or None when unknowable.
+
+    Issue #1050 (#1048 change 21): the single reading of a fan command entity's state, shared
+    by ``ClimateAdvisorCoordinator._get_fan_physical_state()``'s command-entity fallback and
+    ``AutomationEngine``'s command read-back (``_reconcile_fan_physical_drift``).
+
+    None means "cannot tell" and callers must NOT treat it as off:
+      - ``state`` is None (entity missing), or its state is ``unavailable``/``unknown``
+        (previously the fallback read those as off, which could strand or falsely release a
+        session);
+      - the entity reports ``assumed_state`` (an RF/IR/momentary transmitter whose HA state
+        only echoes the last command and carries no feedback).
+    Otherwise ``"on"``/``"true"`` (any case) is True and every other state is False.
+    """
+    if state is None:
+        return None
+    raw = getattr(state, "state", None)
+    if not isinstance(raw, str) or is_unavailable_state(raw):
+        return None
+    attrs = getattr(state, "attributes", None)
+    if isinstance(attrs, dict) and attrs.get("assumed_state"):
+        return None
+    return raw.lower() in ("on", "true")
 
 
 def resolve_untracked_fan_status(*, recent_fan_command: bool, idle_status: str = "inactive") -> str:

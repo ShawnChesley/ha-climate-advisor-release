@@ -59,6 +59,9 @@ LEGITIMATELY_REPEATING_EVENT_TYPES = frozenset(
         "hvac_write_blocked_whf_active",
         "morning_wakeup",
         "occupancy_comfort_restored",
+        # Issue #1050: windowed (_recent_duplicate, 600 s) at the emit site; hours-apart arrivals
+        # held for the same reason legitimately repeat identical payloads.
+        "occupancy_restore_deferred",
         "fan_activated",
         "fan_deactivated",
         "nat_vent_fan_on",
@@ -75,6 +78,11 @@ LEGITIMATELY_REPEATING_EVENT_TYPES = frozenset(
         "hvac_mode_not_applied",
         "hvac_mode_applied_recovered",
         "hvac_command_recovered",
+        # Issue #1048 change 9: a stall that recovers and re-opens (equipment ran briefly, then
+        # the house drifted out of band again) re-emits identical payloads; the 3 h sustain clock
+        # and the once-per-episode announcement gate bound them, not payload novelty.
+        "hvac_output_stall",
+        "hvac_output_stall_recovered",
     }
 )
 

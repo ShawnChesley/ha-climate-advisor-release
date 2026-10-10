@@ -23,7 +23,7 @@
 **Owns (`coordinator.py`):**
 - `_run_entity_health_check()` — the per-cycle entry point, isolated in its own try/except so a bug in the sweep can never abort the update cycle it runs inside
 - `_process_entity_health_transitions()` — the ok/missing/recovered state machine and 24h reminder timer
-- `_notify_entity_health_issues()` — unconditional per-issue logging (ERROR for critical, WARNING otherwise) plus one batched `_notify()` call
+- `_notify_entity_health_issues()` — unconditional per-issue logging (ERROR for critical, WARNING otherwise) plus one batched `_notify_in_background()` call
 
 **Explicitly does NOT own:**
 - A configured entity that is *ignored by design of the current source* (Issue #1032: e.g. `outdoor_temp_entity` saved while `outdoor_temp_source` is `weather_service`). Its notification text ("isn't responding") and push channel would be wrong for a config mismatch, so that case is surfaced instead by the Options flow's `reconcile_temperature_source()` (prevents new saves), a once-per-setup WARNING in `coordinator.py`, and the Settings tab's "selected but not in use" text. `_outdoor_temp_entity_relevant` still gates the registry row on the source being a dedicated sensor.
@@ -66,7 +66,7 @@ A blank/unset config value for any key is never flagged, regardless of tier — 
 |---|---|---|
 | `_run_entity_health_check()` | `_async_update_data_impl()`, called once per ~30-min cycle right alongside `_run_invariant_watchdog()` | Runs the sweep, processes transitions, returns the current issue list for `coordinator.data["entity_health_issues"]` |
 | `_process_entity_health_transitions(issues)` | `_run_entity_health_check()` | Diffs against `self._entity_health_state`, decides what needs notifying this cycle |
-| `_notify_entity_health_issues(issues)` | `_process_entity_health_transitions()` (only when there's something to notify) | Logs every issue unconditionally, then sends one batched `AutomationEngine._notify()` call |
+| `_notify_entity_health_issues(issues)` | `_process_entity_health_transitions()` (only when there's something to notify) | Logs every issue unconditionally, then sends one batched message via `_notify_in_background()` |
 
 `self._entity_health_state: dict[str, dict]` is transient (not persisted) — a restart re-evaluates from scratch, which is desirable since a restart is itself the most common way an entity reappears.
 
@@ -87,8 +87,9 @@ Multiple entities transitioning `ok -> missing` in the same cycle (e.g. a networ
 
 ## User-Visible Surface
 
-- **Notification:** one push/email via `AutomationEngine._notify(message, title, notification_type="entity_health")`, gated by `push_entity_health`/`email_entity_health` config toggles (default `True`, same opt-out pattern as every other event type).
+- **Notification:** one push/email sent in the background through the shared `ClimateAdvisorCoordinator._notify_in_background(title, message, "entity_health")` (Issue #1050; the coordinator-side fire-and-forget owner-alert routine -- its failure handling and the `email=` switch are documented with the stall alert in [08-COMPUTATION-REFERENCE.md](08-COMPUTATION-REFERENCE.md#house-off-target-stall-alert-issue-1050-part-of-1048)), gated by `push_entity_health`/`email_entity_health` config toggles (default `True`, same opt-out pattern as every other event type). The per-entity reminder interval uses the shared pure `temperature.reminder_due(last, now, interval_s)`.
 - **Status card:** `coordinator.data["entity_health_issues"]` (list of `{config_key, entity_id, friendly_name, criticality, status}`) -> `api.py`'s status endpoint -> rendered as additional `.value` lines on the existing Status card in `index.html`'s `loadStatus()`, right below `invariant_violations` — no new card, per the Observability Requirements' "extend existing cards" rule.
+- **Status list neighbor (`hvac_control_issues`):** `coordinator.data["hvac_control_issues"]` (Issue #1049) sits beside this list in the same Status card and now carries three entry kinds -- `mode_not_obeyed`, `command_failing` and (Issue #1050) `output_stall`, the "house off-target with no equipment running" entry. It is a separate list (`{issue, detail}`), not part of `entity_health_issues`; see [rest-api.md](rest-api.md).
 - **Logs:** every issue is logged unconditionally (ERROR for `critical`, WARNING otherwise) regardless of whether the notification itself succeeds — `notify_service` is one of the monitored entities, so a broken notify target must not mean the failure goes unrecorded anywhere.
 
 ## Related Fix: HVAC Command Failure Containment

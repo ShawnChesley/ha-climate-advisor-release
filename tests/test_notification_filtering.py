@@ -288,3 +288,19 @@ class TestOccupancyHomeNotification:
         services = [c[0][1] for c in calls]
         assert "mobile_app" in services
         assert "send_email" not in services
+
+
+class TestNotifyEmailParameter:
+    """Issue #1050: ``_notify(email=False)`` skips the email channel only."""
+
+    def test_email_false_skips_email_but_still_pushes(self):
+        engine = _make_engine()
+        asyncio.run(engine._notify("m", "T", notification_type="door_window_pause", email=False))
+        services = [c[0][1] for c in engine.hass.services.async_call.call_args_list]
+        assert services == ["mobile_app"]
+
+    def test_email_default_true_unchanged(self):
+        engine = _make_engine()
+        asyncio.run(engine._notify("m", "T", notification_type="door_window_pause"))
+        services = [c[0][1] for c in engine.hass.services.async_call.call_args_list]
+        assert services == ["mobile_app", "send_email"]

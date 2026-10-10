@@ -21,7 +21,7 @@
 
 **Owns:**
 - The single conversion boundary between internal °F and user-display units
-- Public functions: `from_fahrenheit()`, `to_fahrenheit()`, `convert_delta()`, `display_temp()`, `display_delta()` (None-safe rounded API-boundary wrappers, Issue #1049), `format_temp_delta()`, `format_temp()`, `unit_key_from_attr()`, `unit_mismatch()`, `ha_system_unit()`
+- Public functions: `from_fahrenheit()`, `to_fahrenheit()`, `convert_delta()`, `display_temp()`, `display_delta()` (None-safe rounded API-boundary wrappers, Issue #1049), `format_temp_delta()`, `format_temp()`, `reminder_due()`, `next_fallback_episode()`, `read_state_temp_f()` / `read_attribute_temp_f()` / `read_sensor_state_f()`, `unit_key_from_attr()`, `unit_mismatch()`, `ha_system_unit()`
 - Two string constants: `FAHRENHEIT = "fahrenheit"`, `CELSIUS = "celsius"`
 - One dict: `UNIT_SYMBOL` mapping unit strings to display symbols
 
@@ -84,15 +84,16 @@ def unit_mismatch(attr: object, configured: str) -> str | None:
 
 | Symbol | Caller(s) | Typical use |
 |---|---|---|
-| `from_fahrenheit` | `coordinator.py` (many sites), `briefing.py`, `api.py` | Display any stored °F temperature |
+| `display_temp` / `display_delta` | `api.py` (status `indoor_temp`/`outdoor_temp`/`ca_target_*`/`nat_vent_*`/`trend_magnitude`, learning `comfort_range_*`/`tomorrow_plan`, config `temp_abs`), `coordinator.py` (`get_chart_data` `_conv`, 2-dp `swing_heat`/`swing_cool`, `trend_magnitude`, `pre_condition_target`, `setback_modifier`, `today_low`/`tomorrow_low`), `sensor.py` (`comfort_range_low/high`, `trend_magnitude`), `ai_skills_context.py`, `ai_skills_investigator.py` | The single None-safe, rounded API-boundary conversion (Issues #1049/#1050). Replaces ~13 hand-rolled `round(from_fahrenheit(x, unit), 1) if x is not None else None` copies. `ndigits` selects 0/1/2 decimals |
+| `from_fahrenheit` | `temperature.py` (wrapped by `display_temp`), `briefing.py`, remaining internal display math | Display any stored °F temperature; new API-boundary code should prefer `display_temp` |
 | `read_sensor_state_f` | `coordinator.py` (`_read_outdoor_sensor`, used by `_get_outdoor_temp()` and the outdoor-sensor listener via `_refresh_outdoor_temp`) | Read a dedicated sensor / input_number entity's *state* as °F (Issue #1032): returns `(value_f, None)` or `(None, reason)`; rejects `unavailable`/`unknown`, non-numeric and non-finite (`nan`/`inf`) states. The state-based sibling of `read_state_temp_f` (attribute-based) |
 | `read_attribute_temp_f` | `indoor_temp.py` (climate `current_temperature` path); `read_state_temp_f` delegates to it | Read a temperature *attribute* off an HA state as °F with the failure reason (Issue #1033): returns `(value_f, None)` or `(None, reason)` with `reason` in `entity_missing` / `no_reading` / `non_numeric` / `non_finite`. Attribute-reading sibling of `read_sensor_state_f` |
 | `is_sensor_stale` | `indoor_temp.py` (indoor `sensor` source and sleep sensor, `INDOOR_SENSOR_STALE_HOURS` = 12 h); `coordinator._read_outdoor_sensor` (`OUTDOOR_SENSOR_STALE_HOURS` = 6 h) | True when no report for more than `stale_hours` (age from `last_reported`, falling back to `last_updated`; fails open to fresh when neither is a real `datetime`) (Issues #1032/#1033) |
 | `next_fallback_episode` | `coordinator._note_outdoor_sensor_state` (outdoor), `coordinator._refresh_indoor_sensor_health` (indoor) | Pure once-per-episode transition `(reason, announced, since, now) -> (kind, announced, since, minutes_down)`, `kind` in `none` / `fallback` / `changed` / `recovered`; the caller owns logging and event emission (Issue #1033) |
 | `to_fahrenheit` | `coordinator.py`, config flow validation | Normalize user-entered Celsius setpoints to internal °F; `_get_hourly_forecast_data()` uses it to normalise the hourly forecast at its source (Issue #1015); `_get_outdoor_temp()` uses it for the sensor path and the `weather_attrs["temperature"]` fallback only |
-| `format_temp` | `coordinator.py`, `briefing.py` | Human-readable temperature strings in briefings and dashboard |
-| `convert_delta` | `coordinator.py` (thermal model display) | Display thermal rates (k_active_heat, swing_f) in correct unit |
-| `format_temp_delta` | `coordinator.py`, `briefing.py` | Human-readable delta strings (e.g., "setback of 5°C") |
+| `format_temp` | `coordinator.py`, `briefing.py`, `automation.py` (engine `_t()`), `learning.py`, `ai_skills_context.py` | Human-readable temperature strings in briefings, Activity Log reasons and the dashboard |
+| `convert_delta` | `coordinator.py` (thermal model display), `temperature.format_temp_delta()` and `display_delta()` (both delegate to it), `sensor.py` | Display thermal rates (k_active_heat, swing_f) in correct unit |
+| `format_temp_delta` | `coordinator.py` (stall alert gap), `automation.py` (engine `_td()`), `learning.py` (override-magnitude and forecast-bias suggestion text), `ai_skills_context.py`, `briefing.py` | Human-readable delta strings (e.g., "setback of 5°C"); built on `convert_delta` |
 
 ### from_fahrenheit and to_fahrenheit
 
@@ -134,6 +135,24 @@ The user's display unit is NOT re-detected from HA's unit system at runtime. It 
 **Constant:** `DEFAULT_TEMP_UNIT = "fahrenheit"` in `const.py` — the read-site fallback and the setup-wizard pre-selection fallback when `ha_system_unit()` cannot read HA's unit system. The coordinator's `_check_unit_sources()` uses the same `ha_system_unit()` helper to read HA's unit system for its mismatch warning.
 
 This means the unit does not automatically follow if the user changes their HA unit system after setup. They must update the Climate Advisor option explicitly. Since 0.7.85 a mismatch is no longer silent: a Home Assistant install on a different unit system than the configured `temp_unit` (for example a metric install left on the default Fahrenheit) logs the `Temperature unit mismatch with Home Assistant` WARNING. That is intended, because such a setup really does misread every thermostat value, and a `Temperature sensor unit mismatch` WARNING usually fires alongside it since Home Assistant temperature sensors report in the system unit.
+
+## Display sites and reason strings (Issue #1050, Part of #1048)
+
+**Occupant outcome:** a Celsius household used to see Fahrenheit-looking numbers in the Activity Log reasons, band text, override records, suggestions and the AI report ("natural vent exit: outdoor 64.0°F > threshold 75.0°F", "up by about 2°F", a Target Temperature of about -6 for a 21 °C setting). Every user-facing temperature is now produced from internal °F by one of the helpers above at its boundary.
+
+| Boundary | How it converts |
+|---|---|
+| REST/status (`api.py`) | `display_temp` / `display_delta` (absolute vs scale-only); config `display_transform` `temp_abs` / `temp_delta` -- see [rest-api.md](rest-api.md#config-display-transforms) |
+| Chart/debug payloads (`coordinator.get_chart_data()` / `get_debug_state()`) | Local `_conv(v)` = `display_temp(v, unit)`; deltas via `display_delta` (`swing_*` at 2 dp, `trend_magnitude`, `pre_condition_target`, `setback_modifier`) |
+| Sensor attributes (`sensor.py`) | `comfort_range_low/high` via `display_temp`; `trend_magnitude` via `display_delta` -- both were raw °F before |
+| Engine reason strings and event text (`automation.py`) | `AutomationEngine._temp_unit` with thin `_t(value_f, decimals=1)` / `_td(delta_f, decimals=1)` wrappers over `format_temp` / `format_temp_delta` and shared phrase builders (e.g. `_outdoor_ge_indoor`); band text via `display_temp(..., 0)`. Always pass `decimals=1` for thresholds so reasons keep their pre-#1050 precision |
+| Override records | Producers store `old_setpoint_f` / `new_setpoint_f` as real °F floats (`read_attribute_temp_f` / `read_state_temp_f`, 2 dp) -- never display-unit numbers under an `_f` name; `learning.py` (`LearningEngine(storage_path, entry_id, temp_unit)`) and `ai_skills_context.py` format them with `format_temp` / `format_temp_delta` |
+| Suggestions and AI text | `LearningEngine._temp_unit` words suggestion text ("up by about 1°C"); `ai_skills_context.py` / `ai_skills_investigator.py` use `format_temp`, `format_temp_delta`, `display_temp`, and read attributes through `read_attribute_temp_f` (no hand-converted x5/9) |
+| Dashboard JS (`index.html`) | One `unitSymbol(unit)` helper; settings entries append their own `unit` |
+
+**Logger lines stay °F.** `_LOGGER` messages (and the structured event payload fields named `*_f`) keep the internal Fahrenheit value so logs are comparable across installs; only strings shown to the occupant (Activity Log reason/settings text, push notifications, Status text, AI context) follow `temp_unit`.
+
+**Protected reason substrings.** Several consumers match fragments of reason strings, so the unit migration must not alter them: `airflow reversed`, `cooled to floor`, `free cooling gone`, `manual override to`, `{trigger} reconcile — fan already running` (`tools/sim_harness/outcomes.py`), the prefixes `economizer cool-down` / `maintain` / `off`, and `sleep band [`, `comfort band [`, `> threshold`. Only the numeric/unit portion inside them changes. Fahrenheit homes are otherwise unchanged except one missing `°` added and some AI-text spacing. Tests: `tests/test_automation_unit_display.py`, `tests/test_override_record_units.py`, `tests/test_phase2_display_units.py`.
 
 ## Provider unit must equal the configured unit (Issue #1015)
 

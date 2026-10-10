@@ -54,7 +54,7 @@ from .const import (
     VERSION,
 )
 from .coordinator import ClimateAdvisorCoordinator
-from .temperature import FAHRENHEIT, convert_delta
+from .temperature import FAHRENHEIT, convert_delta, display_delta, display_temp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -165,9 +165,11 @@ class ClimateAdvisorDayTypeSensor(ClimateAdvisorBaseSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Include trend info as attributes."""
         data = self.coordinator.data or {}
+        unit = self.coordinator.config.get("temp_unit", FAHRENHEIT)
         return {
             "trend_direction": data.get(ATTR_TREND, "unknown"),
-            "trend_magnitude": data.get(ATTR_TREND_MAGNITUDE, 0),
+            # Issue #1048: internal degF delta -> the user's unit (scale only).
+            "trend_magnitude": display_delta(data.get(ATTR_TREND_MAGNITUDE, 0), unit),
         }
 
 
@@ -269,13 +271,14 @@ class ClimateAdvisorComplianceSensor(ClimateAdvisorBaseSensor):
         data = self.coordinator.data or {}
         suggestions = data.get(ATTR_LEARNING_SUGGESTIONS, [])
         today = self.coordinator.today_record
+        unit = self.coordinator.config.get("temp_unit", FAHRENHEIT)
         attrs: dict[str, Any] = {
             "pending_suggestions": len(suggestions),
             "comfort_violations_minutes_today": today.comfort_violations_minutes if today else 0.0,
-            "comfort_range_low": self.coordinator.config.get("comfort_heat", 70),
-            "comfort_range_high": self.coordinator.config.get("comfort_cool", 75),
+            # Issue #1048: config comfort settings are internal degF; show them in the user's unit.
+            "comfort_range_low": display_temp(self.coordinator.config.get("comfort_heat", 70), unit),
+            "comfort_range_high": display_temp(self.coordinator.config.get("comfort_cool", 75), unit),
         }
-        unit = self.coordinator.config.get("temp_unit", FAHRENHEIT)
         thermal = self.coordinator.learning.get_thermal_model(learning_health=self.coordinator._build_learning_health())
         heat_rate_f = thermal.get("heating_rate_f_per_hour")
         cool_rate_f = thermal.get("cooling_rate_f_per_hour")

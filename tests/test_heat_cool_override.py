@@ -942,3 +942,46 @@ class TestFixHFanDetectionLogging:
             f"When _fan_command_time is None, the log must say 'None'. Got: {log_str}. "
             "Fix H: handle None fan_command_time in the diagnostic log."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Issue #1048 — heat_cool override magnitude uses whichever setpoint actually changed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHeatCoolOverrideMagnitude:
+    """A low-only change used to be recorded as magnitude 0 / 'down' because the unchanged
+    high setpoint stood in for it. The record now carries the setpoint that moved (the larger
+    move when both did), in internal degrees F to 2 dp."""
+
+    def _run(self, **event_kwargs):
+        coord = _make_coordinator_stub(hvac_command_age_seconds=None)
+        event = _make_event(**event_kwargs)
+        mock_dt = MagicMock()
+        mock_dt.now.return_value = _NOW_BASE
+        with patch(_PATCH_CALLBACK, side_effect=lambda fn: fn), patch(_PATCH_DT_UTIL, mock_dt):
+            asyncio.run(coord._async_thermostat_changed(event))
+        return coord
+
+    def test_low_only_change_is_recorded_with_its_own_magnitude(self):
+        coord = self._run(old_target_high=76.0, new_target_high=76.0, old_target_low=68.0, new_target_low=71.0)
+        detail = coord._today_record.override_details[-1]
+        assert detail["old_temp"] == 68.0 and detail["new_temp"] == 71.0
+        assert detail["magnitude"] == 3.0 and detail["direction"] == "up"
+
+    def test_low_only_decrease_is_down(self):
+        coord = self._run(old_target_high=76.0, new_target_high=76.0, old_target_low=68.0, new_target_low=65.5)
+        detail = coord._today_record.override_details[-1]
+        assert detail["magnitude"] == 2.5 and detail["direction"] == "down"
+
+    def test_high_only_change_unchanged_behaviour(self):
+        coord = self._run(old_target_high=76.0, new_target_high=78.0, old_target_low=68.0, new_target_low=68.0)
+        detail = coord._today_record.override_details[-1]
+        assert detail["old_temp"] == 76.0 and detail["new_temp"] == 78.0
+        assert detail["magnitude"] == 2.0 and detail["direction"] == "up"
+
+    def test_both_changed_uses_the_larger_magnitude_with_its_sign(self):
+        coord = self._run(old_target_high=76.0, new_target_high=77.0, old_target_low=68.0, new_target_low=64.0)
+        detail = coord._today_record.override_details[-1]
+        assert detail["magnitude"] == 4.0 and detail["direction"] == "down"
+        assert detail["old_temp"] == 68.0 and detail["new_temp"] == 64.0

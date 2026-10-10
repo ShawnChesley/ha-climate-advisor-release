@@ -69,6 +69,7 @@ Suggestions are generated when `generate_suggestions()` is called (typically dur
 **Suggestion:** "Would you like Climate Advisor to analyze the override patterns and suggest new setpoints?"
 **If accepted:** System flags for setpoint analysis (future: actually analyze the override direction and magnitude to suggest specific new setpoints).
 **Trade-off:** May result in slightly different comfort baseline.
+**Unit handling (Issue #1050):** the suggestion's detail line ("mostly up by about 1°C ...") is worded in the user's unit. `LearningEngine.__init__(storage_path, entry_id="", temp_unit="fahrenheit")` receives the configured `temp_unit` from the coordinator and formats the average override magnitude with `format_temp_delta()`; stored override records are always internal °F (`old_setpoint_f` / `new_setpoint_f` are real °F floats, so a 21 -> 22 °C change is stored as 69.8 -> 71.6 and reads back as "+1°C"). History written before this fix with mixed-unit records is not migrated; the 14-day window ages it out.
 
 ### Pattern: High Runtime on Mild/Warm Days
 
@@ -570,7 +571,7 @@ Analyzes historical records where both forecast and observed temperatures are pr
 | Suggestion Key | Detection | Suggestion Text |
 |---|---|---|
 | `thermal_model_ready` | `get_thermal_model()` confidence transitions from `"none"` to `"low"` or better for both heat and cool | "Your home's thermal profile is ready. Bedtime setback depth and pre-heat timing are now tuned to your home's actual heating performance." |
-| `forecast_bias_significant` | `get_weather_bias()` high or low bias magnitude exceeds 3°F at `"medium"` or higher confidence | "Your weather service appears to run [warm/cool] by about X°F on average. Climate Advisor has adjusted its timing calculations to compensate." |
+| `forecast_bias_significant` | `get_weather_bias()` high or low bias magnitude exceeds 3°F at `"medium"` or higher confidence (threshold is internal °F) | "Your weather service appears to run [warm/cool] by about X on average. Climate Advisor has adjusted its timing calculations to compensate." -- X is `format_temp_delta(magnitude, temp_unit, 1)`, so a Celsius home sees °C (Issue #1050) |
 
 ### Sensor Attributes (Compliance Sensor)
 
