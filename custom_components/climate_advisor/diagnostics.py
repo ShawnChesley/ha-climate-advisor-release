@@ -15,6 +15,7 @@ don't deprecate it" decision for the legacy service.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -23,12 +24,21 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import CONFIG_METADATA, DOMAIN, VERSION
+from .diagnostic_snapshot import build_diagnostic_snapshot, recent_hvac_events
+
+_LOGGER = logging.getLogger(__name__)
 
 # Redact "notify_service" (may reveal personal info, per the existing
 # api.py:542 convention) plus every CONFIG_METADATA key flagged
 # ``"sensitive": True`` (currently just "ai_api_key") — reusing the same flag
 # api.py already uses for the config API's sanitization, not a second
 # redaction list.
+#
+# Thermostat attributes (serial/MAC/IP/location/owner name) are NOT handled by this
+# exact-key set: their key names are third-party-defined, so `diagnostic_snapshot.py`
+# redacts them inside `build_diagnostic_snapshot()` (Issue #1049) for every consumer at
+# once. `async_redact_data(payload, TO_REDACT)` below remains the second layer for
+# config secrets.
 TO_REDACT = {"notify_service"} | {key for key, meta in CONFIG_METADATA.items() if meta.get("sensitive")}
 
 
@@ -86,9 +96,23 @@ async def async_get_diagnostics_payload(hass: HomeAssistant, entry: ConfigEntry)
     }
 
     if coordinator is not None:
+        # Issue #1049: what the thermostat supports (hvac_modes, features, min/max/step,
+        # current attributes), what Climate Advisor last asked it to do, and what happened,
+        # so a reporter does not have to be asked to paste thermostat details and logs.
+        # Attribute redaction happens inside the builder; a failure here must not lose the
+        # rest of the diagnostics file.
+        try:
+            thermostat_snapshot: Any = build_diagnostic_snapshot(hass, coordinator)
+            hvac_events: Any = recent_hvac_events(coordinator)
+        except Exception:
+            _LOGGER.warning("diagnostics: thermostat snapshot failed -- omitting from payload", exc_info=True)
+            thermostat_snapshot = None
+            hvac_events = None
         payload.update(
             {
                 "debug_state": coordinator.get_debug_state(),
+                "thermostat_snapshot": thermostat_snapshot,
+                "recent_hvac_events": hvac_events,
                 "chart_data_summary": _chart_data_summary(coordinator),
                 "learning_summary": coordinator.learning.get_compliance_summary(),
                 "config": dict(coordinator.config),
