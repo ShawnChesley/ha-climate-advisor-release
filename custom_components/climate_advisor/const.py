@@ -1,5 +1,7 @@
 """Constants for Climate Advisor."""
 
+from typing import Any
+
 DOMAIN = "climate_advisor"
 
 # Integration version — MUST match manifest.json "version" field.
@@ -184,6 +186,25 @@ WARM_WINDOW_CLOSE_HOUR = 10  # 10:00 AM
 # MILD-day window timing — open mid-morning, close late afternoon (Issue #147)
 MILD_WINDOW_OPEN_HOUR = 10  # 10:00 AM fallback (was hardcoded in classifier.py)
 MILD_WINDOW_CLOSE_HOUR = 17  # 5:00 PM fallback
+
+# Entity states meaning "the integration/device is not reporting" (Issue #1049).
+# A transition OUT of one of these is the device reconnecting, never an occupant action.
+UNAVAILABLE_STATES = frozenset({"unavailable", "unknown"})
+
+
+def is_unavailable_state(value: str | None) -> bool:
+    """Return True when ``value`` is an HA "not reporting" state (False for None)."""
+    return value is not None and value in UNAVAILABLE_STATES
+
+
+def is_availability_recovery(old_state: Any) -> bool:
+    """Return True when ``old_state`` (an HA State or None) was unavailable/unknown.
+
+    A thermostat waking from ``unavailable`` often reports Off or stale attributes;
+    that is a reconnect, not an occupant override (Issue #1049).
+    """
+    return old_state is not None and is_unavailable_state(getattr(old_state, "state", None))
+
 
 # Occupancy toggle configuration
 CONF_HOME_TOGGLE = "home_toggle_entity"

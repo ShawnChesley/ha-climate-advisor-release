@@ -241,6 +241,7 @@ from .const import (
     THRESHOLD_WARM,
     VACATION_SETBACK_EXTRA,
     VERSION,
+    is_availability_recovery,
 )
 from .entity_health import run_entity_health_sweep
 from .fan_mode_resolver import is_thermostat_fan_physically_active
@@ -5685,7 +5686,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # and treating it as a blip would risk silently skipping debounce on a genuine
             # first-ever open in some other, more exotic startup ordering.
             old_state = event.data.get("old_state")
-            if old_state is not None and old_state.state in ("unavailable", "unknown"):
+            if is_availability_recovery(old_state):
                 if new_state.last_changed is not None:
                     self._sensor_reconnect_blip_last_changed[entity_id] = new_state.last_changed
                 _LOGGER.info(
@@ -5905,6 +5906,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             and new_state.state == _last_cmd_mode
             and (dt_util.now() - _last_cmd_time).total_seconds() < 120
         )
+        # Issue #1049: the thermostat waking from unavailable/unknown (often reporting Off or
+        # stale attributes) is a reconnect, never an occupant action. Computed once; gates all
+        # four override-detection sites below. No early return — other bookkeeping must run.
+        _is_availability_recovery = is_availability_recovery(old_state)
 
         # Detect manual HVAC override during a door/window pause.
         # Note: we intentionally do NOT require old_state == "off" here.
@@ -5918,6 +5923,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self.automation_engine.is_paused_by_door
             and old_state.state != new_state.state
             and new_state.state not in ("off", "unavailable", "unknown")
+            and not _is_availability_recovery
         ):
             _any_command_pending = (
                 self.automation_engine._hvac_command_pending
@@ -5960,6 +5966,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # branch fires first and handles the re-override case.
             old_state.state != new_state.state
             and new_state.state not in ("unavailable", "unknown")
+            and not _is_availability_recovery
             and self.automation_engine._manual_override_active
             and new_state.state != self.automation_engine._manual_override_mode
             and not self.automation_engine._hvac_command_pending
@@ -6008,6 +6015,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         elif (
             old_state.state != new_state.state
             and new_state.state not in ("unavailable", "unknown")
+            and not _is_availability_recovery
             and not self.automation_engine._manual_override_active
             and not self.automation_engine._hvac_command_pending
             and not self.automation_engine._fan_command_pending
@@ -6397,6 +6405,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         if (
             _setpoint_changed
+            # Issue #1049: a reconnecting thermostat has no prior setpoint (old_temp is None) —
+            # that is a reading appearing, not an occupant changing it.
+            and not _is_availability_recovery
+            and old_temp is not None
             and self._today_record
             and not self.automation_engine._temp_command_pending
             and not self.automation_engine._hvac_command_pending
