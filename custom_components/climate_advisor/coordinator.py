@@ -243,6 +243,7 @@ from .const import (
     VACATION_SETBACK_EXTRA,
     VERSION,
     is_availability_recovery,
+    is_unavailable_state,
 )
 from .entity_health import run_entity_health_sweep
 from .fan_mode_resolver import is_thermostat_fan_physically_active
@@ -280,14 +281,16 @@ from .scheduler import (
 from .state import StatePersistence
 from .temperature import (
     convert_delta,
+    display_delta,
+    display_temp,
     find_temperature_crossing,
     format_temp,
     free_cooling_direction_ok,
-    from_fahrenheit,
     ha_system_unit,
     is_sensor_stale,
     next_fallback_episode,
     read_sensor_state_f,
+    reminder_due,
     to_fahrenheit,
     unit_key_from_attr,
     unit_mismatch,
@@ -2192,7 +2195,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
     def _is_toggle_on(self, entity_id: str, invert: bool) -> bool:
         """Check if a toggle entity is effectively ON, respecting invert."""
         state = self.hass.states.get(entity_id)
-        if not state or state.state in ("unavailable", "unknown"):
+        if not state or is_unavailable_state(state.state):
             if state:
                 _LOGGER.warning(
                     "Occupancy toggle %s is %s — treating as OFF",
@@ -4206,7 +4209,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             return
         climate_id = self.config.get("climate_entity", "")
         state = self.hass.states.get(climate_id) if climate_id else None
-        if state is None or state.state in ("unavailable", "unknown"):
+        if state is None or is_unavailable_state(state.state):
             return
         self._climate_unit_checked = True
         raw = state.attributes.get("temperature_unit")
@@ -4262,7 +4265,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if not entity_id:
                 continue
             state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown"):
+            if state is None or is_unavailable_state(state.state):
                 continue
             checked.add(role)
             sensor_unit = unit_mismatch(state.attributes.get("unit_of_measurement"), configured)
@@ -4288,7 +4291,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             return None
 
         # Entity exists but isn't reporting data yet (common after restart)
-        if weather_state.state in ("unavailable", "unknown"):
+        if is_unavailable_state(weather_state.state):
             _LOGGER.debug(
                 "Weather entity %s is %s — treating as not ready",
                 weather_entity,
@@ -5976,7 +5979,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # The existing elif below guards with `not _manual_override_active`, so this
             # branch fires first and handles the re-override case.
             old_state.state != new_state.state
-            and new_state.state not in ("unavailable", "unknown")
+            and not is_unavailable_state(new_state.state)
             and not _is_availability_recovery
             and self.automation_engine._manual_override_active
             and new_state.state != self.automation_engine._manual_override_mode
@@ -6025,7 +6028,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             self._feed_override_grace_fsm_on_detect("handle_manual_override")
         elif (
             old_state.state != new_state.state
-            and new_state.state not in ("unavailable", "unknown")
+            and not is_unavailable_state(new_state.state)
             and not _is_availability_recovery
             and not self.automation_engine._manual_override_active
             and not self.automation_engine._hvac_command_pending
@@ -6817,7 +6820,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         decision, not two.
         """
         new_state = event.data.get("new_state")
-        if not new_state or new_state.state in ("unknown", "unavailable"):
+        if not new_state or is_unavailable_state(new_state.state):
             return
 
         # Issue #495: dedup on the event's own timestamp (the entity's `state` field IS the
@@ -7030,7 +7033,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
-        if state is None or state.state in ("unknown", "unavailable"):
+        if state is None or is_unavailable_state(state.state):
             return None
         return state.state
 
@@ -7065,7 +7068,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             if not remote_entity_id:
                 return None
             state = self.hass.states.get(remote_entity_id)
-            if state is None or state.state in ("unknown", "unavailable"):
+            if state is None or is_unavailable_state(state.state):
                 _LOGGER.debug(
                     "RF timer provenance: fan_remote_entity %s unavailable at startup — nothing to resume",
                     remote_entity_id,
@@ -7244,7 +7247,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         fan_state_entity_id = self.config.get(CONF_FAN_STATE_ENTITY)
         if fan_state_entity_id:
             state = self.hass.states.get(fan_state_entity_id)
-            if state is not None and state.state not in ("unavailable", "unknown"):
+            if state is not None and not is_unavailable_state(state.state):
                 self._fan_state_entity_unavailable_warned = False  # reset on success
                 return state.state.lower() in ("on", "true")
             # Unavailable or missing — warn once then fall back
@@ -7284,15 +7287,38 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             ):
                 continue
             self._emit_event("invariant_violation", {"invariant": violation.name, "detail": violation.detail})
-            self.hass.async_create_task(
-                self.automation_engine._notify(
-                    f"{violation.detail} Climate Advisor is stepping in to prevent this, but"
-                    " flagging it because it should never happen.",
-                    "Climate Advisor — invariant violated",
-                    notification_type="invariant_violation",
-                )
+            self._notify_in_background(
+                "Climate Advisor — invariant violated",
+                f"{violation.detail} Climate Advisor is stepping in to prevent this, but"
+                " flagging it because it should never happen.",
+                "invariant_violation",
             )
         return violations
+
+    def _notify_in_background(self, title: str, message: str, notification_type: str, *, email: bool = True) -> None:
+        """Fire-and-forget owner notification (Issue #1050, change 26).
+
+        The one place the coordinator sends an alert without awaiting it: a task, so a notify
+        failure can never abort the update cycle that detected the problem (logged as a WARNING
+        instead). ``email=False`` skips the email channel for this alert (push still follows
+        its per-event preference). No-op before the automation engine exists.
+        """
+        engine = self.automation_engine
+        if engine is None:
+            return
+
+        async def _send() -> None:
+            try:
+                if email:
+                    await engine._notify(message, title, notification_type=notification_type)
+                else:
+                    await engine._notify(message, title, notification_type=notification_type, email=False)
+            except Exception:
+                _LOGGER.warning(
+                    "Background notification failed: type=%s title=%s", notification_type, title, exc_info=True
+                )
+
+        self.hass.async_create_task(_send())
 
     def _run_entity_health_check(self) -> list:
         """Detect missing/unavailable configured entities and notify on new outages (Issue #805).
@@ -7333,7 +7359,13 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         for issue in issues:
             current_keys.add(issue.config_key)
             tracked = self._entity_health_state.get(issue.config_key)
-            if tracked is None:
+            step = next_fallback_episode(
+                issue.status,
+                tracked["status"] if tracked else None,
+                tracked["first_seen"] if tracked else None,
+                now,
+            )
+            if step.kind == "fallback":
                 # ok -> missing/unavailable transition — a brand new outage.
                 self._entity_health_state[issue.config_key] = {
                     "status": issue.status,
@@ -7342,8 +7374,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 }
                 to_notify.append(issue)
             else:
+                # "none"/"changed" (missing <-> unavailable): same outage, only the reminder rule applies.
                 tracked["status"] = issue.status
-                if (now - tracked["last_notified"]).total_seconds() >= _ENTITY_HEALTH_REMINDER_SECONDS:
+                if reminder_due(tracked["last_notified"], now, _ENTITY_HEALTH_REMINDER_SECONDS):
                     tracked["last_notified"] = now
                     to_notify.append(issue)
 
@@ -7382,14 +7415,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 "Devices & Services."
             )
 
-        if self.automation_engine is not None:
-            self.hass.async_create_task(
-                self.automation_engine._notify(
-                    message,
-                    "Climate Advisor — entity not found",
-                    notification_type="entity_health",
-                )
-            )
+        self._notify_in_background("Climate Advisor — entity not found", message, "entity_health")
 
     def _should_run_untracked_fan_backstop(self, is_untracked: bool) -> bool:
         """Whether the periodic ``backstop_30min`` untracked-fan reconcile should fire now.
@@ -10990,7 +11016,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 actual_outdoor.append({"time": _ts, "temp": _outdoor})
 
         def _conv(v: float | None) -> float | None:
-            return round(from_fahrenheit(v, unit), 1) if v is not None else None
+            return display_temp(v, unit)
 
         actual_outdoor = [{"time": p["time"], "temp": _conv(p["temp"])} for p in actual_outdoor]
         actual_indoor = [{"time": p["time"], "temp": _conv(p["temp"])} for p in actual_indoor]
@@ -11181,8 +11207,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 "observation_count_vent_window": thermal_model.get("observation_count_vent_window", 0),
                 "observation_count_vent_fan": thermal_model.get("observation_count_vent_fan", 0),
                 "observation_count_solar": thermal_model.get("observation_count_solar", 0),
-                "swing_heat": round(convert_delta(thermal_model.get("swing_heat_f_display", 1.5), unit), 2),
-                "swing_cool": round(convert_delta(thermal_model.get("swing_cool_f_display", 1.5), unit), 2),
+                "swing_heat": display_delta(thermal_model.get("swing_heat_f_display", 1.5), unit, 2),
+                "swing_cool": display_delta(thermal_model.get("swing_cool_f_display", 1.5), unit, 2),
                 "swing_heat_measured": thermal_model.get("swing_heat_f") is not None,
                 "swing_cool_measured": thermal_model.get("swing_cool_f") is not None,
                 "observation_count_swing_heat": thermal_model.get("observation_count_swing_heat", 0),
@@ -11336,7 +11362,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             "classification": {
                 "day_type": c.day_type if c else None,
                 "trend_direction": c.trend_direction if c else None,
-                "trend_magnitude": round(convert_delta(c.trend_magnitude, unit), 1) if c else None,
+                "trend_magnitude": display_delta(c.trend_magnitude, unit) if c else None,
                 "hvac_mode": c.hvac_mode if c else None,
                 "windows_recommended": c.windows_recommended if c else None,
                 "window_open_time": (c.window_open_time.isoformat() if c and c.window_open_time else None),
@@ -11356,16 +11382,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     c.window_opportunity_evening_end.isoformat() if c and c.window_opportunity_evening_end else None
                 ),
                 "pre_condition": c.pre_condition if c else None,
-                "pre_condition_target": (
-                    round(from_fahrenheit(c.pre_condition_target, unit), 1)
-                    if c and c.pre_condition_target is not None
-                    else None
-                ),
-                "setback_modifier": round(convert_delta(c.setback_modifier or 0, unit), 1) if c else None,
-                "today_low": (round(from_fahrenheit(c.today_low, unit), 1) if c and c.today_low is not None else None),
-                "tomorrow_low": (
-                    round(from_fahrenheit(c.tomorrow_low, unit), 1) if c and c.tomorrow_low is not None else None
-                ),
+                "pre_condition_target": display_temp(c.pre_condition_target, unit) if c else None,
+                "setback_modifier": display_delta(c.setback_modifier or 0, unit) if c else None,
+                "today_low": (display_temp(c.today_low, unit) if c else None),
+                "tomorrow_low": (display_temp(c.tomorrow_low, unit) if c else None),
             },
             "last_action_time": ae._last_action_time,
             "last_action_reason": ae._last_action_reason,

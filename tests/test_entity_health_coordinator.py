@@ -73,6 +73,7 @@ def _make_coordinator(config: dict, states: dict[str, str | None] | None = None,
         ClimateAdvisorCoordinator._process_entity_health_transitions, coord
     )
     coord._notify_entity_health_issues = types.MethodType(ClimateAdvisorCoordinator._notify_entity_health_issues, coord)
+    coord._notify_in_background = types.MethodType(ClimateAdvisorCoordinator._notify_in_background, coord)
     return coord
 
 

@@ -44,9 +44,10 @@ from .const import (
     FAN_MODE_WHOLE_HOUSE,
     TEMP_SOURCE_INPUT_NUMBER,
     TEMP_SOURCE_SENSOR,
+    UNAVAILABLE_STATES,
 )
 
-_UNAVAILABLE_STATES = ("unavailable", "unknown")
+_UNAVAILABLE_STATES = UNAVAILABLE_STATES  # back-compat alias; rule lives in const.py
 
 # The one list-valued config key. Swept separately from the scalar registry
 # below since each list member gets its own independent health check.

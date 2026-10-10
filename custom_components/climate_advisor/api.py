@@ -70,7 +70,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
     VERSION,
 )
-from .temperature import convert_delta, display_temp, from_fahrenheit
+from .temperature import display_delta, display_temp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -255,8 +255,8 @@ class ClimateAdvisorStatusView(HomeAssistantView):
             indoor_temp = coordinator._get_indoor_temp()
             outdoor_temp = coordinator._last_outdoor_temp
             unit = coordinator.config.get("temp_unit", "fahrenheit")
-            indoor_temp_display = round(from_fahrenheit(indoor_temp, unit), 1) if indoor_temp is not None else None
-            outdoor_temp_display = round(from_fahrenheit(outdoor_temp, unit), 1) if outdoor_temp is not None else None
+            indoor_temp_display = display_temp(indoor_temp, unit)
+            outdoor_temp_display = display_temp(outdoor_temp, unit)
             # Deliberately NOT read from coordinator.data (only refreshed once per ~30-min
             # update cycle) — same staleness class as the ca_target_heat/cool fields below,
             # and the same fix: read the live classification instead of the cached snapshot.
@@ -266,7 +266,7 @@ class ClimateAdvisorStatusView(HomeAssistantView):
             # classification has run yet (e.g. right after restart), matching the fallback
             # pattern already used for _ca_target_heat/_ca_target_cool just below.
             trend_direction_display = data.get(ATTR_TREND, "unknown")
-            trend_magnitude_display = round(convert_delta(data.get(ATTR_TREND_MAGNITUDE, 0), unit), 1)
+            trend_magnitude_display = display_delta(data.get(ATTR_TREND_MAGNITUDE, 0), unit)
 
             # Issue #402: ca_target_heat/cool must reflect the sleep band during the sleep
             # window, not always the flat daytime comfort_heat/comfort_cool — otherwise the
@@ -313,7 +313,7 @@ class ClimateAdvisorStatusView(HomeAssistantView):
 
             if classification is not None:
                 trend_direction_display = classification.trend_direction
-                trend_magnitude_display = round(convert_delta(classification.trend_magnitude, unit), 1)
+                trend_magnitude_display = display_delta(classification.trend_magnitude, unit)
 
             # Issue #402 follow-up: surface the WHF fan's actual on/off cycling band so the
             # Natural Vent status card can show it instead of a single static midpoint number
@@ -330,21 +330,9 @@ class ClimateAdvisorStatusView(HomeAssistantView):
             # (same as _ca_target_heat/_ca_target_cool above) — convert to display units here,
             # matching the indoor_temp_display/outdoor_temp_display pattern, since the frontend
             # renders these directly with the configured unit symbol appended.
-            _nat_vent_target_display = (
-                round(from_fahrenheit(_nat_vent_band["nat_vent_target"], unit), 1)
-                if _nat_vent_band["nat_vent_target"] is not None
-                else None
-            )
-            _nat_vent_on_threshold_display = (
-                round(from_fahrenheit(_nat_vent_band["nat_vent_on_threshold"], unit), 1)
-                if _nat_vent_band["nat_vent_on_threshold"] is not None
-                else None
-            )
-            _nat_vent_off_threshold_display = (
-                round(from_fahrenheit(_nat_vent_band["nat_vent_off_threshold"], unit), 1)
-                if _nat_vent_band["nat_vent_off_threshold"] is not None
-                else None
-            )
+            _nat_vent_target_display = display_temp(_nat_vent_band["nat_vent_target"], unit)
+            _nat_vent_on_threshold_display = display_temp(_nat_vent_band["nat_vent_on_threshold"], unit)
+            _nat_vent_off_threshold_display = display_temp(_nat_vent_band["nat_vent_off_threshold"], unit)
             _nat_vent_active = bool(ae._natural_vent_active)
             _nat_vent_ac_assist = (
                 _nat_vent_active
@@ -429,12 +417,8 @@ class ClimateAdvisorStatusView(HomeAssistantView):
                 "paused_by_door": ae.is_paused_by_door,
                 "pause_suppressed_classification": _pause_suppressed_classification,
                 "pause_suppressed_classification_text": _pause_suppressed_classification_text,
-                "ca_target_heat": round(from_fahrenheit(_ca_target_heat, unit), 1)
-                if _ca_target_heat is not None
-                else None,
-                "ca_target_cool": round(from_fahrenheit(_ca_target_cool, unit), 1)
-                if _ca_target_cool is not None
-                else None,
+                "ca_target_heat": display_temp(_ca_target_heat, unit),
+                "ca_target_cool": display_temp(_ca_target_cool, unit),
                 "nat_vent_active": _nat_vent_active,
                 "nat_vent_ac_assist": _nat_vent_ac_assist,
                 "nat_vent_target": _nat_vent_target_display,
@@ -612,8 +596,8 @@ class ClimateAdvisorLearningView(HomeAssistantView):
                     "tomorrow_plan": tomorrow_plan,
                     "suggestions": suggestions,
                     "compliance": coordinator.learning.get_compliance_summary(),
-                    "comfort_range_low": round(from_fahrenheit(coordinator.config.get("comfort_heat", 70), unit), 1),
-                    "comfort_range_high": round(from_fahrenheit(coordinator.config.get("comfort_cool", 75), unit), 1),
+                    "comfort_range_low": display_temp(coordinator.config.get("comfort_heat", 70), unit),
+                    "comfort_range_high": display_temp(coordinator.config.get("comfort_cool", 75), unit),
                     "unit": unit,
                 }
             )

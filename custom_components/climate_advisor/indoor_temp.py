@@ -53,7 +53,7 @@ from typing import Any, NamedTuple
 
 from homeassistant.util import dt as dt_util
 
-from .const import INDOOR_SENSOR_STALE_HOURS, TEMP_SOURCE_INPUT_NUMBER, TEMP_SOURCE_SENSOR
+from .const import INDOOR_SENSOR_STALE_HOURS, TEMP_SOURCE_INPUT_NUMBER, TEMP_SOURCE_SENSOR, is_unavailable_state
 from .temperature import is_sensor_stale, read_attribute_temp_f, read_sensor_state_f
 
 _LOGGER = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ def _resolve_primary_indoor_temp_f(
     if reason is not None:
         # Only a FAILED attribute read is relabelled: a thermostat can report state "unknown"
         # (no HVAC mode) yet still publish a valid current_temperature, which must keep working.
-        if reason == "no_reading" and getattr(climate_state, "state", None) in ("unavailable", "unknown"):
+        if reason == "no_reading" and is_unavailable_state(getattr(climate_state, "state", None)):
             reason = "unavailable"
         _LOGGER.debug("Indoor temp from climate entity %s unusable: reason=%s", climate_entity, reason)
         return None, None, reason
