@@ -20,7 +20,7 @@
 
 **Owns:**
 - The single conversion boundary between internal °F and user-display units
-- Public functions: `from_fahrenheit()`, `to_fahrenheit()`, `convert_delta()`, `format_temp_delta()`, `format_temp()`, `unit_key_from_attr()`, `unit_mismatch()`, `ha_system_unit()`
+- Public functions: `from_fahrenheit()`, `to_fahrenheit()`, `convert_delta()`, `display_temp()`, `display_delta()` (None-safe rounded API-boundary wrappers, Issue #1049), `format_temp_delta()`, `format_temp()`, `unit_key_from_attr()`, `unit_mismatch()`, `ha_system_unit()`
 - Two string constants: `FAHRENHEIT = "fahrenheit"`, `CELSIUS = "celsius"`
 - One dict: `UNIT_SYMBOL` mapping unit strings to display symbols
 

@@ -70,7 +70,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
     VERSION,
 )
-from .temperature import convert_delta, from_fahrenheit
+from .temperature import convert_delta, display_temp, from_fahrenheit
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -595,11 +595,21 @@ class ClimateAdvisorLearningView(HomeAssistantView):
 
             unit = coordinator.config.get("temp_unit", "fahrenheit")
 
+            # Issue #1049: coordinator.tomorrow_plan is internal °F; convert a COPY at this
+            # display boundary (the frontend appends the unit symbol and does no conversion).
+            tomorrow_plan = coordinator.tomorrow_plan
+            if tomorrow_plan is not None:
+                tomorrow_plan = {
+                    **tomorrow_plan,
+                    "expected_high": display_temp(tomorrow_plan.get("expected_high"), unit),
+                    "expected_low": display_temp(tomorrow_plan.get("expected_low"), unit),
+                }
+
             return self.json(
                 {
                     "today_record": today_record,
                     "yesterday_record": coordinator.yesterday_record,
-                    "tomorrow_plan": coordinator.tomorrow_plan,
+                    "tomorrow_plan": tomorrow_plan,
                     "suggestions": suggestions,
                     "compliance": coordinator.learning.get_compliance_summary(),
                     "comfort_range_low": round(from_fahrenheit(coordinator.config.get("comfort_heat", 70), unit), 1),

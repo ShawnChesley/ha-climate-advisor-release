@@ -275,36 +275,65 @@ def _entity_selector_for_source(source: str) -> selector.EntitySelector:
     return selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", device_class="temperature"))
 
 
+_DISPLAY_DEFAULT_EPSILON = 0.05
+"""Max distance outside a slider bound that ``_display_default`` will snap back in (display units)."""
+
+
+def _display_default(
+    f_value: float,
+    is_celsius: bool,
+    lo: float,
+    hi: float,
+    snap_step: float | None = None,
+) -> float:
+    """Convert a stored/default °F value into a slider default in the display unit (Issue #1049).
+
+    * ``snap_step`` set: round to that step (fresh-install defaults, e.g. 0.5 °C).
+    * ``snap_step`` None: keep the stored value, rounded to 4 dp to strip float noise
+      (``from_fahrenheit(to_fahrenheit(18.0))`` is ``18.00000000000004`` — which the slider's
+      ``max`` check rejected as "too large" on a plain re-save).
+
+    The result is clamped to ``[lo, hi]`` ONLY when it is within ``_DISPLAY_DEFAULT_EPSILON``
+    outside a bound (fp noise). A genuinely out-of-range value is returned unchanged rather
+    than silently rewritten: the user must see and correct it, not have the integration
+    re-save a different setpoint than the one they configured.
+    """
+    value = from_fahrenheit(f_value, CELSIUS) if is_celsius else float(f_value)
+    value = round(value / snap_step) * snap_step if snap_step else round(value, 4)
+    if lo - _DISPLAY_DEFAULT_EPSILON <= value < lo:
+        return lo
+    if hi < value <= hi + _DISPLAY_DEFAULT_EPSILON:
+        return hi
+    return value
+
+
 def setpoint_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, float, float]]:
-    """Slider (min, max, default, step) for the 6 setpoints on the INITIAL setup wizard
-    (async_step_setpoints), keyed by field name.
+    """Slider ``(min, max, default, step)`` for the 6 setpoints, keyed by field name.
+
+    Shared by the initial setup wizard (async_step_setpoints in ClimateAdvisorConfigFlow, which
+    uses ``default`` as the fresh-install value) and the options flow (which uses only
+    ``min``/``max``/``step`` and shows the CURRENT configured value, via ``_display_default``,
+    instead of ``default``).
 
     Celsius defaults are derived from the same DEFAULT_* Fahrenheit constants (rounded
     to the 0.5 step) rather than a second set of hand-picked literals, so the two unit
     branches — and any future reformat of the DEFAULT_* constants — can never drift
-    apart again. This closes a real bug: DEFAULT_SLEEP_HEAT/DEFAULT_SLEEP_COOL were
-    reformatted from 66/78 to 64/72 (architecture-reset session, #438), but this
-    wizard's own hardcoded defaults were never updated, so every brand-new install
-    (Fahrenheit sleep fields, and ALL SIX Celsius fields) had the stale values
-    explicitly written into its config on first setup.
-
-    The options/edit flow (async_step_setpoints in ClimateAdvisorOptionsFlow) is
-    intentionally NOT built from this function — it displays the CURRENT configured
-    value (`current.get(key, DEFAULT_X)`), not a fresh-install default, so its ranges
-    dicts stay separate.
+    apart again (#438: stale hardcoded sleep defaults shipped to every new install).
+    Celsius bounds cover the full Fahrenheit slider span converted (Issue #1049: 65 °F =
+    18.33 °C used to exceed a hard-coded 18 °C max).
     """
 
-    def _c_default(f_value: float) -> float:
-        return round(from_fahrenheit(f_value, CELSIUS) * 2) / 2
+    def _c_default(f_value: float, lo: float, hi: float) -> float:
+        return _display_default(f_value, True, lo, hi, snap_step=0.5)
 
     if is_celsius:
         return {
-            "comfort_heat": (13, 27, _c_default(DEFAULT_COMFORT_HEAT), 0.5),
-            "comfort_cool": (20, 29, _c_default(DEFAULT_COMFORT_COOL), 0.5),
-            "setback_heat": (7, 18, _c_default(DEFAULT_SETBACK_HEAT), 0.5),
-            "setback_cool": (24, 32, _c_default(DEFAULT_SETBACK_COOL), 0.5),
-            "sleep_heat": (13, 26, _c_default(DEFAULT_SLEEP_HEAT), 0.5),
-            "sleep_cool": (21, 32, _c_default(DEFAULT_SLEEP_COOL), 0.5),
+            "comfort_heat": (12.5, 27, _c_default(DEFAULT_COMFORT_HEAT, 12.5, 27), 0.5),
+            "comfort_cool": (20, 29.5, _c_default(DEFAULT_COMFORT_COOL, 20, 29.5), 0.5),
+            "setback_heat": (7, 18.5, _c_default(DEFAULT_SETBACK_HEAT, 7, 18.5), 0.5),
+            "setback_cool": (23.5, 32.5, _c_default(DEFAULT_SETBACK_COOL, 23.5, 32.5), 0.5),
+            "sleep_heat": (12.5, 26.5, _c_default(DEFAULT_SLEEP_HEAT, 12.5, 26.5), 0.5),
+            "sleep_cool": (20.5, 32, _c_default(DEFAULT_SLEEP_COOL, 20.5, 32), 0.5),
         }
     return {
         "comfort_heat": (55, 80, DEFAULT_COMFORT_HEAT, 1),
@@ -313,6 +342,27 @@ def setpoint_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, fl
         "setback_cool": (75, 90, DEFAULT_SETBACK_COOL, 1),
         "sleep_heat": (55, 79, DEFAULT_SLEEP_HEAT, 1),
         "sleep_cool": (69, 89, DEFAULT_SLEEP_COOL, 1),
+    }
+
+
+def threshold_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, float]]:
+    """Slider ``(min, max, step)`` for the 4 day-type thresholds (options flow, Issue #1049).
+
+    Celsius bounds cover the Fahrenheit span converted, so every stored value the °F
+    slider accepts is displayable (65 °F = 18.33 °C used to exceed a hard-coded 18 °C max).
+    """
+    if is_celsius:
+        return {
+            CONF_THRESHOLD_HOT: (23.5, 43.5, 0.5),
+            CONF_THRESHOLD_WARM: (15, 35, 0.5),
+            CONF_THRESHOLD_MILD: (7, 27, 0.5),
+            CONF_THRESHOLD_COOL: (-2, 18.5, 0.5),
+        }
+    return {
+        CONF_THRESHOLD_HOT: (75, 110, 1),
+        CONF_THRESHOLD_WARM: (60, 95, 1),
+        CONF_THRESHOLD_MILD: (45, 80, 1),
+        CONF_THRESHOLD_COOL: (30, 65, 1),
     }
 
 
@@ -897,38 +947,27 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                 await self._commit_section(user_input)
                 return await self.async_step_init()
 
-        if is_celsius:
-            ranges = {
-                "comfort_heat": (13, 27, 0.5),
-                "comfort_cool": (20, 29, 0.5),
-                "setback_heat": (7, 18, 0.5),
-                "setback_cool": (24, 32, 0.5),
-                "sleep_heat": (13, 26, 0.5),
-                "sleep_cool": (21, 32, 0.5),
-            }
-            unit_label = "°C"
-            comfort_heat_disp = from_fahrenheit(current.get("comfort_heat", DEFAULT_COMFORT_HEAT), unit)
-            comfort_cool_disp = from_fahrenheit(current.get("comfort_cool", DEFAULT_COMFORT_COOL), unit)
-            setback_heat_disp = from_fahrenheit(current.get("setback_heat", DEFAULT_SETBACK_HEAT), unit)
-            setback_cool_disp = from_fahrenheit(current.get("setback_cool", DEFAULT_SETBACK_COOL), unit)
-            sleep_heat_disp = from_fahrenheit(current.get("sleep_heat", DEFAULT_SLEEP_HEAT), unit)
-            sleep_cool_disp = from_fahrenheit(current.get("sleep_cool", DEFAULT_SLEEP_COOL), unit)
-        else:
-            ranges = {
-                "comfort_heat": (55, 80, 1),
-                "comfort_cool": (68, 85, 1),
-                "setback_heat": (45, 65, 1),
-                "setback_cool": (75, 90, 1),
-                "sleep_heat": (55, 79, 1),
-                "sleep_cool": (69, 89, 1),
-            }
-            unit_label = "°F"
-            comfort_heat_disp = current.get("comfort_heat", DEFAULT_COMFORT_HEAT)
-            comfort_cool_disp = current.get("comfort_cool", DEFAULT_COMFORT_COOL)
-            setback_heat_disp = current.get("setback_heat", DEFAULT_SETBACK_HEAT)
-            setback_cool_disp = current.get("setback_cool", DEFAULT_SETBACK_COOL)
-            sleep_heat_disp = current.get("sleep_heat", DEFAULT_SLEEP_HEAT)
-            sleep_cool_disp = current.get("sleep_cool", DEFAULT_SLEEP_COOL)
+        unit_label = "°C" if is_celsius else "°F"
+        slider = setpoint_slider_ranges(is_celsius)
+        ranges = {k: (mn, mx, step) for k, (mn, mx, _default, step) in slider.items()}
+        defaults_f = {
+            "comfort_heat": DEFAULT_COMFORT_HEAT,
+            "comfort_cool": DEFAULT_COMFORT_COOL,
+            "setback_heat": DEFAULT_SETBACK_HEAT,
+            "setback_cool": DEFAULT_SETBACK_COOL,
+            "sleep_heat": DEFAULT_SLEEP_HEAT,
+            "sleep_cool": DEFAULT_SLEEP_COOL,
+        }
+        disp = {
+            k: _display_default(current.get(k, defaults_f[k]), is_celsius, ranges[k][0], ranges[k][1])
+            for k in defaults_f
+        }
+        comfort_heat_disp = disp["comfort_heat"]
+        comfort_cool_disp = disp["comfort_cool"]
+        setback_heat_disp = disp["setback_heat"]
+        setback_cool_disp = disp["setback_cool"]
+        sleep_heat_disp = disp["sleep_heat"]
+        sleep_cool_disp = disp["sleep_cool"]
 
         return self.async_show_form(
             step_id="setpoints",
@@ -1715,30 +1754,16 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                 await self._commit_section(converted)
                 return await self.async_step_init()
 
-        if is_celsius:
-            ranges = {
-                CONF_THRESHOLD_HOT: (24, 43, 0.5),
-                CONF_THRESHOLD_WARM: (15, 35, 0.5),
-                CONF_THRESHOLD_MILD: (7, 26, 0.5),
-                CONF_THRESHOLD_COOL: (-2, 18, 0.5),
-            }
-            unit_label = "°C"
-            hot_disp = from_fahrenheit(current.get(CONF_THRESHOLD_HOT, DEFAULT_THRESHOLD_HOT), unit)
-            warm_disp = from_fahrenheit(current.get(CONF_THRESHOLD_WARM, DEFAULT_THRESHOLD_WARM), unit)
-            mild_disp = from_fahrenheit(current.get(CONF_THRESHOLD_MILD, DEFAULT_THRESHOLD_MILD), unit)
-            cool_disp = from_fahrenheit(current.get(CONF_THRESHOLD_COOL, DEFAULT_THRESHOLD_COOL), unit)
-        else:
-            ranges = {
-                CONF_THRESHOLD_HOT: (75, 110, 1),
-                CONF_THRESHOLD_WARM: (60, 95, 1),
-                CONF_THRESHOLD_MILD: (45, 80, 1),
-                CONF_THRESHOLD_COOL: (30, 65, 1),
-            }
-            unit_label = "°F"
-            hot_disp = current.get(CONF_THRESHOLD_HOT, DEFAULT_THRESHOLD_HOT)
-            warm_disp = current.get(CONF_THRESHOLD_WARM, DEFAULT_THRESHOLD_WARM)
-            mild_disp = current.get(CONF_THRESHOLD_MILD, DEFAULT_THRESHOLD_MILD)
-            cool_disp = current.get(CONF_THRESHOLD_COOL, DEFAULT_THRESHOLD_COOL)
+        unit_label = "°C" if is_celsius else "°F"
+        ranges = threshold_slider_ranges(is_celsius)
+
+        def _thr(key: str, default_f: float) -> float:
+            return _display_default(current.get(key, default_f), is_celsius, ranges[key][0], ranges[key][1])
+
+        hot_disp = _thr(CONF_THRESHOLD_HOT, DEFAULT_THRESHOLD_HOT)
+        warm_disp = _thr(CONF_THRESHOLD_WARM, DEFAULT_THRESHOLD_WARM)
+        mild_disp = _thr(CONF_THRESHOLD_MILD, DEFAULT_THRESHOLD_MILD)
+        cool_disp = _thr(CONF_THRESHOLD_COOL, DEFAULT_THRESHOLD_COOL)
 
         return self.async_show_form(
             step_id="classification_thresholds",

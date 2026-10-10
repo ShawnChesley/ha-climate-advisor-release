@@ -216,6 +216,26 @@ def read_sensor_state_f(state, unit: str) -> tuple[float | None, str | None]:
     return value_f, None
 
 
+def display_temp(value_f: float | None, unit: str, ndigits: int = 1) -> float | None:
+    """Convert an internal °F *absolute* temperature to a rounded display number (Issue #1049).
+
+    None-safe wrapper over ``from_fahrenheit`` for API/payload boundaries: None stays None.
+    """
+    if value_f is None:
+        return None
+    return round(from_fahrenheit(value_f, unit), ndigits)
+
+
+def display_delta(value_f: float | None, unit: str, ndigits: int = 1) -> float | None:
+    """Convert an internal °F *delta or rate* to a rounded display number (scale only, no offset).
+
+    None-safe wrapper over ``convert_delta``; use ``display_temp`` for absolute temperatures.
+    """
+    if value_f is None:
+        return None
+    return round(convert_delta(value_f, unit), ndigits)
+
+
 def format_temp(value_fahrenheit: float, unit: str, decimals: int = 0) -> str:
     """Format an internal Fahrenheit temperature for display in the user's unit.
 
@@ -242,7 +262,7 @@ def format_temp_delta(delta_fahrenheit: float, unit: str, decimals: int = 0) -> 
         format_temp_delta(5.0, CELSIUS)       → "3°C"
         format_temp_delta(0.0, CELSIUS)       → "0°C"
     """
-    delta = delta_fahrenheit * 5.0 / 9.0 if unit == CELSIUS else float(delta_fahrenheit)
+    delta = convert_delta(delta_fahrenheit, unit)
     symbol = UNIT_SYMBOL.get(unit, "°F")
     return f"{delta:.{decimals}f}{symbol}"
 

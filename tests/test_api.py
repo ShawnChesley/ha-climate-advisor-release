@@ -941,6 +941,53 @@ class TestLearningViewCelsiusUnit:
         assert "unit" in response  # KeyError before fix
 
 
+class TestLearningViewTomorrowPlanUnits:
+    """Issue #1049: Tomorrow's Plan sent internal-°F expected_high/low to a frontend that only
+    appends the unit symbol, so a 16.3/11 °C forecast rendered as '61.39°C / 51.8°C'."""
+
+    def _coord(self, temp_unit, plan):
+        coord = TestLearningViewCelsiusUnit()._make_coordinator(temp_unit=temp_unit)
+        coord.tomorrow_plan = plan
+        return coord
+
+    def _plan(self):
+        return {"date": "2026-10-11", "day_type": "mild", "expected_high": 61.34, "expected_low": 51.8}
+
+    def test_celsius_plan_is_converted_without_mutating_the_coordinator_plan(self):
+        import pytest
+
+        plan = self._plan()
+        response = _simulate_learning_get(self._coord("celsius", plan))
+        assert response["tomorrow_plan"]["expected_high"] == pytest.approx(16.3, abs=0.05)
+        assert response["tomorrow_plan"]["expected_low"] == pytest.approx(11.0, abs=0.05)
+        assert response["tomorrow_plan"]["day_type"] == "mild"
+        # coordinator property stays internal degF (a copy was converted)
+        assert plan["expected_high"] == 61.34
+        assert plan["expected_low"] == 51.8
+
+    def test_fahrenheit_plan_is_unchanged(self):
+        response = _simulate_learning_get(self._coord("fahrenheit", self._plan()))
+        assert response["tomorrow_plan"]["expected_high"] == 61.3
+        assert response["tomorrow_plan"]["expected_low"] == 51.8
+
+    def test_missing_plan_stays_none(self):
+        assert _simulate_learning_get(self._coord("celsius", None))["tomorrow_plan"] is None
+
+    def test_frontend_reads_the_keys_the_api_sends(self):
+        """renderTomorrowPlan must read expected_high/expected_low and not convert again."""
+        from pathlib import Path
+
+        html = (
+            Path(__file__).parent.parent / "custom_components" / "climate_advisor" / "frontend" / "index.html"
+        ).read_text(encoding="utf-8")
+        body = html[html.index("function renderTomorrowPlan") :]
+        body = body[: body.index("async function loadSuggestions")]
+        assert "plan.expected_high" in body
+        assert "plan.expected_low" in body
+        assert "- 32" not in body
+        assert "* 5" not in body
+
+
 class TestCancelViewsGraceCancellation:
     """Issue #508: both Cancel-override API views must cancel grace, not just the override flag.
 
