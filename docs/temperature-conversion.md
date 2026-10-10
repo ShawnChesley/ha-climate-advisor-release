@@ -15,6 +15,7 @@
 | What happens to same-day readings when the user changes the unit? | On the next same-day restore the saved `temp_unit` differs from the configured unit, so outdoor/indoor temp history, `pred_archive` and `classification` are discarded (WARNING + `unit_changed` event). Chart-log and learning records written under the wrong unit are not repaired. | [Unit change handling](#unit-change-handling-issue-1015) |
 | Does the climate-entity unit check (Issue #968) honour `temp_unit`? | Yes, since 0.7.84 (Issue #1018). `_check_climate_unit()` compares the entity's `temperature_unit` attribute (if exposed) with the configured `temp_unit` and logs one ERROR on mismatch; it no longer assumes Fahrenheit. Log-only. | [Climate-entity unit check](#climate-entity-unit-check-issue-968-issue-1018) |
 | Does CA check that its unit matches Home Assistant's unit system and its configured temperature sensors' units? | Yes, since 0.7.85 (Issues #1021, #1020). `_check_unit_sources()` logs one WARNING if `temp_unit` differs from HA's system unit (`hass.config.units.temperature_unit`), and one per role (`outdoor_temp`, `indoor_temp`, `sleep_indoor_temp`) if a sensor's `unit_of_measurement` differs. Log-only; debug-state fields `ha_system_unit`, `ha_unit_mismatch`, `sensor_unit_mismatches`. | [Home Assistant unit system and sensor unit checks](#home-assistant-unit-system-and-sensor-unit-checks-issue-1020-issue-1021) |
+| Where are Tomorrow's Plan temperatures converted to the display unit, and how do the Celsius setpoint sliders avoid range errors? | `api.py` `ClimateAdvisorLearningView` converts a copy of `coordinator.tomorrow_plan` (`expected_high`/`expected_low`, internal °F) with `display_temp()`; the frontend only appends the symbol. In `config_flow.py`, `_display_default()` keeps the stored value (rounded to 4 dp) and the Celsius slider bounds cover the full converted °F span, so a plain re-save no longer fails the range check (Issue #1049). | [Scope](#scope) |
 
 ## Scope
 
@@ -35,6 +36,8 @@
 - Convert temperature *differences* and *rates* from °F scale to the user's display unit scale (`convert_delta`), without adding the offset that applies only to absolute temperatures
 - Format an absolute temperature as a display string with symbol (`format_temp`)
 - Format a temperature difference as a display string with symbol (`format_temp_delta`)
+- Provide None-safe, rounded wrappers for API/payload boundaries: `display_temp(value_f, unit, ndigits=1)` (absolute, via `from_fahrenheit`) and `display_delta(value_f, unit, ndigits=1)` (delta/rate, via `convert_delta`); `None` stays `None`. `format_temp_delta` now delegates to `convert_delta` (Issue #1049).
+- Boundary note (Issue #1049): `GET /api/climate_advisor/learning` returns `tomorrow_plan.expected_high`/`expected_low` already converted to the configured unit (`api.py`); the Options flow derives slider defaults with `config_flow._display_default()` (only fp-noise-sized overshoots are clamped to the slider bound; a genuinely out-of-range value is shown, not rewritten).
 
 ## Interfaces
 

@@ -65,6 +65,7 @@ The automation logic table and all threshold constants in this document are expr
 | Why did briefly opening a monitored door (e.g. walking outside) trigger an instant "HVAC paused" notification, bypassing the configured 10-minute debounce window entirely? | `_sensor_debounce_pending()` checked `_door_open_timers` (timing-dependent) instead of the sensor's `last_changed` timestamp (timing-independent). Fixed by checking both, making the guard immune to scheduling order (Issue #623). | [§ Debounce-Timer Registration Race (Issue #623)](grace-periods-spec.md#debounce-timer-registration-race-issue-623) |
 | Why did the AC get silently commanded into "cool" mode with a monitored window still open, over an hour after nat-vent released ownership, with no pause and no log line even mentioning the mode change? | `_apply_comfort_band()` (the single choke-point for all 7 comfort-band callers) had no independent live-sensor check; it relied only on upstream `_paused_by_door` bookkeeping which could lag. `_set_temperature()` also didn't log its bundled `mode` parameter. Fixed by (1) a choke-point guard refusing to arm while a window is genuinely open (Issue #629, mirroring the pre-existing WHF/AC mutex choke-point from Issue #392 Fix 1b), and (2) adding `mode=` to the log line. | [§9. Structural WHF/AC Mutual Exclusion](08-COMPUTATION-REFERENCE.md#9-structural-whfac-mutual-exclusion) |
 | Why did HVAC mode flip to "cool" right after a redeploy/restart, with the dashboard still correctly showing "windows open" and the door/window sensor genuinely open the whole time? | A monitored sensor blipped `unavailable → on` during HA startup, resetting `last_changed` on an old open. The choke-point guard then saw "pending" for 10 min and skipped the pause. Fixed by teaching the listener to recognize `unavailable`/`unknown` → open as a reconnect blip and exclude it from debounce timing (Issue #645, which closed a gap the Issue #629 choke-point guard above didn't cover). | [§9. Structural WHF/AC Mutual Exclusion](08-COMPUTATION-REFERENCE.md#9-structural-whfac-mutual-exclusion) |
+| How does CA make sure a heat/cool setpoint actually switches the thermostat on, and how does it notice a thermostat that ignores the mode (Sensi/ecobee)? | `_ensure_hvac_mode_for_write()` awaits an explicit `climate.set_hvac_mode` before the setpoint (`decide_explicit_mode_switch`, 120 s dedupe), all climate calls go through the blocking `_call_climate()`, and a 10 s / 130 s read-back (`decide_mode_alignment`) raises `hvac_mode_not_applied` once per episode. Issue #1049. | [Command shapes since #301](08-COMPUTATION-REFERENCE.md#command-shapes-since-301-explicit-mode-switch-issue-1049) |
 
 ## 1. Day Classification
 
@@ -1291,9 +1292,42 @@ There is no `off` sentinel, no off+setback divergence, and no per-handler HVAC-m
 
 Mode changes are issued only when the thermostat is not already in the target mode — the existing idempotent `_set_hvac_mode` setter (line ~1258) enforces this. Dry-run mode is respected throughout.
 
-**Emitted event:** `comfort_band_applied` — payload: `{floor, ceiling, active, mode, reason}`. Every call to `_apply_comfort_band` that results in a service call emits this event. Visible in the Daily Record's event list and the AI activity report.
+**Emitted event:** `comfort_band_applied` — payload: `{floor, ceiling, active, mode, reason, outcome}`. `outcome` (Issue #1049) is derived from the write's `HvacCommandResult` via `hvac_outcome_label()`: `sent` (accepted or answer still unknown), `blocked` (whole-house fan owns the thermostat), `dry_run`, `failed`, `superseded` (a newer write replaced it), or `not_sent`; the event is emitted AFTER the write so it no longer claims "applied" for a write that was blocked or failed. See [Command shapes since #301](#command-shapes-since-301-explicit-mode-switch-issue-1049). Every call to `_apply_comfort_band` that reaches a write attempt emits this event. Visible in the Daily Record's event list and the AI activity report.
 
 **Bedtime / occupancy payloads updated:** `bedtime_setback`, `morning_wakeup`, `occupancy_setback` event payloads now also carry `floor/ceiling/active/mode` so the timeline shows the full band context, not just a single setpoint.
+
+#### Command shapes since #301 — explicit mode switch (Issue #1049, Part of #1048)
+
+**Occupant outcome:** a Sensi (or HA-core ecobee) thermostat left Off kept the house cold/hot all day while the Activity Log said the band was "applied". Those integrations ignore the `hvac_mode` kwarg of `climate.set_temperature` (and Sensi rejects/null-reports setpoints while Off), so the mode embedded in the single-setpoint write (#301) never took effect.
+
+The write path is now (all in `automation.py`, `_set_temperature()` and the nudge/retry path):
+
+| Step | Behavior | Anchor |
+|---|---|---|
+| 1. Decide | `desired_state.decide_explicit_mode_switch(commanded_mode, live_state, advertised_modes, recent_switch_to_mode)` is true only when the commanded mode is single `heat`/`cool`, the thermostat advertises it, the live state is a *real* different mode (off/auto/heat_cool/opposite; `None`/non-string/`unavailable`/`unknown` never trigger), and no successful switch to that mode went out within `MODE_SWITCH_DEDUPE_SECONDS` (120 s). It adds no pause/override/window guard of its own. | `desired_state.py` |
+| 2. Switch | `_ensure_hvac_mode_for_write()` awaits `climate.set_hvac_mode` BEFORE the setpoint call; it stamps `_hvac_command_pending` / `_last_commanded_hvac_mode` first so the echo is never read as a manual change, and re-stamps the command times after the (possibly slow) await. Returns False (stop; no setpoint write) on FAILED, REJECTED or when a newer write superseded it. | `automation.py` `_ensure_hvac_mode_for_write` |
+| 3. Dedupe marker | A successful (or TIMEOUT-unconfirmed) switch records `_mode_switch_marker = (mode, now)`; cloud thermostats echo the new mode 30-120 s late, so the write that immediately follows must not send a duplicate `set_hvac_mode`. FAILED/REJECTED clear the marker. | `_mode_switch_marker_recent` |
+| 4. Setpoint | The setpoint call (still carrying `hvac_mode` for obedient thermostats) follows. | `_set_temperature` |
+
+**Awaited, classified commands.** Every `climate.*` call in this path goes through `AutomationEngine._call_climate()`: `blocking=True` (so an integration rejection reaches CA instead of being swallowed), wrapped in `wait_for(shield(task), CLIMATE_CALL_TIMEOUT_S = 10)` so a slow cloud thermostat is not torn down mid-command. `ClimateCallOutcome`: `OK`; `TIMEOUT` (no answer in 10 s — state **unknown**, deliberately not a failure; the read-back below is the safety net); `REJECTED` (HA validation: `incident_payload.is_climate_validation_error()` — out-of-range setpoint, mode not offered — logged WARNING and skipped, never an `hvac_command_failed` episode); `FAILED` (anything else, ERROR logged on every failure).
+
+**`HvacCommandResult`** (returned by `_set_hvac_mode()`; recorded in the frozen `HvacWriteRecord`): `EXECUTED`, `DRY_RUN`, `WHF_BLOCKED`, `FAILED`, `UNCONFIRMED`, `SUPERSEDED`. `hvac_outcome_label()` maps these to the Activity Log `outcome` field (`EXECUTED`/`UNCONFIRMED` -> `sent`).
+
+**Mode read-back.** After a single-setpoint write, `_check_mode_alignment()` runs twice through the pure `setpoint_verify_decision.decide_mode_alignment()`: at ~10 s (`announce=False` — only starts the mismatch clock; it runs first inside the 10 s setpoint check because Sensi's `temperature: null` while Off would otherwise make that check exit early) and at `MODE_ALIGNMENT_RECHECK_S = 130` s (`announce=True`, own cancel slot). Evaluation order: stale write seq, nothing requested, dry-run, manual override / confirm pending, WHF owns HVAC, door/window pause (non-`off` requests only), command in progress, unreadable live state, then ALIGNED vs MISALIGNED. Excluded/unreadable outcomes are stored as `HvacWriteRecord.apply_skip_reason` and never announce.
+
+**Events (episode-gated via `next_fallback_episode`):**
+
+| Event | Emitted when | Closes with |
+|---|---|---|
+| `hvac_mode_not_applied` (`kind="not_obeyed"`) | The >=130 s check is MISALIGNED; once per episode (re-announced only if the requested mode changes) | `hvac_mode_applied_recovered` (`requested_mode`, `minutes_down`) when a later check is ALIGNED |
+| `hvac_mode_not_applied` (`kind="rejected"`) | A mode command is REJECTED by HA validation (mode not offered); windowed to once per hour; opens no episode | — |
+| `incident_detected` / `hvac_command_failed` | A `climate.*` call FAILED; announced once per failure episode (not every 30-min cycle) | `hvac_command_recovered` (`hvac_mode`, `minutes_down`) on the next OK mode/setpoint call |
+
+The Status card surfaces open episodes through `coordinator.data["hvac_control_issues"]` (`mode_not_obeyed`, `command_failing`; see [rest-api.md](rest-api.md)).
+
+**Availability recovery is not an override (change 4).** `const.is_availability_recovery(old_state)` is true when the previous state was in `UNAVAILABLE_STATES` (`unavailable`, `unknown`). `coordinator._async_thermostat_changed()` computes it once and excludes it from the four override-detection sites (door/window-pause mode override, re-override during grace, plain mode override, setpoint-only override); the contact-sensor reconnect-blip check uses the same helper. A thermostat waking up reporting Off or a missing setpoint is a reconnect, not an occupant action. See [grace-periods-spec.md](grace-periods-spec.md).
+
+**Tests:** `tests/test_hvac_mode_switch_decision.py` (pure `decide_explicit_mode_switch`), `tests/test_hvac_mode_switch_sensi.py` (end-to-end on the `sensi_like` harness quirk), `tests/test_hvac_mode_alignment.py` (read-back, episodes, exclusions), `tests/test_hvac_command_visibility.py` (`_call_climate` outcomes, `HvacCommandResult`, episode-gated failures, `outcome` field), `tests/test_availability_recovery_override.py`, `tests/test_hvac_control_issues.py`.
 
 #### Nat-Vent and Economizer with the Band Armed
 
@@ -3329,6 +3363,10 @@ This logic table MUST be kept current for any changes to automation behavior.
 | C4×E6 (band armed) | test_warm_day_setback.py | TestWarmDayBandArming::test_warm_day_dual_thermostat_sets_dual_setpoints |
 | C2×E5 / C3×E5 / C5×E5 (band stays armed on nat-vent) | test_window_hvac_interaction.py, test_door_window.py | Band remains armed when fan activates; no `hvac_mode=off` issued |
 | C2×E6 / C5×E6 (band applied on re-classification) | test_thermostat_program.py, test_production_harness.py | `apply_classification` arms band `[comfort_heat, comfort_cool]` (occupied+awake, any day type) |
+| C1–C7 × any heat/cool setpoint write (explicit awaited `set_hvac_mode` before the setpoint when live mode differs; 120 s dedupe; no switch for `None`/`unavailable`/`unknown`) | test_hvac_mode_switch_decision.py, test_hvac_mode_switch_sensi.py | Issue #1049 — `decide_explicit_mode_switch`; Sensi-like Off thermostat ends in heat |
+| C1–C7 × any climate write (`_call_climate` blocking; FAILED -> one episode-gated `hvac_command_failed`, REJECTED skipped quietly, TIMEOUT = unknown not failed; `hvac_command_recovered` closes) | test_hvac_command_visibility.py | Issue #1049 |
+| C1–C7 × any heat/cool write (mode read-back at 10 s / 130 s; `hvac_mode_not_applied` / `hvac_mode_applied_recovered`; excluded during override, WHF, pause, dry-run, unavailable) | test_hvac_mode_alignment.py, test_hvac_control_issues.py | Issue #1049 — `decide_mode_alignment` |
+| All C × thermostat `unavailable`/`unknown` -> X state change (not an override at the four detection sites) | test_availability_recovery_override.py | Issue #1049 — `is_availability_recovery` |
 | All×E8 (coalesce: turn-off, no nat-vent) | _(test-ref pending)_ | restart clears `_fan_override_active`; coalesce turns off fan when nat-vent not eligible |
 | All×E8 (coalesce: adopt-on) | _(test-ref pending)_ | coalesce adopts running fan as CA nat-vent when conditions hold; `_natural_vent_active=True` |
 | C1×E5 / C6×E5 / C7×E5 (thermostatic exit: `outdoor ≥ indoor`) | _(test-ref pending)_ | `fan_thermostat_check` turns fan off on `outdoor ≥ indoor` before next 30-min poll |
