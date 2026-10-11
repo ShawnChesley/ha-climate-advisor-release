@@ -3,6 +3,11 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.101] — 2026-10-11
+
+- Fix #1067: on a cool morning the chart's predicted indoor temperature now rises toward your comfort floor (as the thermostat will) instead of drifting below it. On a mild day that starts cold, the later afternoon prediction is correspondingly a little warmer, so the ceiling guard may start cooling sooner.
+- Fix #1076: on warming or cooling trend days the Away and Vacation band on the chart now matches the setback the thermostat actually holds.
+
 ## [0.7.100] — 2026-10-11
 
 - Fix #1075: documented and tested what happens when the thermostat drops offline and comes back (comfort is restored on the first temperature reading if the house is outside the range, otherwise at the next 30-minute check). No behaviour change.

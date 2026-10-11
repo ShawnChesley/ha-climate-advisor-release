@@ -4959,7 +4959,8 @@ class AutomationEngine:
     async def _schedule_pre_condition(self, c: DayClassification) -> None:
         """Schedule pre-heating or pre-cooling based on trend.
 
-        For warming trends: more aggressive setback (handled by setback_modifier)
+        For warming trends: overnight pre-cool banking (setback_modifier feeds
+        compute_pre_cool_target() only; it is not applied to away/vacation setbacks)
         For cooling trends: pre-heat in the evening
         """
         unit = self._temp_unit
