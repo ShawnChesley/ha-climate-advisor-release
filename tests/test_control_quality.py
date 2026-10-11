@@ -155,13 +155,25 @@ class TestMisarmedAccuracy:
         assert m["minutes"] == 0.0
 
     def test_five_thousand_samples_is_fast_and_linear(self):
-        rows = [row(m, indoor=69 if (m // 30) % 2 else 72) for m in range(5000, 0, -1)]
-        changes = [change(5000, "cool", 69)]
-        t0 = time.perf_counter()
-        report = build(changes, rows, now=NOW)
-        elapsed = time.perf_counter() - t0
-        assert report["windows"]["7d"]["misarmed"]["minutes"] is not None
-        assert elapsed < 0.1, f"build took {elapsed * 1000:.0f} ms"
+        # Issue #1083: an absolute 0.1 s wall-clock limit flaked on loaded CI runners
+        # (181 ms, 325 ms). Linearity is what matters: doubling the samples must roughly
+        # double the time (a quadratic build would be ~4x), best-of-3 to ride out noise,
+        # with a generous absolute ceiling that only a real blow-up can reach.
+        def best_time(n: int) -> float:
+            rows = [row(m, indoor=69 if (m // 30) % 2 else 72) for m in range(n, 0, -1)]
+            changes = [change(n, "cool", 69)]
+            best = float("inf")
+            for _ in range(3):
+                t0 = time.perf_counter()
+                report = build(changes, rows, now=NOW)
+                best = min(best, time.perf_counter() - t0)
+            assert report["windows"]["7d"]["misarmed"]["minutes"] is not None
+            return best
+
+        t_half = best_time(2500)
+        t_full = best_time(5000)
+        assert t_full < 3.0, f"build took {t_full * 1000:.0f} ms"
+        assert t_full < max(3.5 * t_half, 0.05), f"not linear: {t_half * 1000:.0f} ms -> {t_full * 1000:.0f} ms"
 
 
 class TestModeChanges:
