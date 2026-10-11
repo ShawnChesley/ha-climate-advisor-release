@@ -20,7 +20,7 @@ printed in every investigator report). The redaction is key- and value-based
 (`redact_sensitive()`), not HA's exact-key `async_redact_data`, because the attribute
 key set is not enumerable; `diagnostics.py` still wraps its whole payload in
 `async_redact_data(payload, TO_REDACT)` for config secrets (`notify_service`,
-`ai_api_key`) -- two layers for two different threat models, not two competing lists.
+`github_token`, `ai_api_key`) -- two layers for two different threat models, not two competing lists.
 """
 
 from __future__ import annotations

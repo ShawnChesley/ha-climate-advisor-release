@@ -23,23 +23,22 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import CONFIG_METADATA, DOMAIN, VERSION
+from .const import CONFIG_METADATA, DOMAIN, REDACTED_CONFIG_KEYS, VERSION
 from .diagnostic_snapshot import build_diagnostic_snapshot, recent_hvac_events
 
 _LOGGER = logging.getLogger(__name__)
 
-# Redact "notify_service" (may reveal personal info, per the existing
-# api.py:542 convention) plus every CONFIG_METADATA key flagged
-# ``"sensitive": True`` (currently just "ai_api_key") — reusing the same flag
-# api.py already uses for the config API's sanitization, not a second
-# redaction list.
+# Redact REDACTED_CONFIG_KEYS ("notify_service" may reveal personal info; "github_token" is a
+# credential, Issue #1062) plus every CONFIG_METADATA key flagged ``"sensitive": True``
+# (currently just "ai_api_key") — reusing the same flag api.py already uses for the config
+# API's sanitization.
 #
 # Thermostat attributes (serial/MAC/IP/location/owner name) are NOT handled by this
 # exact-key set: their key names are third-party-defined, so `diagnostic_snapshot.py`
 # redacts them inside `build_diagnostic_snapshot()` (Issue #1049) for every consumer at
 # once. `async_redact_data(payload, TO_REDACT)` below remains the second layer for
 # config secrets.
-TO_REDACT = {"notify_service"} | {key for key, meta in CONFIG_METADATA.items() if meta.get("sensitive")}
+TO_REDACT = set(REDACTED_CONFIG_KEYS) | {key for key, meta in CONFIG_METADATA.items() if meta.get("sensitive")}
 
 
 def _chart_data_summary(coordinator: Any) -> dict[str, Any]:

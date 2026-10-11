@@ -3,6 +3,11 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.96] — 2026-10-11
+
+- Fix #1062: the diagnostics download and the diagnostics log dump no longer contain your GitHub token. If you shared either from an earlier version, revoke and recreate the token.
+- Fix #1063: Celsius households now see setback depth and the comfort deadbands in °C on the dashboard Settings tab, matching the options screen.
+
 ## [0.7.95] — 2026-10-11
 
 - Fix #1061: every setting in the setup and options screens now has a clear name (no more raw names like temp_unit), the unit is shown once instead of twice, and Celsius households see setback depth and comfort deadbands in °C. Setup now asks only the essentials (timing delays, advanced fan options, the welcome-home period and the sleep sensor are in Settings with the same defaults), asks whether to send the daily briefing, and a zone can be renamed in Core Settings.

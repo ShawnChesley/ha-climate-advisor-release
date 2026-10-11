@@ -143,6 +143,7 @@ class TestRedaction:
     def test_to_redact_includes_notify_service_and_sensitive_config_keys(self):
         sensitive_keys = {key for key, meta in CONFIG_METADATA.items() if meta.get("sensitive")}
         assert "notify_service" in TO_REDACT
+        assert "github_token" in TO_REDACT  # Issue #1062
         assert sensitive_keys, "expected at least one sensitive CONFIG_METADATA key (ai_api_key)"
         assert sensitive_keys <= TO_REDACT
 
@@ -165,6 +166,56 @@ class TestRedaction:
 
         assert payload["config"]["ai_api_key"] != "sk-ant-super-secret-value"
         assert "super-secret" not in str(payload)
+
+    def test_github_token_is_redacted_in_payload_and_log_dump_text(self):
+        """Issue #1062: the token must not appear anywhere in the payload (download or service log)."""
+        import json
+
+        entry_a = _make_entry("entry_a", "Bedroom")
+        coord_a = _make_coordinator({"github_token": "ghp_super_secret_token_value", "github_repo": "me/repo"})
+        hass = _make_hass({"entry_a": coord_a}, [entry_a])
+
+        payload = asyncio.run(async_get_diagnostics_payload(hass, entry_a))
+
+        assert payload["config"]["github_token"] != "ghp_super_secret_token_value"
+        assert "ghp_super_secret" not in json.dumps(payload, default=str)
+        assert payload["config"]["github_repo"] == "me/repo"  # not a secret
+
+    def test_every_password_field_in_the_flows_is_redacted(self):
+        """A future PASSWORD selector (a secret) must be added to the redaction set or CI fails."""
+        import ast
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "custom_components" / "climate_advisor" / "config_flow.py"
+        const_mod = __import__("custom_components.climate_advisor.const", fromlist=["x"])
+        password_keys = set()
+        pairs = []  # (vol.Optional(KEY) call, selector value) from dict literals and schema[...] = ... assignments
+        for node in ast.walk(ast.parse(src.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Dict):
+                pairs.extend(zip(node.keys, node.values, strict=True))
+            elif isinstance(node, ast.Assign):
+                pairs.extend((t.slice, node.value) for t in node.targets if isinstance(t, ast.Subscript))
+        for key_node, val_node in pairs:
+            if "PASSWORD" not in ast.dump(val_node) or not isinstance(key_node, ast.Call):
+                continue
+            arg = key_node.args[0]
+            if isinstance(arg, ast.Name):
+                password_keys.add(getattr(const_mod, arg.id))
+            elif isinstance(arg, ast.Attribute):
+                password_keys.add(getattr(const_mod, arg.attr))
+            elif isinstance(arg, ast.Constant):
+                password_keys.add(arg.value)
+        assert {"ai_api_key", "github_token"} <= password_keys, password_keys
+        assert password_keys <= TO_REDACT, f"password fields missing from TO_REDACT: {password_keys - TO_REDACT}"
+
+    def test_non_secret_token_count_setting_is_not_redacted(self):
+        entry_a = _make_entry("entry_a", "Bedroom")
+        coord_a = _make_coordinator({"ai_max_tokens": 4096})
+        hass = _make_hass({"entry_a": coord_a}, [entry_a])
+
+        payload = asyncio.run(async_get_diagnostics_payload(hass, entry_a))
+
+        assert payload["config"]["ai_max_tokens"] == 4096
 
     def test_non_sensitive_config_values_pass_through_unredacted(self):
         entry_a = _make_entry("entry_a", "Bedroom")
