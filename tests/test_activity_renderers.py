@@ -10,6 +10,7 @@ Test classes:
   TestBuildEventTimelineTable — full table builder: band events, dedup, non-band events
   TestDefaultRenderer         — _default_renderer surprise-safe fallback
   TestEventRenderersCoverage  — guardrail: all emitted types have a registered renderer
+  TestEventRenderersCatalogParity — guardrail: every registered type has a docs catalog row (#1053)
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import datetime
 import re
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -652,6 +654,45 @@ class TestEventRenderersCoverage:
             + "\n".join(f"  - {t}" for t in sorted(dead))
             + "\nEither remove them from EVENT_RENDERERS or add them to _LEGACY_TYPES."
         )
+
+
+class TestEventRenderersCatalogParity:
+    """Issue #1053: every EVENT_RENDERERS key has a row in the doc's Event Catalog.
+
+    The catalog had silently drifted 17 rows behind the registry. This parses the
+    first-column backticked event names between the "## Event Catalog" and
+    "## Default Renderer" headings of docs/activity-report-table.md. There is
+    deliberately no allowlist: even the hidden type (unprotected_grace_started) is
+    catalogued, with a row stating it is hidden.
+    """
+
+    _DOC = str(Path(__file__).resolve().parent.parent / "docs" / "activity-report-table.md")
+
+    def _catalog_event_names(self) -> set[str]:
+        with open(self._DOC, encoding="utf-8") as f:
+            text = f.read()
+        start = text.index("## Event Catalog")
+        end = text.index("## Default Renderer")
+        return set(re.findall(r"^\| `([a-z0-9_]+)` \|", text[start:end], re.MULTILINE))
+
+    def test_every_registered_event_has_a_catalog_row(self):
+        from custom_components.climate_advisor.ai_skills_context import EVENT_RENDERERS
+
+        missing = set(EVENT_RENDERERS) - self._catalog_event_names()
+        assert not missing, (
+            f"EVENT_RENDERERS keys with no row in {self._DOC} Event Catalog (add one per type):\n"
+            + "\n".join(f"  - {t}" for t in sorted(missing))
+        )
+
+    def test_catalog_has_no_unknown_event_rows(self):
+        """The reverse direction: a catalog row for a type that is neither registered nor hidden is stale."""
+        from custom_components.climate_advisor.ai_skills_context import (
+            _REPORT_HIDDEN_EVENT_TYPES,
+            EVENT_RENDERERS,
+        )
+
+        stale = self._catalog_event_names() - set(EVENT_RENDERERS) - _REPORT_HIDDEN_EVENT_TYPES
+        assert not stale, f"Catalog rows with no registered renderer: {sorted(stale)}"
 
 
 class TestFanEventRenderers:
