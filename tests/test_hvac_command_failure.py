@@ -91,7 +91,10 @@ class TestSetHvacModeCommandFailure:
         engine = _make_automation_engine()
         engine.hass.services.async_call.side_effect = Exception("boom")
         emitted = []
-        engine._emit_event_callback = lambda event_type, data: emitted.append((event_type, data))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda event_type, data: (
+            emitted.append((event_type, data)) if event_type != "thermostat_mode_set" else None
+        )
 
         asyncio.run(engine._set_hvac_mode("heat", reason="test"))
 
@@ -142,7 +145,10 @@ class TestSetTemperatureCommandFailure:
         engine = _make_automation_engine()
         engine.hass.services.async_call.side_effect = Exception("boom")
         emitted = []
-        engine._emit_event_callback = lambda event_type, data: emitted.append((event_type, data))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda event_type, data: (
+            emitted.append((event_type, data)) if event_type != "thermostat_mode_set" else None
+        )
 
         asyncio.run(engine._set_temperature(72, reason="test", mode="cool"))
 

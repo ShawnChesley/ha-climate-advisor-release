@@ -1,21 +1,46 @@
-"""Comfort-family decision leaf — Design D, "nearest-edge arming" (Issue #1066).
+"""Comfort-family decision leaf -- nearest-edge arming (Issue #1066) plus the settling guard (Issue #1073).
 
 A single-setpoint thermostat can only guard ONE edge of the comfort band at a
 time: the floor (heat mode) or the ceiling (cool mode). This pure leaf decides
-which one, every cycle, from the indoor temperature alone. Supersedes the
-#821/#827/#843/#858/#867 against-grain machinery (day-type default edge,
-breach + deadband + recency window + sustain + dwell + recovery margin), which
-left the thermostat sitting in COOL below the comfort floor on mild/warm days.
+which one, every cycle, from the indoor temperature and a few pre-computed facts
+(the shell reads the clocks; the leaf never touches Home Assistant, the thermal
+model or any timer). Supersedes the #821/#827/#843/#858/#867 against-grain
+machinery, which left the thermostat sitting in COOL below the comfort floor.
 
-Rule (symmetric; all temperatures internal Fahrenheit):
+Rule (symmetric; all temperatures internal Fahrenheit). ``m`` is the fixed arming
+margin (``effective_margin``: ``COMFORT_MIN_ARMING_MARGIN_F`` clamped to a third of
+the band; it is NOT a user setting):
 
-- ``indoor < floor``   -> heating, immediately (breach).
-- ``indoor > ceiling`` -> cooling, immediately (breach).
-- otherwise, with effective arming margin ``m`` (see ``effective_margin``):
-  ``indoor <= floor + m``   -> heating (inclusive);
-  ``indoor >= ceiling - m`` -> cooling (inclusive);
-  strictly between           -> keep the family the thermostat is currently in
-  (hysteresis memory), or ``default_family`` when the current family is unknown.
+- ``indoor < floor``   -> heating (breach);
+- ``indoor > ceiling`` -> cooling (breach);
+- otherwise ``indoor <= floor + m`` -> heating, ``indoor >= ceiling - m`` -> cooling,
+  strictly between -> keep the current family (hysteresis memory), or
+  ``default_family`` when the current family is unknown.
+
+Settling guard (Issue #1073, ``docs/comfort-edge-selection-spec.md`` R1/R2): an
+appliance overshoots (a compressor stops about half a degree past its setpoint, a
+thermostat reports whole degrees), so a reading at or past an edge right after the
+OPPOSITE family ran is usually that overshoot, not a real need. After a cool bank the
+house typically reads 68-70 first (INSIDE the arming margin, not yet a breach), so the
+guard covers the margin zone as well as the breach zone. A SWITCH from a known current
+family is HELD (outcome HOLD, target = the current family, ``held=True``) when ALL of:
+
+  (a) the switch is against the day's grain -- the target is not ``native_family``
+      (the native side has tolerance 0 and is never delayed; a day type with no
+      native side makes both sides against-grain);
+  (b) the family being left ran or was DELIBERATELY commanded (user / TOU bank / ODE guard;
+      not a selector or restore write) within ``recency_window_min``
+      (``opposite_ran_min_ago``, computed by the shell; None/unknown = not recent);
+  (c) the house has not gone more than ``tolerance_f`` PAST the target edge. The signed
+      distance past the edge is floor - indoor (heat) or indoor - ceiling (cool): positive
+      in the breach zone, zero or negative inside the band (the margin zone). The hold
+      decision exposes ``hold_zone`` ("breach" or "margin") and a non-negative
+      ``hold_depth_f`` (0.0 inside the band).
+
+Going deeper than the tolerance past the edge ALWAYS switches at once (R1). The
+hysteresis-gap ("keep current family") path is unchanged, never when the current family
+is unknown (adoption), and a hold never moves the dwell clock. When the window lapses a
+margin switch proceeds normally (the 600 s dwell lock still applies to non-breach switches).
 
 Capabilities: heat-only thermostat -> heating; cool-only -> cooling; neither ->
 NOT_APPLICABLE. Nat-vent or whole-house-fan owning the HVAC, or missing
@@ -23,20 +48,12 @@ indoor/floor/ceiling -> NOT_APPLICABLE. Manual override, door/window pause and
 occupancy are NOT inputs: callers run before this leaf and skip it.
 
 TOU banking (Issue #1066 F1): an ACTIVE time-of-use precondition (the scheduler's
-``PRECONDITIONING`` phase, i.e. banking toward an upcoming high-cost window) also makes the
-leaf NOT_APPLICABLE, exactly like nat-vent/WHF. The bank deliberately drives the setpoint
-to the comfort edge OPPOSITE the day's reactive one (cool to the floor, or heat to the
-ceiling); without the deferral the selector would flip the thermostat back at the first
-margin reading and the next TOU write would re-bank it (heat and cool alternating).
-Breach during banking is deliberately NOT carved out: the scheduler's banking target IS a
-comfort edge (``resolve_comfort_heat``/``resolve_comfort_cool``, sleep-aware), the phase is
-bounded by the cost window start, and once the phase ends the selector resumes on the very
-next cycle (``docs/scheduler-spec.md`` "Coast Phase": comfort wins after the bank, via the
-normal band). The accepted residual risk is only sensor/thermostat overshoot past the bank
-target for the duration of the lead window (30-240 min).
+``PRECONDITIONING`` phase) makes the leaf NOT_APPLICABLE, exactly like nat-vent/WHF;
+once the phase ends the selector resumes and the settling guard holds the shallow
+bank overshoot (Issue #1071 is closed by the guard, not by a TOU special case).
 
 The leaf is stateless and has no Home Assistant imports. It never enforces a
-dwell lock — ``comfort_family_fsm.py`` owns the anti-chatter timer and lets any
+dwell lock -- ``comfort_family_fsm.py`` owns the anti-chatter timer and lets any
 breach decision through regardless of it.
 """
 
@@ -77,6 +94,15 @@ class ComfortFamilyDecision:
     margin_applied_f: float | None = None
     heat_zone_limit_f: float | None = None  # floor + m
     cool_zone_limit_f: float | None = None  # ceiling - m
+    # Issue #1073 settling guard: True when a breach SWITCH was held. ``target_family`` is then the
+    # current family; the fields below describe why (for the shell's log / activity event).
+    held: bool = False
+    hold_candidate_family: str | None = None  # the family the breach wanted
+    hold_depth_f: float | None = None  # non-negative; 0.0 inside the band
+    hold_zone: str | None = None  # "breach" (past the edge) or "margin" (inside the band)
+    hold_tolerance_f: float | None = None
+    opposite_ran_min_ago: float | None = None
+    hold_window_min: float | None = None
 
 
 @dataclass(frozen=True)
@@ -96,13 +122,24 @@ class ComfortFamilyInputs:
     supports_cool: bool = True
     # A TOU precondition (banking toward a high-cost window) owns the thermostat.
     tou_precondition_active: bool = False
+    # Issue #1073 settling guard inputs (all pre-computed by the shell; the leaf reads no clock).
+    # tolerance_f: the day type's comfort_deadband_*_f. Note: only a non-positive ``recency_window_min`` (or
+    # an unknown ran time) disables the guard; tolerance 0.0 still HOLDS the margin zone (distance <= 0) and
+    # only releases once the house is any distance past the edge.
+    tolerance_f: float = 0.0
+    # The day's native family ("cooling" hot/warm, "heating" cool/cold, None mild/unknown).
+    native_family: str | None = None
+    # Minutes since the family being LEFT (current_family) ran or was commanded; None = unknown.
+    opposite_ran_min_ago: float | None = None
+    # comfort_family_recency_window_min; 0.0 (default) disables the guard.
+    recency_window_min: float = 0.0
 
 
 def _native_family(day_type: str | None) -> str | None:
     """The day's native comfort family, or ``None`` for a day type with no strong preference.
 
-    Not part of the arming decision (Design D ignores the day type). Kept because the comfort-stall
-    detector (``coordinator._check_comfort_stall`` via ``comfort_stall_decision.stall_margins``) still asks
+    Not part of nearest-edge arming. Used by the settling guard (Issue #1073: the native side has
+    tolerance 0) and by the comfort-stall detector (``comfort_stall_decision.stall_margins``), which asks
     which direction a day type favors when it scales its per-direction stall margins.
     """
     if day_type in (DAY_TYPE_HOT, DAY_TYPE_WARM):
@@ -123,6 +160,45 @@ def effective_margin(margin_f: float, floor: float, ceiling: float) -> float | N
     if m < COMFORT_MIN_USABLE_MARGIN_F:
         return None
     return m
+
+
+def _settling_hold(
+    inputs: ComfortFamilyInputs, target: str, past_edge: float, margin: float | None
+) -> ComfortFamilyDecision | None:
+    """Issue #1073: the settling guard. Returns a HOLD decision, or None when the switch proceeds.
+
+    ``past_edge`` is the SIGNED distance past the target edge: positive when the house is beyond
+    it (breach zone), zero or negative when still inside the band (margin zone).
+    """
+    current = inputs.current_family
+    if current is None or target == current:
+        return None  # adoption (unknown family) or no switch: nothing to hold
+    if inputs.native_family is not None and target == inputs.native_family:
+        return None  # the day's native side is never delayed (tolerance 0)
+    ran = inputs.opposite_ran_min_ago
+    if ran is None or ran < 0.0 or inputs.recency_window_min <= 0.0 or ran >= inputs.recency_window_min:
+        return None  # the family being left did not run recently
+    if past_edge > inputs.tolerance_f:
+        return None  # R1: deeper than the tolerance past the edge always switches at once
+    depth = max(0.0, past_edge)
+    zone = "breach" if past_edge > 0.0 else "margin"
+    return ComfortFamilyDecision(
+        outcome=ComfortFamilyOutcome.HOLD,
+        target_family=current,
+        reason=(
+            f"settling guard: {current} ran {ran:.0f} min ago (window {inputs.recency_window_min:.0f} min),"
+            f" {zone} zone depth {depth:.1f}F <= tolerance {inputs.tolerance_f:.1f}F -- holding {current}"
+        ),
+        breach=past_edge > 0.0,
+        margin_applied_f=margin,
+        held=True,
+        hold_candidate_family=target,
+        hold_depth_f=depth,
+        hold_zone=zone,
+        hold_tolerance_f=inputs.tolerance_f,
+        opposite_ran_min_ago=ran,
+        hold_window_min=inputs.recency_window_min,
+    )
 
 
 def _decision(
@@ -188,6 +264,9 @@ def decide_comfort_family(inputs: ComfortFamilyInputs) -> ComfortFamilyDecision:
     cool_limit = ceiling - m if m is not None else None
 
     if indoor < floor:
+        held = _settling_hold(inputs, _FAMILY_HEATING, floor - indoor, m)
+        if held is not None:
+            return held
         return _decision(
             inputs,
             _FAMILY_HEATING,
@@ -198,6 +277,9 @@ def decide_comfort_family(inputs: ComfortFamilyInputs) -> ComfortFamilyDecision:
             cool_limit=cool_limit,
         )
     if indoor > ceiling:
+        held = _settling_hold(inputs, _FAMILY_COOLING, indoor - ceiling, m)
+        if held is not None:
+            return held
         return _decision(
             inputs,
             _FAMILY_COOLING,
@@ -213,6 +295,9 @@ def decide_comfort_family(inputs: ComfortFamilyInputs) -> ComfortFamilyDecision:
         return _decision(inputs, target, "band too narrow for interior switching", margin=m)
 
     if indoor <= heat_limit:
+        held = _settling_hold(inputs, _FAMILY_HEATING, floor - indoor, m)
+        if held is not None:
+            return held
         return _decision(
             inputs,
             _FAMILY_HEATING,
@@ -222,6 +307,9 @@ def decide_comfort_family(inputs: ComfortFamilyInputs) -> ComfortFamilyDecision:
             cool_limit=cool_limit,
         )
     if indoor >= cool_limit:
+        held = _settling_hold(inputs, _FAMILY_COOLING, indoor - ceiling, m)
+        if held is not None:
+            return held
         return _decision(
             inputs,
             _FAMILY_COOLING,

@@ -264,12 +264,14 @@ def _build_control_quality_section(coordinator: Any, config: dict[str, Any]) -> 
         engine = getattr(coordinator, "automation_engine", None)
         changes = getattr(engine, "comfort_mode_changes", None)
         history = getattr(coordinator, "_indoor_temp_history", None)
+        holds = getattr(engine, "comfort_holds", None)
         return build_control_quality(
             now=now,
             mode_changes=list(changes) if isinstance(changes, list) else [],
             chart_entries=entries,
             indoor_history=list(history) if isinstance(history, list) else None,
             temp_unit=config.get("temp_unit", "fahrenheit"),
+            comfort_holds=list(holds) if isinstance(holds, list) else None,
         )
     except Exception:  # noqa: BLE001 - diagnostics must never raise
         _LOGGER.debug("control_quality section unavailable", exc_info=True)
@@ -400,7 +402,13 @@ def _render_control_quality(cq: Any) -> list[str]:
             pair("misarmed", "minutes"),
             pair("mode_changes", "count"),
             pair("prediction_error", "horizons", "60m", "mean_abs_f"),
-        )
+        ),
+        "  settling_guard (24h / 7d): holds={} hold_min={} recovered_share={} max_depth_f={}".format(
+            pair("settling_guard", "hold_episodes"),
+            pair("settling_guard", "hold_minutes_total"),
+            pair("settling_guard", "recovered_share"),
+            pair("settling_guard", "max_depth_f"),
+        ),
     ]
 
 

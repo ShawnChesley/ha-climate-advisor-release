@@ -4267,8 +4267,10 @@ class TestDeactivateFanRestoresStrandedHvacSuppression:
 
         asyncio.run(engine._deactivate_fan(reason="door/window closed", restore_hvac=True))
 
-        engine._emit_event_callback.assert_called_once()
-        event_name, payload = engine._emit_event_callback.call_args.args
+        # Issue #1073: the restore's real mode change also emits an orthogonal thermostat_mode_set audit row.
+        _calls = [c.args for c in engine._emit_event_callback.call_args_list if c.args[0] != "thermostat_mode_set"]
+        assert len(_calls) == 1
+        event_name, payload = _calls[0]
         assert event_name == "stranded_hvac_suppression_restored"
         assert payload["restore_mode"] == "cool"
 

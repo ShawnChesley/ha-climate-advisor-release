@@ -35,9 +35,11 @@ from .const import (
     COMFORT_DEADBAND_MILD_MIN_F,
     COMFORT_DEADBAND_WARM_MAX_F,
     COMFORT_DEADBAND_WARM_MIN_F,
+    COMFORT_HOLD_LOG_CAP,
     COMFORT_MODE_CHANGE_LOG_CAP,
     COMFORT_MODE_SWITCH_MIN_INTERVAL_S,
     COMFORT_REACTIVE_RETRY_S,
+    COMFORT_RECENT_COMMAND_WINDOW_S,
     CONF_ADAPTIVE_PREHEAT,
     CONF_ADAPTIVE_SETBACK,
     CONF_AUTOMATION_GRACE_NOTIFY,
@@ -154,6 +156,7 @@ from .classification_fsm import (
     ClassificationFsmInputs,
 )
 from .classification_fsm import transition as _classification_fsm_transition
+from .comfort_family_decision import COMFORT_MIN_ARMING_MARGIN_F, _native_family
 from .comfort_family_fsm import (
     ComfortFamilyDwellState,
     ComfortFamilyEvent,
@@ -259,7 +262,23 @@ from .thermal_lead_time import compute_lead_minutes_from_rate
 _LOGGER = logging.getLogger(__name__)
 
 # Issue #1066: allowed reason codes / keys for commanded-mode ring-buffer entries.
-_MODE_CHANGE_REASONS = frozenset({"selector", "pause", "restore", "other"})
+_MODE_CHANGE_REASONS = frozenset(
+    {"selector", "pause", "restore", "tou", "ode_guard", "nat_vent", "user", "startup", "other"}
+)
+# Issue #1073 (M1): the activity-record ``reason`` for ``thermostat_mode_set`` is ALWAYS one of these fixed
+# labels, keyed by the ring-buffer reason code -- never free text. Callers' reason strings can carry an entity
+# id (door/window pause) or a TOU schedule id, and activity records end up in public GitHub issues.
+_MODE_SET_REASON_LABELS: dict[str, str] = {
+    "selector": "comfort range decision",
+    "pause": "door or window opened",
+    "restore": "restoring after a pause",
+    "tou": "time-of-use schedule",
+    "ode_guard": "predicted ceiling breach",
+    "nat_vent": "natural ventilation",
+    "user": "you changed it at the thermostat",
+    "startup": "startup",
+    "other": "other",
+}
 _MODE_CHANGE_STR_KEYS = ("ts", "from_mode", "to_mode", "reason")
 _MODE_CHANGE_NUM_KEYS = ("indoor_f", "floor_f", "ceiling_f", "margin_f")
 
@@ -293,6 +312,47 @@ def _sanitize_mode_change(item: Any) -> dict[str, Any] | None:
         else:
             clean[key] = float(val)
     return clean
+
+
+def _sanitize_comfort_hold(item: Any) -> dict[str, Any] | None:
+    """Return a type-validated copy of one persisted hold episode, or None if unusable (Issue #1073)."""
+    if not isinstance(item, dict):
+        return None
+
+    def _iso(val: Any) -> str | None:
+        if not isinstance(val, str):
+            return None
+        try:
+            datetime.fromisoformat(val)
+        except ValueError:
+            return None
+        return val
+
+    start = _iso(item.get("start_ts"))
+    if start is None:
+        return None
+    end_raw = item.get("end_ts")
+    end = _iso(end_raw)
+    if end_raw is not None and end is None:
+        return None
+    family = item.get("candidate_family")
+    if family not in ("heating", "cooling"):
+        return None
+    end_reason = item.get("end_reason") if item.get("end_reason") in ("recovered", "switched", "lapsed") else None
+    conf = item.get("model_confidence") if item.get("model_confidence") in ("none", "low", "medium", "high") else None
+
+    def _num(val: Any) -> float | None:
+        return None if isinstance(val, bool) or not isinstance(val, int | float) else float(val)
+
+    return {
+        "start_ts": start,
+        "end_ts": end,
+        "end_reason": end_reason if end is not None else None,
+        "candidate_family": family,
+        "max_depth_f": _num(item.get("max_depth_f")),
+        "tolerance_f": _num(item.get("tolerance_f")),
+        "model_confidence": conf,
+    }
 
 
 class FanCommandResult(Enum):
@@ -856,6 +916,22 @@ def compute_bedtime_setback(
         return min(raw, floor)
 
 
+_DELIBERATE_MODE_REASONS: frozenset[str] = frozenset({"user", "tou", "ode_guard"})
+# Issue #1073: a settling-guard hold that re-enters within this many seconds of the previous episode's end
+# (same candidate) reopens that episode rather than starting a new one.
+_COMFORT_HOLD_MERGE_S = 600.0
+# Issue #1073: thermostat states that are NOT a real HVAC mode (availability / empty placeholders).
+_NON_MODE_STATES = frozenset({"", "unavailable", "unknown"})
+
+
+def _real_hvac_mode(value: Any) -> str | None:
+    """``value`` when it is a real thermostat HVAC mode string, else None (unavailable / unknown / empty / non-str).
+
+    The ONE filter shared by the live-mode read (``_live_hvac_state``) and the user-change recorder, so a
+    thermostat that is merely unreachable never produces a fake mode change."""
+    return value if isinstance(value, str) and value not in _NON_MODE_STATES else None
+
+
 @dataclass
 class AutomationEngineCallbacks:
     """Bundle of the 9 callbacks the coordinator wires onto an AutomationEngine.
@@ -1284,6 +1360,14 @@ class AutomationEngine:
         # persisted in the existing state file; read by the control-quality report).
         self._last_selector_margin: float | None = None
         self._last_comfort_switch: dict[str, Any] | None = None
+        # Issue #1073: the settling guard's current hold (None when not holding) and the signature
+        # (candidate, current) it was last logged under, so INFO fires once per hold, not per reading.
+        self._last_comfort_hold: dict[str, Any] | None = None
+        self._comfort_hold_signature: tuple[str, str] | None = None
+        # Issue #1073 (S7): capped, persisted log of settling-guard hold episodes (control_quality).
+        # ``_comfort_hold_episode`` is the OPEN episode (also the last element of the list).
+        self._comfort_holds: list[dict[str, Any]] = []
+        self._comfort_hold_episode: dict[str, Any] | None = None
         self._comfort_mode_changes: deque[dict[str, Any]] = deque(maxlen=COMFORT_MODE_CHANGE_LOG_CAP)
         self._mode_change_reason: str = "other"
         # Issue #1066 (F1): TOU banking window. Set by the coordinator each cycle
@@ -2626,6 +2710,18 @@ class AutomationEngine:
         self._close_mode_episode_quietly("manual override detected")
         state = self.hass.states.get(self.climate_entity)
         detected_mode = state.state if state else "unknown"
+        # Issue #1073 (S3): a user-initiated MODE change is a mode change like any other -- it
+        # must move the one mode-change clock (the ring buffer), so a selector switch moments
+        # later is dwell-locked instead of undoing the occupant's action. Setpoint-only
+        # overrides change no mode and are not recorded.
+        if source != "setpoint":
+            _user_mode = new_mode if isinstance(new_mode, str) and new_mode else detected_mode
+            if _real_hvac_mode(_user_mode) is not None and _user_mode != old_mode:
+                self._append_mode_change(old_mode, _user_mode, "user")
+                # NOT updating ``_last_commanded_hvac_mode`` here (asked for, then reverted): the override
+                # self-resolve path compares the live mode with the last COMMAND, and the locked golden
+                # ``override_self_resolve_transient`` pins that. ``_record_commanded_mode`` instead judges a
+                # "real change" against the LIVE mode, so a CA write that reverses this user change is recorded.
         confirm_seconds = int(self.config.get(CONF_OVERRIDE_CONFIRM_PERIOD, DEFAULT_OVERRIDE_CONFIRM_SECONDS))
 
         # Issue #714: a manual override to an active HVAC mode structurally conflicts
@@ -2826,31 +2922,33 @@ class AutomationEngine:
         """
         if not self._manual_override_active or self._manual_override_mode is None:
             return False
+        # Setpoint-only overrides never adopt, whatever the mode: the mode may already agree while
+        # the user's chosen TEMPERATURE is a real, live disagreement; matching alone is not evidence
+        # the intent converged and adopting would silently drop their setpoint (Issue #483, kept by #1073).
         if self._manual_override_source == "setpoint":
             return False
         if classification is None:
             return False
-        if self._manual_override_mode != classification.hvac_mode:
-            return False
-        if classification.hvac_mode not in ("heat", "cool"):
-            # "off" (or any other non-setpoint mode): no setpoint to compare — mode match
-            # is sufficient evidence of convergence.
-            return True
+        if self._manual_override_mode not in ("heat", "cool"):
+            # "off" / heat_cool / auto: no setpoint to compare and no selector family -- the
+            # override matches only when automation's day mode is the same non-setpoint mode.
+            return self._manual_override_mode == classification.hvac_mode
 
-        band = select_comfort_band(
-            classification,
-            self.config,
-            occupancy_mode=self._occupancy_mode,
-            in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
-            aggressive_savings=bool(self.config.get("aggressive_savings", False)),
-        )
-        target_f = band.floor if classification.hvac_mode == "heat" else band.ceiling
+        # Issue #1073 (S6 / #1070): compare against what the SELECTOR would arm now and the RESOLVED
+        # band edge, not ``classification.hvac_mode`` / the flat band. On warm and mild days the
+        # classification mode is "off" while the selector still arms a family on the band, so the old
+        # comparison could never adopt a user's heat/cool there (and compared the wrong setpoint on
+        # sleep / away / aggressive-savings bands).
+        decision_mode, target_f = self._override_decision_mode_and_target(classification)
+        if decision_mode != self._manual_override_mode:
+            return False
+        if target_f is None:
+            return True
 
         state = self.hass.states.get(self.climate_entity) if self.hass else None
         raw_setpoint = state.attributes.get("temperature") if state else None
         if raw_setpoint is None:
-            # No live setpoint to compare against — nothing more precise available;
-            # mode match is the best evidence we have.
+            # No live setpoint to compare against -- mode match is the best evidence we have.
             return True
         unit = self._temp_unit
         try:
@@ -2858,6 +2956,46 @@ class AutomationEngine:
         except (TypeError, ValueError):
             return True
         return abs(current_f - target_f) <= OVERRIDE_ADOPT_SETPOINT_TOLERANCE_F
+
+    def _override_decision_mode_and_target(self, classification: DayClassification) -> tuple[str | None, float | None]:
+        """What automation would arm right now, for override adoption (Issue #1073, S6).
+
+        Returns ``(mode, target_f)``: ``mode`` is the comfort-edge selector's family ("heat" /
+        "cool") read WITHOUT mutating selector state (the same pure preview the reactive check
+        uses), and ``target_f`` the resolved band's edge for it. The day's default family comes from
+        the band's active edge, so a warm/mild day (classification mode "off") still resolves.
+        ``(None, None)`` when the selector does not apply (nat-vent / WHF / TOU bank owns the
+        thermostat, or a thermostat without the capability).
+        """
+        band = self._resolved_comfort_band(classification)
+        day_mode = {"ceiling": "cool", "floor": "heat"}.get(band.active, "cool")
+        now = dt_util.now()
+        try:
+            _, result = self._comfort_family_would_switch(
+                day_mode, floor=band.floor, ceiling=band.ceiling, now=now, day_type=classification.day_type
+            )
+        except Exception:  # noqa: BLE001 - adoption must degrade to "not adopted", never raise
+            _LOGGER.debug("Override adoption selector preview failed", exc_info=True)
+            return None, None
+        family = result.to_state
+        if result.locked_out or family is None:
+            family = result.from_state if result.from_state is not None else family
+        if family is None:
+            return None, None
+        mode = "heat" if family is ComfortFamilyState.HEATING else "cool"
+        return mode, (band.floor if mode == "heat" else band.ceiling)
+
+    def _override_match_inputs(self, classification: DayClassification | None) -> tuple[str | None, float | None]:
+        """``(decision_mode, target_f)`` exactly as ``_override_matches_current_decision()`` compares them.
+
+        Single source for production and the override/grace FSM's inputs (Issue #1073). Read-only.
+        A non-heat/cool override compares against ``classification.hvac_mode`` (no setpoint).
+        """
+        if classification is None:
+            return None, None
+        if self._manual_override_mode not in ("heat", "cool"):
+            return classification.hvac_mode, None
+        return self._override_decision_mode_and_target(classification)
 
     def _confirm_override_action(self, mode: str, source: str | None = None) -> bool:
         """Real side effect only (Issue #664): the non-FSM-derived manual-override
@@ -3096,6 +3234,7 @@ class AutomationEngine:
                         self._manual_override_mode,
                         self._manual_override_time,
                     )
+                    self._release_comfort_hold(dt_util.now())
                     return
 
             if self._override_confirm_pending:
@@ -3104,6 +3243,7 @@ class AutomationEngine:
                     self._override_confirm_mode,
                     self._override_confirm_time,
                 )
+                self._release_comfort_hold(dt_util.now())
                 return
 
             # Issue #498: occupancy/paused/nat-vent checks below now route through the single
@@ -3136,6 +3276,7 @@ class AutomationEngine:
 
             # Issue #337: while paused by open door/window, suppress the band and hold HVAC off.
             if _gate == ScheduledBandGate.DEFER_PAUSED:
+                self._release_comfort_hold(dt_util.now())
                 _LOGGER.info(
                     "apply_classification: door/window open (_paused_by_door=True) — "
                     "suppressing band, ensuring HVAC off; day_type=%s",
@@ -3147,10 +3288,11 @@ class AutomationEngine:
                         "apply_classification: thermostat in state=%r — forcing off (windows open)",
                         _cs_paused.state,
                     )
-                    await self._set_hvac_mode(
-                        "off",
-                        reason="classification cycle: door/window open — HVAC suppressed while paused",
-                    )
+                    with self._mode_change_context("pause"):
+                        await self._set_hvac_mode(
+                            "off",
+                            reason="classification cycle: door/window open — HVAC suppressed while paused",
+                        )
                 else:
                     _LOGGER.info("apply_classification: thermostat already off — no mode change needed (windows open)")
                 _paused_key = (classification.day_type, classification.hvac_mode)
@@ -3188,6 +3330,7 @@ class AutomationEngine:
             # compute select_comfort_band()/run the ODE ceiling guard just to have the result
             # dropped (Issue #392 Fix 1b's own rationale).
             if _gate == ScheduledBandGate.DEFER_NAT_VENT:
+                self._release_comfort_hold(dt_util.now())
                 _aggressive = bool(self.config.get("aggressive_savings", False))
                 # Issue #618: DEFER_NAT_VENT is natural_vent_active OR whf_owns_hvac() (see the
                 # comment above this block) — printing both disjuncts separately makes it
@@ -3517,7 +3660,7 @@ class AutomationEngine:
         finally:
             self._mode_change_reason = prior
 
-    def _record_commanded_mode(self, mode: str) -> None:
+    def _record_commanded_mode(self, mode: str, reason_text: str | None = None) -> None:
         """Single writer of ``_last_commanded_hvac_mode`` (Issue #1066).
 
         Besides the expected-state bookkeeping, appends one capped ring-buffer entry each
@@ -3525,8 +3668,32 @@ class AutomationEngine:
         misarmed minutes and switch latency at minute resolution (the chart log is ~30 min).
         """
         prev = getattr(self, "_last_commanded_hvac_mode", None)
+        # Issue #1073 (S3): a command that merely re-affirms the mode the thermostat is ALREADY in
+        # is not a mode change and must not move the mode-change clock. A command issued moments
+        # after the previous one (live state still lagging) is judged by ``prev`` alone.
+        _cmd_time = getattr(self, "_last_commanded_hvac_time", None)
+        try:
+            _recent_cmd = (
+                _cmd_time is not None
+                and abs((dt_util.now() - _cmd_time).total_seconds()) < COMFORT_RECENT_COMMAND_WINDOW_S
+            )
+        except TypeError:  # naive vs aware datetime mix: treat the earlier command as stale
+            _recent_cmd = False
         self._last_commanded_hvac_mode = mode
-        if prev == mode:
+        _live = self._live_hvac_state()
+        # Issue #1073 (M2): "is this a real change?" is judged against the LIVE thermostat mode, not CA's own
+        # last COMMAND -- an occupant who switched cool -> heat leaves ``prev`` at "cool", so a CA write of
+        # "cool" after the grace ends would otherwise look like a re-affirm and never be recorded. Judge by
+        # ``prev`` only when the live mode is unreadable or CA itself commanded moments ago (the entity lags).
+        if _live is not None and not _recent_cmd:
+            if _live == mode:
+                _LOGGER.debug(
+                    "Commanded HVAC mode re-affirms the live mode, not recorded as a change: zone=%s mode=%s",
+                    self.climate_entity,
+                    mode,
+                )
+                return
+        elif prev == mode:
             return
         if getattr(self, "_mode_change_reason", "other") != "selector":
             # Issue #1066 (review fix 3): the mode changed WITHOUT the comfort-edge selector (TOU
@@ -3536,6 +3703,27 @@ class AutomationEngine:
             # repeat and emit no INFO/event/_last_comfort_switch. Clear it on any non-selector
             # mode CHANGE (simpler than an age-based rule; same-mode re-assertions don't clear).
             self._last_resolved_family = None
+        # The "from" side is CA's last command when it differs; when CA is reversing an occupant's change
+        # (prev == mode) the thermostat was really in the live mode.
+        _from = _live if (prev == mode and _live is not None) else prev
+        self._append_mode_change(_from, mode, getattr(self, "_mode_change_reason", "other"), reason_text)
+
+    def _live_hvac_state(self) -> str | None:
+        """The thermostat's reported HVAC mode, or None when unreadable or not a real mode (unavailable/unknown)."""
+        try:
+            state = self.hass.states.get(self.climate_entity)
+        except Exception:  # noqa: BLE001 - bookkeeping must never break a mode write
+            return None
+        live = getattr(state, "state", None) if state is not None else None
+        return _real_hvac_mode(live)
+
+    def _append_mode_change(self, prev: str | None, mode: str, reason: str, reason_text: str | None = None) -> None:
+        """Append one entry to the capped mode-change ring buffer (the one mode-change clock).
+
+        Issue #1073 (S3): shared by the commanded-mode choke point (``_record_commanded_mode``)
+        and the user-initiated-change observer (``start_override_confirmation``), so every
+        writer that really changes the thermostat mode lands in the same persisted list.
+        """
         changes = getattr(self, "_comfort_mode_changes", None)
         if changes is None:
             changes = deque(maxlen=COMFORT_MODE_CHANGE_LOG_CAP)
@@ -3545,7 +3733,6 @@ class AutomationEngine:
             indoor = self._get_indoor_temp_f()
         except Exception:  # noqa: BLE001 - bookkeeping must never break a mode write
             indoor = None
-        reason = getattr(self, "_mode_change_reason", "other")
         entry = {
             "ts": dt_util.now().isoformat(),
             "from_mode": prev,
@@ -3558,7 +3745,8 @@ class AutomationEngine:
         }
         changes.append(entry)
         _LOGGER.info(
-            "Commanded HVAC mode changed: zone=%s from=%s to=%s indoor=%s floor=%s ceiling=%s margin=%s reason=%s",
+            "%s: zone=%s from=%s to=%s indoor=%s floor=%s ceiling=%s margin=%s reason=%s",
+            "User HVAC mode change recorded" if entry["reason"] == "user" else "Commanded HVAC mode changed",
             self.climate_entity,
             prev,
             mode,
@@ -3568,6 +3756,64 @@ class AutomationEngine:
             entry["margin_f"],
             entry["reason"],
         )
+        self._emit_thermostat_mode_set(entry, reason_text)
+
+    def _zone_label(self) -> str:
+        """Redacted zone label for activity events: always the generic ``"thermostat"``.
+
+        Activity records and log downloads end up in public GitHub issues and a friendly name can
+        reveal personal information, so neither the entity id nor the friendly name is ever used
+        (same convention as the generic "monitored door/window" labels). No hass lookup.
+        """
+        return "thermostat"
+
+    def _emit_thermostat_mode_set(self, entry: dict[str, Any], reason_text: str | None = None) -> None:
+        """Issue #1073 (S8b / D4): one ``thermostat_mode_set`` activity row per REAL mode change.
+
+        Called only from ``_append_mode_change`` (a re-affirm never reaches it), so this is the
+        single emission point for every writer: selector, restore, TOU, pause, nat-vent, ODE guard,
+        startup and the occupant's own change. Identical repeats of (from, to, reason) inside 120 s
+        are not re-announced. Never raises into the control path; no I/O (a plain callback).
+
+        ``reason`` is a FIXED label from ``_MODE_SET_REASON_LABELS`` (``reason_text`` is accepted for call
+        compatibility but never emitted: it may hold an entity id or a TOU schedule id -- Issue #1073 M1).
+
+        ``outcome`` is always ``"requested"``: the change is recorded BEFORE the awaited climate call
+        (so concurrent writes see it), so the row cannot claim the thermostat obeyed. Confirmation or
+        failure is shown by ``hvac_mode_applied_recovered`` / ``hvac_command_recovered`` /
+        ``hvac_mode_not_applied`` / ``hvac_write_blocked_whf_active`` (Issue #1049).
+        """
+        if not getattr(self, "_emit_event_callback", None):
+            return
+        try:
+            if self._recent_duplicate(
+                "thermostat_mode_set",
+                (entry["from_mode"], entry["to_mode"], entry["reason"]),
+                window_seconds=120,
+            ):
+                _LOGGER.debug(
+                    "thermostat_mode_set event suppressed -- identical change inside 120 s: from=%s to=%s reason=%s",
+                    entry["from_mode"],
+                    entry["to_mode"],
+                    entry["reason"],
+                )
+                return
+            self._emit_event_callback(
+                "thermostat_mode_set",
+                {
+                    "zone": self._zone_label(),
+                    "from_mode": entry["from_mode"],
+                    "to_mode": entry["to_mode"],
+                    "reason": _MODE_SET_REASON_LABELS.get(entry["reason"], "other"),
+                    "source": entry["reason"],
+                    "indoor_f": entry["indoor_f"],
+                    "floor_f": entry["floor_f"],
+                    "ceiling_f": entry["ceiling_f"],
+                    "outcome": "requested",
+                },
+            )
+        except Exception:  # noqa: BLE001 - observability must never break a mode write
+            _LOGGER.debug("thermostat_mode_set emission failed", exc_info=True)
 
     @property
     def comfort_mode_changes(self) -> list[dict[str, Any]]:
@@ -3874,7 +4120,7 @@ class AutomationEngine:
         _mode_seq = self._write_seq
         self._hvac_command_pending = True
         self._hvac_command_time = dt_util.now()
-        self._record_commanded_mode(mode)
+        self._record_commanded_mode(mode, reason)
         self._last_commanded_hvac_time = dt_util.now()
         _cs_reaffirm = self.hass.states.get(self.climate_entity)
         if _cs_reaffirm and _cs_reaffirm.state == mode:
@@ -4137,7 +4383,7 @@ class AutomationEngine:
         # hvac_mode is embedded in the set_temperature call, so register it as a
         # commanded mode change — coordinator uses these to suppress mode-change
         # echoes from CA's own writes (mirrors what _set_hvac_mode used to do).
-        self._record_commanded_mode(mode)
+        self._record_commanded_mode(mode, reason)
         self._last_commanded_hvac_time = _now
         self._hvac_command_time = _now
         try:
@@ -4351,6 +4597,55 @@ class AutomationEngine:
         self._record_action(f"Set temp to {format_temp(temperature, unit)} (mode={mode})", reason)
         return HvacCommandResult.EXECUTED if _call.ok else HvacCommandResult.UNCONFIRMED
 
+    def _resolved_comfort_band(self, c: DayClassification) -> ComfortBand:
+        """The comfort band in force right now for ``c`` (Issue #1073, S6): the SAME
+        ``select_comfort_band()`` inputs ``apply_classification()`` feeds ``_apply_comfort_band()``
+        (occupancy, sleep window, aggressive savings). Falls back to the flat
+        ``comfort_heat``/``comfort_cool`` band if the resolver cannot run, so a restore is never
+        skipped by a resolver fault (graceful degradation)."""
+        try:
+            return select_comfort_band(
+                c,
+                self.config,
+                occupancy_mode=self._occupancy_mode,
+                in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
+                aggressive_savings=bool(self.config.get("aggressive_savings", False)),
+            )
+        except Exception:  # noqa: BLE001 - a resolver fault must not strand a restore
+            _LOGGER.warning(
+                "Resolved comfort band unavailable, restoring on the flat comfort band: zone=%s",
+                self.climate_entity,
+                exc_info=True,
+            )
+            heat = float(self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
+            cool = float(self.config.get("comfort_cool", DEFAULT_COMFORT_COOL))
+            return ComfortBand(
+                floor=heat,
+                ceiling=cool,
+                active="floor" if getattr(c, "hvac_mode", None) == "heat" else "ceiling",
+                reason="flat comfort band (resolver unavailable)",
+            )
+
+    def _log_restore_via_selector(self, c: DayClassification, band: ComfortBand, mode: str, reason: str) -> None:
+        """Issue #1073 (S6): INFO line for a restore resolved through the selector on the resolved band."""
+        if mode not in ("heat", "cool"):
+            return
+        flat = float(self.config.get("comfort_heat" if mode == "heat" else "comfort_cool", 0.0))
+        edge = band.floor if mode == "heat" else band.ceiling
+        _LOGGER.info(
+            "Restore applied via selector: zone=%s reason=%s day_mode=%s resolved_mode=%s"
+            " band=[%s/%s] setpoint=%s flat_setpoint=%s band_changed_setpoint=%s",
+            self.climate_entity,
+            reason,
+            c.hvac_mode,
+            mode,
+            self._t(band.floor, 0),
+            self._t(band.ceiling, 0),
+            self._t(edge, 0),
+            self._t(flat, 0),
+            abs(edge - flat) > 1e-6,
+        )
+
     async def _set_temperature_for_mode(
         self,
         c: DayClassification,
@@ -4413,20 +4708,39 @@ class AutomationEngine:
         # explicit target_override (TOU pre-conditioning) bypasses the FSM entirely
         # via this call-site-level ternary — never threaded into the FSM as an input
         # flag — see this method's own docstring for why.
+        #
+        # Issue #1073 (S6 / #1070): a comfort RESTORE (target_override is None: door/window close,
+        # resume, nat-vent exit, economizer off, occupancy home, ...) is resolved against the SAME
+        # band ``_apply_comfort_band()`` arms -- sleep, away/vacation, aggressive savings -- not the
+        # flat comfort_heat/comfort_cool. The selector (and with it the settling guard, R6) therefore
+        # sees the real edges, and the setpoint written is the resolved band's edge for the family.
+        _band: ComfortBand | None = None
+        _resolved_floor: float | None = None
+        _resolved_ceiling: float | None = None
+        if target_override is None:
+            _band = self._resolved_comfort_band(c)
+            _resolved_floor = _band.floor
+            _resolved_ceiling = _band.ceiling
         _resolved_mode = (
             c.hvac_mode
             if target_override is not None
             else self._resolve_comfort_family_via_fsm(
                 c.hvac_mode,
-                floor=float(self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT)),
-                ceiling=float(self.config.get("comfort_cool", DEFAULT_COMFORT_COOL)),
+                floor=_resolved_floor,
+                ceiling=_resolved_ceiling,
                 now=dt_util.now(),
                 day_type=c.day_type,
             )
         )
+        if _band is not None:
+            self._log_restore_via_selector(c, _band, _resolved_mode, reason)
 
         if _resolved_mode == "heat":
-            floor_target = target_override if target_override is not None else float(self.config["comfort_heat"])
+            floor_target = (
+                target_override
+                if target_override is not None
+                else (_band.floor if _band is not None else float(self.config["comfort_heat"]))
+            )
             _write_result = await self._set_temperature(
                 floor_target, reason=reason, mode="heat", skip_setpoint_sanity_check=skip_setpoint_sanity_check
             )
@@ -4440,7 +4754,11 @@ class AutomationEngine:
             self._arm_comfort_family("heating", dt_util.now(), only_if_changed=True)
             return _write_result
         elif _resolved_mode == "cool":
-            ceiling_target = target_override if target_override is not None else float(self.config["comfort_cool"])
+            ceiling_target = (
+                target_override
+                if target_override is not None
+                else (_band.ceiling if _band is not None else float(self.config["comfort_cool"]))
+            )
             _write_result = await self._set_temperature(
                 ceiling_target, reason=reason, mode="cool", skip_setpoint_sanity_check=skip_setpoint_sanity_check
             )
@@ -4516,12 +4834,13 @@ class AutomationEngine:
             schedule_id,
             classification.hvac_mode,
         )
-        _tou_result = await self._set_temperature_for_mode(
-            classification,
-            reason=f"tou_precondition schedule={schedule_id}",
-            target_override=target,
-            skip_setpoint_sanity_check=True,
-        )
+        with self._mode_change_context("tou"):
+            _tou_result = await self._set_temperature_for_mode(
+                classification,
+                reason=f"tou_precondition schedule={schedule_id}",
+                target_override=target,
+                skip_setpoint_sanity_check=True,
+            )
 
         # Emit only when the write above actually banked toward `target` — not when
         # _set_temperature_for_mode() redirected to away/vacation setback (Issue #85),
@@ -4605,12 +4924,13 @@ class AutomationEngine:
             schedule_id,
             mode,
         )
-        _tou_av_result = await self._set_temperature(
-            target,
-            reason=f"tou_av_precondition schedule={schedule_id}",
-            mode=mode,
-            skip_setpoint_sanity_check=True,
-        )
+        with self._mode_change_context("tou"):
+            _tou_av_result = await self._set_temperature(
+                target,
+                reason=f"tou_av_precondition schedule={schedule_id}",
+                mode=mode,
+                skip_setpoint_sanity_check=True,
+            )
 
         _tou_av_outcome = hvac_outcome_label(_tou_av_result)
         _signature = (schedule_id, mode, round(target, 2), _tou_av_outcome)
@@ -5709,10 +6029,11 @@ class AutomationEngine:
                         if c.hvac_mode in ("heat", "cool"):
                             # Issue #1066 (F4): no blind _set_hvac_mode(c.hvac_mode) here -- the
                             # selector call below writes mode + setpoint in one explicit switch.
-                            await self._set_temperature_for_mode(
-                                c,
-                                reason="natural vent comfort-floor exit — restoring comfort",
-                            )
+                            with self._mode_change_context("nat_vent"):
+                                await self._set_temperature_for_mode(
+                                    c,
+                                    reason="natural vent comfort-floor exit — restoring comfort",
+                                )
                             self._start_grace_period("automation", trigger="nat_vent_exit_resume")
                     return
 
@@ -6623,11 +6944,14 @@ class AutomationEngine:
         if classification is None:
             return
         if self._manual_override_active or self._override_confirm_pending:
+            self._release_comfort_hold(dt_util.now())
             return
         if self._natural_vent_active or self._whf_owns_hvac():
             # Nat-vent/WHF owns HVAC -- the selector itself also defers (NOT_APPLICABLE).
+            self._release_comfort_hold(dt_util.now())
             return
         if self._tou_precondition_active(dt_util.now()):
+            self._release_comfort_hold(dt_util.now())
             # Issue #1066 (F1): a TOU precondition owns the thermostat -- the selector defers
             # (NOT_APPLICABLE) and a full re-classification here would undo the bank.
             _LOGGER.debug("Comfort family reactive tick: skipped -- TOU precondition owns HVAC")
@@ -6645,6 +6969,27 @@ class AutomationEngine:
             day_type=classification.day_type,
             indoor=current_temp,
         )
+        _held = preview.decision.held
+        if _held or (
+            not would_switch
+            and (
+                getattr(self, "_last_comfort_hold", None) is not None
+                or getattr(self, "_comfort_hold_episode", None) is not None
+            )
+        ):
+            # Issue #1073 (reviewer M-B): a hold that BEGINS or ENDS on a reactive tick must be recorded now (INFO
+            # line, event, Debug row, episode), not at the next 30-minute pass. ``_note_comfort_hold`` dedups by
+            # (candidate, current) signature, so repeated readings add no log spam; it writes no service call.
+            _now_note = dt_util.now()
+            _fsm_inputs, _ = self._comfort_family_inputs(
+                _day_mode,
+                floor=band.floor,
+                ceiling=band.ceiling,
+                now=_now_note,
+                day_type=classification.day_type,
+                indoor=current_temp,
+            )
+            self._note_comfort_hold(preview, _fsm_inputs, band.floor, band.ceiling, _now_note)
         if not would_switch:
             return
         if self._paused_by_door and not preview.decision.breach:
@@ -7362,10 +7707,11 @@ class AutomationEngine:
                         restore_mode,
                         reason="user resumed from door/window pause",
                     )
-                await self._set_temperature_for_mode(
-                    self._current_classification,
-                    reason="user resumed from door/window pause",
-                )
+                with self._mode_change_context("restore"):
+                    await self._set_temperature_for_mode(
+                        self._current_classification,
+                        reason="user resumed from door/window pause",
+                    )
 
         from .override_grace_fsm import OverrideGraceFsmEventKind as _OGFEventKind
 
@@ -8900,10 +9246,11 @@ class AutomationEngine:
             # _set_temperature_for_mode() so the resolver can correct it if conditions
             # (e.g. indoor now below comfort_heat) call for a different family.
             if self._current_classification:
-                await self._set_temperature_for_mode(
-                    self._current_classification,
-                    reason=f"nat-vent exit resume — {reason}",
-                )
+                with self._mode_change_context("nat_vent"):
+                    await self._set_temperature_for_mode(
+                        self._current_classification,
+                        reason=f"nat-vent exit resume — {reason}",
+                    )
             self._start_grace_period("automation", trigger="nat_vent_exit_resume")
             _log = _LOGGER.debug if result is FanCommandResult.RATE_LIMITED_DUP else _LOGGER.info
             _log("Nat-vent exit (%s): sensors closed — restoring HVAC and starting grace period", reason)
@@ -9513,16 +9860,10 @@ class AutomationEngine:
 
         current_setpoint_f: float | None = None
         target_setpoint_f: float | None = None
+        decision_mode, decision_target_f = self._override_match_inputs(classification)
         try:
-            if classification is not None and classification_mode in ("heat", "cool"):
-                band = select_comfort_band(
-                    classification,
-                    self.config,
-                    occupancy_mode=self._occupancy_mode,
-                    in_sleep_window=_in_sleep_window(now, self.config),
-                    aggressive_savings=bool(self.config.get("aggressive_savings", False)),
-                )
-                target_setpoint_f = band.floor if classification_mode == "heat" else band.ceiling
+            if classification is not None and decision_mode in ("heat", "cool"):
+                target_setpoint_f = decision_target_f
                 state = self.hass.states.get(self.climate_entity)
                 raw_setpoint = state.attributes.get("temperature") if state else None
                 if raw_setpoint is not None:
@@ -9558,6 +9899,8 @@ class AutomationEngine:
             grace_source=self._last_resume_source or "automation",
             now=now,
             grace_would_start=self._manual_grace_would_start(now),
+            decision_mode=decision_mode,
+            decision_mode_resolved=True,
         )
 
     def _grace_would_start(self, source: str, now: datetime) -> bool:
@@ -9982,10 +10325,16 @@ class AutomationEngine:
     }
 
     def _comfort_deadband_for_day_type(self, day_type: str | None) -> float:
-        """Issue #827 Design §1: resolve the configured (and clamped) against-grain
-        deadband for ``day_type``, defaulting to the mild/off tier when ``day_type``
-        is unknown (no classification yet) — the same conservative-tier fallback the
-        Design table specifies for an off-classified day."""
+        """Resolve the configured (and clamped) settling tolerance for ``day_type``
+        (Issue #1073; the ``comfort_deadband_{hot,warm,mild,cool,cold}_f`` settings).
+
+        Meaning: how far past a comfort edge the house may go, right after the opposite
+        mode ran, before the opposite mode is switched on; the day's natural side is never
+        delayed (the guard, not this helper, applies that exemption). Defaults to the
+        mild/off tier when ``day_type`` is unknown (no classification yet). Also read by
+        the comfort-stall detector (``comfort_stall_decision.stall_margins``) as the extra
+        distance past the edge before an against-grain stall is declared.
+        It is NOT the arming margin: that is the fixed ``COMFORT_MIN_ARMING_MARGIN_F``."""
         conf_key, default, lo, hi = self._COMFORT_DEADBAND_CONF_BY_DAY_TYPE.get(
             day_type, self._COMFORT_DEADBAND_CONF_BY_DAY_TYPE[DAY_TYPE_MILD]
         )
@@ -10014,14 +10363,88 @@ class AutomationEngine:
     def _minutes_since_heating_ended(self, *, now: datetime) -> float | None:
         """Issue #843: minutes since HVAC-heat activity was last seen active.
         No fan/nat-vent equivalent counts toward heating — asymmetric by
-        design (see comfort_family_decision.py's field docs)."""
-        return self._minutes_since_iso(getattr(self, "_last_hvac_heating_active", None), now=now)
+        design (see comfort_family_decision.py's field docs). Issue #1073 (S4): thin
+        delegate to the one "last ran" reader, ``minutes_since_equipment_ran()``."""
+        return self.minutes_since_equipment_ran("heat", now)
+
+    @staticmethod
+    def _direction_key(direction: str) -> str | None:
+        """Normalise "heat"/"heating" -> "heat" and "cool"/"cooling" -> "cool"; else None."""
+        return {"heat": "heat", "heating": "heat", "cool": "cool", "cooling": "cool"}.get(str(direction).lower())
+
+    def minutes_since_equipment_ran(self, direction: str, now: datetime) -> float | None:
+        """Issue #1073 (S4): the ONE "last ran" reader -- minutes since the heating/cooling
+        equipment was last seen active (``hvac_action``), or None if never / unknown.
+
+        Source: the engine's persisted ``_last_hvac_heating_active`` / ``_last_hvac_cooling_active``
+        ISO stamps, fed at event grain by the coordinator's thermostat listener
+        (``_note_equipment_activity``) and at cycle grain by ``_async_update_data``; they survive
+        a restart through ``get_serializable_state()``/``restore_state()``. Used by the ODE
+        ceiling guard's recency gate and available to the settling guard.
+        """
+        key = self._direction_key(direction)
+        if key is None:
+            return None
+        # A side that is running RIGHT NOW has "just run": the stamp alone only moves on hvac_action
+        # events/cycles, so read the live action too (0.0 min ago).
+        if self._live_hvac_action() == ("heating" if key == "heat" else "cooling"):
+            return 0.0
+        attr = "_last_hvac_heating_active" if key == "heat" else "_last_hvac_cooling_active"
+        return self._minutes_since_iso(getattr(self, attr, None), now=now)
+
+    def _live_hvac_action(self) -> str | None:
+        """The thermostat's reported ``hvac_action`` ("heating"/"cooling"/...) or None if unreadable."""
+        try:
+            state = self.hass.states.get(self.climate_entity)
+            attrs = getattr(state, "attributes", None) if state is not None else None
+            action = attrs.get("hvac_action") if isinstance(attrs, dict) else None
+        except Exception:  # noqa: BLE001 - a read helper must never break the selector
+            return None
+        return action.lower() if isinstance(action, str) else None
+
+    def _last_mode_change_time(
+        self, direction: str | None = None, reasons: frozenset[str] | None = None
+    ) -> datetime | None:
+        """Timestamp of the newest mode-change ring-buffer entry (optionally only those TO a
+        family), or None. The one mode-change clock (Issue #1073, S3); survives restart."""
+        key = self._direction_key(direction) if direction is not None else None
+        if direction is not None and key is None:
+            return None
+        newest: datetime | None = None
+        for entry in getattr(self, "_comfort_mode_changes", ()):
+            if key is not None and entry.get("to_mode") != key:
+                continue
+            if reasons is not None and entry.get("reason") not in reasons:
+                continue
+            try:
+                ts = datetime.fromisoformat(entry["ts"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            if newest is None or ts > newest:
+                newest = ts
+        return newest
+
+    def minutes_since_mode_set(
+        self, direction: str, now: datetime, reasons: frozenset[str] | None = None
+    ) -> float | None:
+        """Issue #1073 (S4): minutes since the thermostat was last changed TO ``direction``
+        ("heat"/"cool"; "heating"/"cooling" accepted) by ANY writer incl. the user, read from the
+        mode-change ring buffer. None if never. Lets the settling guard treat "commanded or
+        user-set recently" as "ran"."""
+        ts = self._last_mode_change_time(direction, reasons)
+        if ts is None:
+            return None
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        return (now - ts).total_seconds() / 60.0
 
     def _current_thermostat_family(self, now: datetime) -> ComfortFamilyState | None:
         """Issue #1066: the comfort family the thermostat is actually in right now.
 
-        A mode CA commanded less than 30 s ago wins over the live state (the thermostat
-        entity lags the command); otherwise the live ``climate`` state is the memory.
+        A mode CA commanded less than ``COMFORT_RECENT_COMMAND_WINDOW_S`` ago wins over the live
+        state (the thermostat entity lags the command); otherwise the live ``climate`` state is the memory.
         ``heat``/``cool`` map to a family; ``off``/``heat_cool``/``auto``/unavailable/None
         are "unknown" (None) and the selector falls back to the day's default family.
         """
@@ -10039,7 +10462,7 @@ class AutomationEngine:
         cmd_time = getattr(self, "_last_commanded_hvac_time", None)
         if cmd_mode is not None and cmd_time is not None:
             try:
-                if abs((now - cmd_time).total_seconds()) < 30:
+                if abs((now - cmd_time).total_seconds()) < COMFORT_RECENT_COMMAND_WINDOW_S:
                     mode = cmd_mode
             except TypeError:  # naive vs aware datetime mix: treat the command as stale
                 mode = None
@@ -10093,12 +10516,30 @@ class AutomationEngine:
         if day_type is None:
             day_type = self._current_classification.day_type if self._current_classification else None
         caps = self._get_thermostat_capabilities()
+        current_state = self._current_thermostat_family(now)
+        # Issue #1073 settling guard: minutes since the family being LEFT ran or was commanded.
+        # min() of the equipment clock and the mode-change clock; either None = unknown. The thermal
+        # model is deliberately not consulted (R7).
+        opposite_ran: float | None = None
+        if current_state is not None:
+            _cands = [
+                v
+                for v in (
+                    self.minutes_since_equipment_ran(current_state.value, now),
+                    # Only DELIBERATE commands count (user, TOU bank, ODE guard); a selector/restore/default
+                    # write says nothing about the equipment having run (the #1066 09:17 symptom).
+                    self.minutes_since_mode_set(current_state.value, now, _DELIBERATE_MODE_REASONS),
+                )
+                # A negative value is a future timestamp (clock jump / restore): unknown, not "just ran".
+                if v is not None and v >= 0.0
+            ]
+            opposite_ran = min(_cands) if _cands else None
         inputs = ComfortFamilyFsmInputs(
             default_family="heating" if day_mode == "heat" else "cooling",
             indoor=indoor if indoor is not None else self._get_indoor_temp_f(),
             floor=floor,
             ceiling=ceiling,
-            margin_f=self._comfort_deadband_for_day_type(day_type),
+            margin_f=COMFORT_MIN_ARMING_MARGIN_F,
             natural_vent_active=self._natural_vent_active,
             whf_owns_hvac=self._whf_owns_hvac(),
             now=now,
@@ -10108,8 +10549,15 @@ class AutomationEngine:
             supports_heat=caps.supports_heat,
             supports_cool=caps.supports_cool,
             tou_precondition_active=self._tou_precondition_active(now),
+            last_mode_change_at=self._last_mode_change_time(),
+            tolerance_f=self._comfort_deadband_for_day_type(day_type),
+            native_family=_native_family(day_type),
+            opposite_ran_min_ago=opposite_ran,
+            recency_window_min=float(
+                self.config.get(CONF_COMFORT_FAMILY_RECENCY_WINDOW_MIN, DEFAULT_COMFORT_FAMILY_RECENCY_WINDOW_MIN)
+            ),
         )
-        return inputs, self._current_thermostat_family(now)
+        return inputs, current_state
 
     def _comfort_family_would_switch(
         self,
@@ -10139,6 +10587,233 @@ class AutomationEngine:
         would = result.changed and not result.locked_out and (result.from_state is not None or result.decision.breach)
         return would, result
 
+    def _note_comfort_hold(
+        self,
+        result: ComfortFamilyTransition,
+        fsm_inputs: ComfortFamilyFsmInputs,
+        floor: float | None,
+        ceiling: float | None,
+        now: datetime,
+    ) -> None:
+        """Issue #1073: log/record the settling guard's hold. INFO + ``comfort_switch_held`` event once
+        when a hold begins or its (candidate, current) signature changes; DEBUG on repeats (the
+        reactive tick can run on every reading). ``_last_comfort_hold`` feeds the Debug-tab row and is
+        set to None as soon as an evaluation no longer holds. Every hold is also tracked as an episode
+        in the persisted ``comfort_holds`` log (S7)."""
+        decision = result.decision
+        if not decision.held:
+            # getattr-defensive: partial AutomationEngine stubs built via object.__new__() skip __init__.
+            if getattr(self, "_last_comfort_hold", None) is not None:
+                _LOGGER.debug("Comfort edge hold released: zone=%s", self.climate_entity)
+            self._last_comfort_hold = None
+            self._comfort_hold_signature = None
+            self._end_comfort_hold_episode(result, fsm_inputs, floor, ceiling, now)
+            return
+        current = result.from_state.value if result.from_state is not None else None
+        signature = (str(decision.hold_candidate_family), str(current))
+        is_new = signature != getattr(self, "_comfort_hold_signature", None)
+        self._comfort_hold_signature = signature
+        _ran = decision.opposite_ran_min_ago
+        _win = decision.hold_window_min
+        _until_ts: str | None = None
+        if isinstance(_ran, int | float) and isinstance(_win, int | float):
+            # Absolute expiry = (when the family last ran) + window = now + (window - minutes since).
+            _until_ts = (now + timedelta(minutes=max(0.0, float(_win) - float(_ran)))).isoformat()
+        self._last_comfort_hold = {
+            "ts": now.isoformat(),
+            "candidate_family": decision.hold_candidate_family,
+            "current_family": current,
+            "zone": decision.hold_zone,
+            "depth_f": decision.hold_depth_f,
+            "tolerance_f": decision.hold_tolerance_f,
+            "opposite_ran_min_ago": decision.opposite_ran_min_ago,
+            "window_min": decision.hold_window_min,
+            "until_ts": _until_ts,
+            "indoor_f": fsm_inputs.indoor,
+            "floor_f": floor,
+            "ceiling_f": ceiling,
+            "new": is_new,
+        }
+        merged = self._track_comfort_hold_episode(decision, now)
+        # One INFO line / event per (merged) episode: a reading that flickers across the edge re-enters
+        # the hold within minutes and must not inflate the log (the episode itself was reopened).
+        _announce = is_new and not merged
+        _log = _LOGGER.info if _announce else _LOGGER.debug
+        _log(
+            "Comfort edge switch held: zone=%s wants=%s current=%s hold_zone=%s indoor=%s floor=%s ceiling=%s"
+            " depth=%.1f tolerance=%.1f opposite_ran_min_ago=%.0f window_min=%.0f native=%s",
+            self.climate_entity,
+            decision.hold_candidate_family,
+            current,
+            decision.hold_zone,
+            fsm_inputs.indoor,
+            floor,
+            ceiling,
+            decision.hold_depth_f if decision.hold_depth_f is not None else 0.0,
+            decision.hold_tolerance_f if decision.hold_tolerance_f is not None else 0.0,
+            decision.opposite_ran_min_ago if decision.opposite_ran_min_ago is not None else -1.0,
+            decision.hold_window_min if decision.hold_window_min is not None else 0.0,
+            fsm_inputs.native_family,
+        )
+        if (
+            _announce
+            and getattr(self, "_emit_event_callback", None)
+            and not self._recent_duplicate(
+                "comfort_switch_held", (str(decision.hold_candidate_family), str(current)), window_seconds=600
+            )
+        ):
+            try:
+                self._emit_event_callback(
+                    "comfort_switch_held",
+                    {
+                        "candidate_family": decision.hold_candidate_family,
+                        "zone": decision.hold_zone,
+                        "depth_f": decision.hold_depth_f,
+                        "tolerance_f": decision.hold_tolerance_f,
+                        "opposite_ran_min_ago": decision.opposite_ran_min_ago,
+                        "window_min": decision.hold_window_min,
+                        "indoor_f": fsm_inputs.indoor,
+                        "floor_f": floor,
+                        "ceiling_f": ceiling,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - observability must never break the control path
+                _LOGGER.debug("comfort_switch_held emission failed", exc_info=True)
+
+    def _release_comfort_hold(self, now: datetime, reason: str = "lapsed") -> None:
+        """Issue #1073: the selector was SKIPPED this pass (TOU precondition, door/window pause, manual
+        override, nat-vent/WHF ownership), so a previously recorded hold is stale: clear the Debug row
+        and close the open episode. A no-op when nothing is held."""
+        if getattr(self, "_last_comfort_hold", None) is not None:
+            _LOGGER.debug("Comfort edge hold released: selector skipped (%s) zone=%s", reason, self.climate_entity)
+        self._last_comfort_hold = None
+        self._comfort_hold_signature = None
+        self._close_comfort_hold_episode(now, reason)
+
+    def _model_confidence_for_log(self) -> str | None:
+        """Thermal-model confidence label for the hold LOG only (S7). The guard itself never reads it (R7)."""
+        try:
+            conf = (getattr(self, "_thermal_model", None) or {}).get("confidence")
+        except Exception:  # noqa: BLE001 - logging aid only
+            return None
+        return conf if conf in ("none", "low", "medium", "high") else None
+
+    def _track_comfort_hold_episode(self, decision: Any, now: datetime) -> bool:
+        """Open a hold episode, or extend the open one (max depth). A different candidate closes the
+        previous episode first (the hold it described is over). A re-entry of the SAME candidate within
+        ``_COMFORT_HOLD_MERGE_S`` of the previous episode's end reopens that episode instead of adding a
+        new one (a flickering reading must not inflate the hold log). Returns True when merged/extended."""
+        episode = getattr(self, "_comfort_hold_episode", None)
+        candidate = decision.hold_candidate_family
+        if episode is not None and episode.get("candidate_family") != candidate:
+            self._close_comfort_hold_episode(now, "lapsed")
+            episode = None
+        depth = decision.hold_depth_f
+        merged = episode is not None
+        holds = getattr(self, "_comfort_holds", None)
+        if holds is None:
+            holds = []
+            self._comfort_holds = holds
+        if episode is None:
+            prev = holds[-1] if holds else None
+            if prev is not None and prev.get("candidate_family") == candidate and prev.get("end_ts"):
+                try:
+                    gap = (now - datetime.fromisoformat(prev["end_ts"])).total_seconds()
+                except (TypeError, ValueError):
+                    gap = None
+                if gap is not None and 0 <= gap <= _COMFORT_HOLD_MERGE_S:
+                    prev["end_ts"] = None
+                    prev["end_reason"] = None
+                    self._comfort_hold_episode = prev
+                    episode = prev
+                    merged = True
+        if episode is None:
+            episode = {
+                "start_ts": now.isoformat(),
+                "end_ts": None,
+                "end_reason": None,
+                "candidate_family": candidate,
+                "max_depth_f": float(depth) if isinstance(depth, int | float) else None,
+                "tolerance_f": decision.hold_tolerance_f,
+                "model_confidence": self._model_confidence_for_log(),
+            }
+            holds.append(episode)
+            del holds[: max(0, len(holds) - COMFORT_HOLD_LOG_CAP)]
+            self._comfort_hold_episode = episode
+            return False
+        if isinstance(depth, int | float):
+            prev_depth = episode.get("max_depth_f")
+            episode["max_depth_f"] = (
+                float(depth) if not isinstance(prev_depth, int | float) else max(prev_depth, float(depth))
+            )
+        return merged
+
+    def _close_comfort_hold_episode(self, now: datetime, reason: str) -> None:
+        episode = getattr(self, "_comfort_hold_episode", None)
+        if episode is None:
+            return
+        episode["end_ts"] = now.isoformat()
+        episode["end_reason"] = reason
+        self._comfort_hold_episode = None
+
+    def _end_comfort_hold_episode(
+        self,
+        result: ComfortFamilyTransition,
+        fsm_inputs: ComfortFamilyFsmInputs,
+        floor: float | None,
+        ceiling: float | None,
+        now: datetime,
+    ) -> None:
+        """The selector stopped holding: ``switched`` when the family moved to the held candidate,
+        ``recovered`` when indoor is back inside the band without a switch, ``lapsed`` otherwise."""
+        episode = getattr(self, "_comfort_hold_episode", None)
+        if episode is None:
+            return
+        indoor = fsm_inputs.indoor
+        if (
+            result.changed
+            and not result.locked_out
+            and result.to_state is not None
+            and result.to_state.value == episode.get("candidate_family")
+        ):
+            reason = "switched"
+        elif (
+            isinstance(indoor, int | float)
+            and isinstance(floor, int | float)
+            and isinstance(ceiling, int | float)
+            and floor <= indoor <= ceiling
+        ):
+            reason = "recovered"
+        else:
+            reason = "lapsed"
+        self._close_comfort_hold_episode(now, reason)
+        _LOGGER.info(
+            "Comfort edge hold ended: zone=%s candidate=%s end_reason=%s max_depth=%s indoor=%s",
+            self.climate_entity,
+            episode.get("candidate_family"),
+            reason,
+            episode.get("max_depth_f"),
+            indoor,
+        )
+
+    @property
+    def comfort_holds(self) -> list[dict[str, Any]]:
+        """Read-only copy of the settling-guard hold-episode log (Issue #1073, S7), oldest first."""
+        return [dict(e) for e in getattr(self, "_comfort_holds", ())]
+
+    def _restore_comfort_holds(self, raw: Any) -> None:
+        """Validate and load a persisted hold log; garbage is dropped, never raised. A trailing OPEN
+        episode is re-adopted so a hold that straddles a restart ends as one episode."""
+        clean_list: list[dict[str, Any]] = []
+        if isinstance(raw, list):
+            for item in raw[-COMFORT_HOLD_LOG_CAP:]:
+                clean = _sanitize_comfort_hold(item)
+                if clean is not None:
+                    clean_list.append(clean)
+        self._comfort_holds = clean_list
+        last = clean_list[-1] if clean_list else None
+        self._comfort_hold_episode = last if last is not None and last["end_ts"] is None else None
+
     def _resolve_comfort_family_via_fsm(
         self,
         day_mode: str,
@@ -10153,7 +10828,8 @@ class AutomationEngine:
 
         Consumed by BOTH ``_apply_comfort_band()`` (``floor``/``ceiling`` = the
         aggressive-savings-adjusted band edges) AND ``_set_temperature_for_mode()``
-        (flat ``comfort_heat``/``comfort_cool``). Only decides the family, never the
+        (Issue #1073: the RESOLVED band edges for a restore -- sleep / away / savings -- not the flat
+        ``comfort_heat``/``comfort_cool``, unless a ``target_override`` is passed). Only decides the family, never the
         temperature. The rule lives in ``comfort_family_decision.py``: indoor below the
         floor arms heat, above the ceiling arms cool (both ignore the dwell lock);
         within the arming margin of an edge arms that edge; in between keeps the family
@@ -10171,6 +10847,7 @@ class AutomationEngine:
             # leaf would say NOT_APPLICABLE too). Pin the plain band write to the direction being
             # banked so it cannot flip the mode that apply_tou_precondition() writes right after.
             _bank_mode = getattr(self, "_tou_precondition_mode", None)
+            self._release_comfort_hold(now)
             _LOGGER.debug(
                 "Comfort edge deferred: TOU precondition owns HVAC (zone=%s bank_mode=%s)",
                 self.climate_entity,
@@ -10207,6 +10884,8 @@ class AutomationEngine:
             fsm_inputs.whf_owns_hvac,
         )
 
+        self._note_comfort_hold(result, fsm_inputs, floor, ceiling, now)
+
         if result.locked_out:
             candidate_family = result.decision.target_family or ("heating" if day_mode == "heat" else "cooling")
             reason = result.decision.reason or "comfort-family switch lockout"
@@ -10238,22 +10917,27 @@ class AutomationEngine:
             # unknown live family (thermostat Off, ``from_state is None``: breach adoption) so an
             # Off thermostat that ignores commands is limited too (review fix 2).
             self._last_selector_write_attempt = (resolved_family, now)
-        if result.changed and result.from_state is not None and resolved_family == _previous_resolved:
+        # Issue #1073 (S8c): the prior family may be UNKNOWN (thermostat Off / heat_cool / unavailable,
+        # e.g. after a restart or a door-close pause). That is still a genuine arming decision, so it is
+        # logged and emitted too (``from_family`` = "unknown"); the unrealised-wish suppression below
+        # applies equally, so an Off thermostat that ignores commands is announced once, not per cycle.
+        _from_family = result.from_state.value if result.from_state is not None else "unknown"
+        if result.changed and resolved_family == _previous_resolved:
             # Same unrealised wish as last cycle (the thermostat has not followed yet): not a new
             # switch -- no second INFO line, event or Debug-tab record (Issue #1066 F2b).
             _LOGGER.debug(
                 "Comfort edge wish unchanged: zone=%s wants=%s thermostat_still=%s indoor=%s",
                 self.climate_entity,
                 resolved_family,
-                result.from_state.value,
+                _from_family,
                 fsm_inputs.indoor,
             )
-        elif result.changed and result.from_state is not None:
+        elif result.changed:
             _LOGGER.info(
                 "Comfort edge switched: zone=%s from=%s to=%s indoor=%s floor=%s ceiling=%s margin=%s breach=%s"
                 " reason=%s",
                 self.climate_entity,
-                result.from_state.value,
+                _from_family,
                 resolved_family,
                 fsm_inputs.indoor,
                 floor,
@@ -10264,7 +10948,7 @@ class AutomationEngine:
             )
             self._last_comfort_switch = {
                 "ts": now.isoformat(),
-                "from": result.from_state.value,
+                "from": _from_family,
                 "to": resolved_family,
                 "reason": result.decision.reason,
             }
@@ -10273,6 +10957,7 @@ class AutomationEngine:
                     "comfort_family_switch",
                     {
                         "resolved_family": resolved_family,
+                        "from_family": _from_family,
                         "reason": result.decision.reason,
                         "margin_applied_f": result.decision.margin_applied_f,
                         "indoor_f": fsm_inputs.indoor,
@@ -10467,7 +11152,7 @@ class AutomationEngine:
         # inside the window it defers to the live reactive checks instead of switching
         # preemptively. (The selector itself has no recency rule since Issue #1066; the
         # selector-preview skip below is the separate #1066 gate.)
-        _minutes_since_heat = self._minutes_since_heating_ended(now=dt_util.now())
+        _minutes_since_heat = self.minutes_since_equipment_ran("heat", dt_util.now())
         _recency_window = float(
             self.config.get(CONF_COMFORT_FAMILY_RECENCY_WINDOW_MIN, DEFAULT_COMFORT_FAMILY_RECENCY_WINDOW_MIN)
         )
@@ -10561,18 +11246,21 @@ class AutomationEngine:
         # Issue #1049: the comfort-band write earlier in this cycle already switched the
         # thermostat to cool (explicit mode switch, change 1) -- do not send a second
         # identical set_hvac_mode moments later.
-        if self._mode_switch_marker_recent("cool"):
-            _LOGGER.debug("ODE ceiling guard: mode already switched to cool this cycle -- skipping duplicate mode call")
-        else:
-            await self._set_hvac_mode(
-                "cool",
-                reason=(f"ODE ceiling guard — breach predicted at {_breach_ts.strftime('%H:%M')}"),
+        with self._mode_change_context("ode_guard"):
+            if self._mode_switch_marker_recent("cool"):
+                _LOGGER.debug(
+                    "ODE ceiling guard: mode already switched to cool this cycle -- skipping duplicate mode call"
+                )
+            else:
+                await self._set_hvac_mode(
+                    "cool",
+                    reason=(f"ODE ceiling guard — breach predicted at {_breach_ts.strftime('%H:%M')}"),
+                )
+            await self._set_temperature(
+                _comfort_cool_cg,
+                reason="ODE ceiling guard — target comfort_cool",
+                mode="cool",
             )
-        await self._set_temperature(
-            _comfort_cool_cg,
-            reason="ODE ceiling guard — target comfort_cool",
-            mode="cool",
-        )
         # Issue #843: this guard writes mode directly rather than going through
         # _resolve_comfort_family_via_fsm(), so it must arm the family state
         # itself — otherwise the FSM's own dwell/recency bookkeeping goes stale
@@ -10831,7 +11519,8 @@ class AutomationEngine:
                 )
         if decision.restore:
             self._occupancy_restore_deferred_pending = False
-            await self._set_temperature_for_mode(c, reason=f"occupancy home — restoring {c.hvac_mode} comfort")
+            with self._mode_change_context("restore"):
+                await self._set_temperature_for_mode(c, reason=f"occupancy home — restoring {c.hvac_mode} comfort")
             comfort = self.config["comfort_heat"] if c.hvac_mode == "heat" else self.config["comfort_cool"]
             if self._emit_event_callback:
                 self._emit_event_callback(
@@ -11206,7 +11895,8 @@ class AutomationEngine:
             detail=None,
             caller="_suppress_hvac_for_whf",
         )
-        await self._set_hvac_mode("off", reason=reason)
+        with self._mode_change_context("nat_vent"):
+            await self._set_hvac_mode("off", reason=reason)
         if self._emit_event_callback:
             self._emit_event_callback("whf_hvac_suppressed", {"prior_mode": prior_mode, "reason": reason})
 
@@ -12727,10 +13417,11 @@ class AutomationEngine:
                     _LOGGER.debug(
                         "_deactivate_fan: fan already inactive but restoring stranded HVAC suppression (%s)", reason
                     )
-                    await self._set_hvac_mode(
-                        _restore_mode,
-                        reason=f"whole-house fan already stopped — restoring HVAC mode ({_restore_mode})",
-                    )
+                    with self._mode_change_context("nat_vent"):
+                        await self._set_hvac_mode(
+                            _restore_mode,
+                            reason=f"whole-house fan already stopped — restoring HVAC mode ({_restore_mode})",
+                        )
                     # Issue #618: this is the "physical fan was already off, but a snapshot
                     # from an earlier session was still stranded" path — the exact case that
                     # was completely invisible in the dashboard Activity Record in the
@@ -12893,10 +13584,11 @@ class AutomationEngine:
                         # no selector call follows inside _deactivate_fan(). Callers that DO
                         # follow with _set_temperature_for_mode() (nat-vent comfort-floor exit)
                         # pass restore_hvac=False so the selector picks the mode.
-                        await self._set_hvac_mode(
-                            _restore_mode,
-                            reason=f"whole-house fan stopped — restoring HVAC mode ({_restore_mode})",
-                        )
+                        with self._mode_change_context("nat_vent"):
+                            await self._set_hvac_mode(
+                                _restore_mode,
+                                reason=f"whole-house fan stopped — restoring HVAC mode ({_restore_mode})",
+                            )
                     else:
                         _LOGGER.debug(
                             "_deactivate_fan: releasing stranded HVAC suppression without"
@@ -13258,10 +13950,11 @@ class AutomationEngine:
         if c and c.hvac_mode == "cool":
             # Issue #1066 (F4): no blind _set_hvac_mode("cool") first -- the selector call below
             # writes mode + setpoint (and may legitimately arm heat if the floor needs defending).
-            await self._set_temperature_for_mode(
-                c,
-                reason="economizer off — restoring comfort cooling",
-            )
+            with self._mode_change_context("restore"):
+                await self._set_temperature_for_mode(
+                    c,
+                    reason="economizer off — restoring comfort cooling",
+                )
         _LOGGER.info("Economizer deactivated: outdoor=%s", format_temp(outdoor_temp, unit))
 
     def _get_indoor_temp_f(self) -> float | None:
@@ -13413,6 +14106,7 @@ class AutomationEngine:
         self._last_natvent_active = state.get("last_natvent_active")
         # Issue #1066: commanded-mode change ring buffer (control-quality report) -- validated, capped.
         self._restore_comfort_mode_changes(state.get("comfort_mode_changes"))
+        self._restore_comfort_holds(state.get("comfort_holds"))
         self._fan_min_runtime_active = state.get("fan_min_runtime_active", False)
         self._pre_fan_hvac_mode = state.get("pre_fan_hvac_mode")
         # _fan_min_cycle_cancel / _fan_thermo_cancel are not serializable; timers restart
@@ -13624,6 +14318,8 @@ class AutomationEngine:
             "last_natvent_active": self._last_natvent_active,
             # Issue #1066: capped ring buffer, restored (validated) on restart.
             "comfort_mode_changes": self.comfort_mode_changes,
+            # Issue #1073 (S7): capped settling-guard hold episodes, restored (validated) on restart.
+            "comfort_holds": self.comfort_holds,
             "fan_override_active": self._fan_override_active,
             "fan_override_time": self._fan_override_time,
             # Issue #486: RF remote timer hours, for observability only — like the two

@@ -143,7 +143,8 @@ class TestHvacCommandResult:
         engine = _make_engine()
         engine.hass.services.async_call.side_effect = ServiceValidationError("mode not offered")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         assert asyncio.run(engine._set_hvac_mode("heat_cool", reason="t")) is HvacCommandResult.FAILED
         # Visible as one Activity Log row, but NOT an hvac_command_failed incident / episode.
         assert [n for n, _ in emitted] == ["hvac_mode_not_applied"]
@@ -166,7 +167,8 @@ class TestEpisodeGating:
     def test_repeated_failures_emit_once_then_one_recovery(self):
         engine = _make_engine()
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         engine.hass.services.async_call.side_effect = RuntimeError("boom")
 
         for _ in range(3):
@@ -189,7 +191,8 @@ class TestEpisodeGating:
     def test_success_with_no_open_episode_emits_nothing(self):
         engine = _make_engine()
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         asyncio.run(engine._set_hvac_mode("heat", reason="t"))
         assert emitted == []
 
@@ -198,7 +201,8 @@ class TestPayloadUnits:
     def test_failed_temperature_payload_setpoint_is_internal_fahrenheit_for_celsius_user(self):
         engine = _make_engine(temp_unit="celsius")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         engine.hass.services.async_call.side_effect = RuntimeError("boom")
         asyncio.run(engine._set_temperature(72.0, reason="t", mode="heat"))
         payload = emitted[0][1]
@@ -209,7 +213,8 @@ class TestPayloadUnits:
         engine = _make_engine()
         engine._occupancy_mode = "away"
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         engine.hass.services.async_call.side_effect = RuntimeError("boom")
         asyncio.run(engine._set_hvac_mode("heat", reason="t"))
         payload = emitted[0][1]
@@ -226,7 +231,8 @@ class TestPayloadUnits:
     def test_nudge_value_is_internal_fahrenheit_for_celsius_user(self):
         engine = _make_engine(temp_unit="celsius")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         wrong = MagicMock()
         wrong.state = "heat"
         wrong.attributes = {"temperature": 20.0}  # 68F reported vs 72F commanded

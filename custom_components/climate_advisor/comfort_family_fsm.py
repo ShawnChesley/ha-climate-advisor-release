@@ -1,5 +1,5 @@
 """Comfort-family FSM — anti-chatter wrapper around the nearest-edge leaf
-(Issue #1066, Design D; originally Issue #827).
+(Issue #1066, Design D; originally Issue #827; settling guard Issue #1073).
 
 Mirrors ``economizer_fsm.py``'s split: a pure decision leaf
 (``comfort_family_decision.py``) plus this thin transition layer.
@@ -12,6 +12,8 @@ Mirrors ``economizer_fsm.py``'s split: a pure decision leaf
 
 What this module owns that the leaf does not:
 
+0. **The settling guard lives in the leaf, not here.** A breach the leaf HOLDS (outcome HOLD,
+   ``decision.held``) is a non-SWITCH to this layer: the state stays and the dwell clock does not move.
 1. **Min-dwell anti-chatter (600 s default).** A non-breach SWITCH within
    ``min_dwell_seconds`` of the last genuine transition is locked out
    (``locked_out=True``, state held). A breach switch (indoor outside
@@ -19,9 +21,11 @@ What this module owns that the leaf does not:
    and advances the clock. ``dwell_since`` moves only on a genuine transition,
    never on HOLD/NOT_APPLICABLE/locked-out ticks.
 2. **The ``comfort_family_switch_locked_out`` signal** for the shell to emit.
-3. **Restart persistence — deliberately NOT persisted.** The real thermostat
-   mode is the memory: after a restart the shell derives ``current_state`` from
-   the thermostat itself, and a fresh process has no flapping history to guard.
+3. **Restart persistence.** ``dwell_since`` itself is not persisted; the real
+   thermostat mode is the memory for ``current_state``. The dwell clock, however,
+   is fed by ``ComfortFamilyFsmInputs.last_mode_change_at`` -- the newest entry of
+   the shell's persisted mode-change ring buffer (Issue #1073) -- so a mode change
+   by any writer (and one made just before a restart) still arms the lock.
 
 Supersedes the against-grain/candidate/recovery bookkeeping of
 #821/#827/#843/#858/#867. No Home Assistant imports.
@@ -82,6 +86,15 @@ class ComfortFamilyFsmInputs:
     supports_heat: bool = True
     supports_cool: bool = True
     tou_precondition_active: bool = False
+    # Issue #1073 (S3): timestamp of the newest thermostat MODE CHANGE by any writer (selector,
+    # restore, TOU, ODE guard, pause, nat-vent, user), read by the shell from the persisted
+    # mode-change ring buffer. Pure data: the leaf never touches the buffer or Home Assistant.
+    last_mode_change_at: datetime | None = None
+    # Issue #1073 settling guard inputs, passed straight to the leaf (see ComfortFamilyInputs).
+    tolerance_f: float = 0.0
+    native_family: str | None = None
+    opposite_ran_min_ago: float | None = None
+    recency_window_min: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,10 @@ def _leaf_inputs(inputs: ComfortFamilyFsmInputs, current_state: ComfortFamilySta
         supports_heat=inputs.supports_heat,
         supports_cool=inputs.supports_cool,
         tou_precondition_active=inputs.tou_precondition_active,
+        tolerance_f=inputs.tolerance_f,
+        native_family=inputs.native_family,
+        opposite_ran_min_ago=inputs.opposite_ran_min_ago,
+        recency_window_min=inputs.recency_window_min,
     )
 
 
@@ -160,8 +177,23 @@ def transition(
             at=inputs.now,
         )
 
-    if not decision.breach and state.dwell_since is not None:
-        elapsed = (inputs.now - state.dwell_since).total_seconds()
+    # Issue #1073 (S3): ONE mode-change clock. The lock runs from the newest mode change by ANY
+    # writer (persisted ring buffer, survives restart); ``state.dwell_since`` (selector-only,
+    # in-memory) is kept as a floor so a selector switch always counts even if the shell could
+    # not read the buffer.
+    _dwell_marks = [t for t in (state.dwell_since, inputs.last_mode_change_at) if t is not None]
+    dwell_since = None
+    for _mark in _dwell_marks:
+        try:
+            if dwell_since is None or _mark > dwell_since:
+                dwell_since = _mark
+        except TypeError:  # naive vs aware mix: ignore the unusable mark
+            continue
+    if not decision.breach and dwell_since is not None:
+        try:
+            elapsed = (inputs.now - dwell_since).total_seconds()
+        except TypeError:
+            elapsed = inputs.min_dwell_seconds  # unusable clock: do not lock
         if elapsed < inputs.min_dwell_seconds:
             return ComfortFamilyTransition(
                 from_state=current_state,

@@ -312,6 +312,8 @@ also now calls `cancel_override(reason="adopted_matching_decision")` instead of 
 `_cancel_grace_timers()` + `clear_manual_override()` in that order — the two existing call sites
 had drifted to opposite call orders, more evidence neither treated this as one canonical operation.
 
+**Post-override rule (Issue #1073, invariant R5):** when an override or grace ends, the system does not undo the user's action because of the overshoot it caused. The user's mode/setpoint counts as "that side ran" for the comfort-edge settling guard, so a shallow breach (within `comfort_deadband_{day_type}_f`) inside `comfort_family_recency_window_min` is held (`comfort_switch_held`) rather than flipped; a deeper breach still switches at once. Example: on a mild day the user cools the house by hand to 66 F (2 F under a 68 F floor); when grace expires the guard holds (depth 2 F equals the 2 F tolerance), and heat arms only if the house falls below 66 F or the window lapses. See [comfort-edge-selection-spec.md](comfort-edge-selection-spec.md).
+
 **Not folded into `clear_manual_override()` itself:** `clear_manual_override()` remains the
 low-level primitive used by `handle_bedtime()`, `handle_morning_wakeup()`, and the occupancy
 handlers — none of which should cancel grace (see [§ Occupancy Interaction](#occupancy-interaction)

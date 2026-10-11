@@ -220,6 +220,17 @@ UNMAPPED_PRODUCTION_EVENTS: frozenset[str] = frozenset(
         # write the switch causes is still visible as the comfort_band_applied / set_temperature action.
         "comfort_family_switch",
         "comfort_family_switch_locked_out",
+        # Issue #1073: thermostat_mode_set (one audit row per REAL thermostat mode change, emitted at
+        # the single mode-recording choke point) and comfort_switch_held (the settling guard's hold
+        # record) are audit rows, not HVAC decisions. thermostat_mode_set fires INSIDE the write a
+        # deciding event causes, so under last-decision-wins it shadowed classification_applied,
+        # setback_applied, resumed, ... in ~50 goldens. The previous semantics (unmapped ->
+        # 'unknown:<type>' decision) were wrong for the same reason as every sibling above. Cannot
+        # hide a real failure: the mode that was commanded is still asserted through engine state /
+        # action_log, and the deciding events still map; a held switch shows as the ABSENCE of a
+        # comfort_family_switch plus the live "comfort_family" engine attribute.
+        "thermostat_mode_set",
+        "comfort_switch_held",
     }
 )
 
