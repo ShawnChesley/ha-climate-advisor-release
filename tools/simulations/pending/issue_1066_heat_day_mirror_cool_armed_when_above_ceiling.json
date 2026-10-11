@@ -1,0 +1,122 @@
+{
+  "name": "issue_1066_heat_day_mirror_cool_armed_when_above_ceiling",
+  "description": "Mirror image of the cold-morning case. On a cold (heat-classified) day the house overheats to 76F, 2F above the 74F ceiling, with the thermostat still in heat. Nearest-edge arming must command cool immediately on the first evaluation (breach above the ceiling) even though the day's native family is heating, hold cool in the cool zone (73F), and re-arm heat once indoor falls to floor+m (70F). Before Issue #1066 cool was the against-grain direction on a cold day and needed a breach beyond the 5F cold deadband, so a 2F overshoot never reached the thermostat.",
+  "source": "Issue #1066 plan, symmetry requirement (the rule is symmetric: indoor > ceiling -> cooling immediately)",
+  "issue": 1066,
+  "notes": [
+    "Occupant impact: a house baking at 76F on a cold day must get cooling immediately instead of the furnace staying armed because the day is 'cold'.",
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: on origin/main comfort_family_decision.py treats a cold day as natively heating and cool as against-grain, gated by comfort_deadband_cold_f (default 5F) and a 90 s sustain. A 2F overshoot (76 vs 74) is WITHIN_DEADBAND forever, so the comfort_family_switch(cooling) event, comfort_family=cooling and last_hvac_mode=cool assertions at 12:00 would all fail on the old behavior.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f rule row 'indoor > ceiling -> cooling, breach: immediate' and the 'Hot/cold's 5 F default therefore becomes 2 F' margin note.",
+    "(c) Occupant outcome if this test fails to catch a regression: on a cold day with strong sun the home stays uncomfortably hot with only the furnace armed (the mirror of the cold-morning bug).",
+    "Classification fields: day_type=cold with hvac_mode=heat and windows_recommended=false match classifier.py (DAY_TYPE_COOL/DAY_TYPE_COLD -> hvac_mode heat; no window recommendation)."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "initial_thermostat_mode": "heat",
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-10-11T12:00:00",
+      "type": "temp_update",
+      "indoor_f": 76.0,
+      "outdoor_f": 40.0,
+      "note": "Sun and cooking push the house to 76F, 2F above the 74F ceiling, while the thermostat is still in heat from the cold morning."
+    },
+    {
+      "time": "2026-10-11T12:00:00",
+      "type": "classification",
+      "day_type": "cold",
+      "hvac_mode": "heat",
+      "windows_recommended": false,
+      "note": "Evaluation cycle at the same reading: Sun and cooking push the house to 76F, 2F above the 74F ceiling, while the thermostat is still in heat from the cold morning."
+    },
+    {
+      "time": "2026-10-11T12:40:00",
+      "type": "temp_update",
+      "indoor_f": 73.0,
+      "outdoor_f": 41.0,
+      "note": "73F: inside the cool zone (>= 72F): stays cool."
+    },
+    {
+      "time": "2026-10-11T12:40:00",
+      "type": "classification",
+      "day_type": "cold",
+      "hvac_mode": "heat",
+      "windows_recommended": false,
+      "note": "Evaluation cycle at the same reading: 73F: inside the cool zone (>= 72F): stays cool."
+    },
+    {
+      "time": "2026-10-11T16:00:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 38.0,
+      "note": "70F = floor+m: the mirror image, heat is re-armed before the floor is reached."
+    },
+    {
+      "time": "2026-10-11T16:00:00",
+      "type": "classification",
+      "day_type": "cold",
+      "hvac_mode": "heat",
+      "windows_recommended": false,
+      "note": "Evaluation cycle at the same reading: 70F = floor+m: the mirror image, heat is re-armed before the floor is reached."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-10-11T12:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "cooling",
+        "indoor_f": 76.0,
+        "breach": true
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Indoor 76F > ceiling 74F is a breach: cool is armed immediately even though the cold day's native family is heating."
+    },
+    {
+      "at": "2026-10-11T12:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_band_applied",
+      "payload_subset": {
+        "mode": "cool",
+        "active": "ceiling",
+        "indoor_f": 76.0
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The cool arm is a real command: a comfort band is sent in cool mode on the ceiling edge (74F) at 12:00, despite the cold-day classification (hvac_mode=heat)."
+    },
+    {
+      "at": "2026-10-11T16:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "heating",
+        "indoor_f": 70.0,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Indoor falls to floor+m = 70F: heat is re-armed ahead of the floor, a non-breach switch well after the dwell window."
+    },
+    {
+      "at": "2026-10-11T16:00:00",
+      "expect": "comfort_family",
+      "family": "heating",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Final family heating after the afternoon cools."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "On a cold day an above-ceiling reading arms cool immediately, cool holds in the cool zone, and heat returns at floor+m.",
+    "observed_behavior": "Cool armed at 12:00 (76F), held at 73F, heat re-armed at 70F.",
+    "expected_behavior": "The rule is symmetric: indoor > ceiling -> cooling immediately (docs/08 section 6f)."
+  }
+}

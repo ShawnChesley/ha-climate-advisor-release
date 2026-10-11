@@ -1,0 +1,297 @@
+{
+  "name": "issue_1066_mixed_day_heat_then_cool_then_heat",
+  "description": "A mild day that starts cold, warms past the ceiling and cools again by evening (the 'mixed day' from docs/08 section 6f). Band 68F/74F, arming margin 2F. The thermostat must follow the nearest edge: heat from the cold morning through 71F, flip to cool at 72F, stay cool through 73-75F and the 71F evening gap, and flip back to heat only at 70F. The commanded mode changes exactly three times across the day (cool -> heat, heat -> cool, cool -> heat).",
+  "source": "Issue #1066 plan, Design D 'mixed day' worked example (docs/08-COMPUTATION-REFERENCE.md section 6f)",
+  "issue": 1066,
+  "notes": [
+    "Occupant impact: the house is heated while it is cold, cooled when it overheats, and heated again as the evening cools, without ever running the wrong system and without chatter in between.",
+    "Three genuine mode changes from the initial cool: 06:30 heat (breach), 10:30 cool (indoor 72), 19:00 heat (indoor 70). Each is asserted as a comfort_family_switch event carrying the exact indoor reading. The switch event is emitted only on a genuine change, and the in-between readings (09:30 and 18:00 at 71F, inside the gap) are the ones that would produce extra changes if hysteresis broke; the final-state and never-cool-after-19:00 assertions catch that. The harness has no 'count of mode changes' assertion type, so an exact count is additionally covered by tests/test_nearest_edge_arming.py.",
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: on origin/main a mild day is natively cooling; heat needed a floor breach beyond the mild deadband, a recency check and a 90 s sustain, and the revert to cool needed a recovery margin plus sustain. The 19:00 heat arm at 70F (no breach: 70 > 68) cannot occur on the old design, and the 06:30 switch would not complete at the first reading, so the comfort_family_switch assertions and the final comfort_family=heating would fail.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f 'Mixed day, floor 68 F, ceiling 74 F, m = 2 F' table (06:30, 10:30, 14:00, 18:00 rows).",
+    "(c) Occupant outcome if this test fails to catch a regression: the evening cools below the floor with the AC still armed, or the morning sun overheats the house while the furnace is armed, for the length of a multi-step confirmation sequence.",
+    "Classification fields: day_type=mild, hvac_mode=off, windows_recommended=true with the classifier's 10:00/17:00 window times (classifier.py DAY_TYPE_MILD)."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "initial_thermostat_mode": "cool",
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-10-11T06:30:00",
+      "type": "temp_update",
+      "indoor_f": 66.0,
+      "outdoor_f": 45.0,
+      "note": "Cold start of the day: indoor 66F, below the 68F floor, thermostat left in cool -> breach, heat armed."
+    },
+    {
+      "time": "2026-10-11T06:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: Cold start of the day: indoor 66F, below the 68F floor, thermostat left in cool -> breach, heat armed."
+    },
+    {
+      "time": "2026-10-11T07:30:00",
+      "type": "temp_update",
+      "indoor_f": 68.0,
+      "outdoor_f": 47.0,
+      "note": "68F: at the floor, inside the heat arming zone (<= 70F) -> stays heat."
+    },
+    {
+      "time": "2026-10-11T07:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 68F: at the floor, inside the heat arming zone (<= 70F) -> stays heat."
+    },
+    {
+      "time": "2026-10-11T08:30:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 52.0,
+      "note": "70F = floor+m, inclusive -> still heat."
+    },
+    {
+      "time": "2026-10-11T08:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 70F = floor+m, inclusive -> still heat."
+    },
+    {
+      "time": "2026-10-11T09:30:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 58.0,
+      "note": "71F is inside the gap (70 < 71 < 72): keep the current mode, heat. This is the reading that used to need a 30-minute cycle to revert."
+    },
+    {
+      "time": "2026-10-11T09:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 71F is inside the gap (70 < 71 < 72): keep the current mode, heat. This is the reading that used to need a 30-minute cycle to revert."
+    },
+    {
+      "time": "2026-10-11T10:30:00",
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 63.0,
+      "note": "72F = ceiling-m (inclusive): flip to cool/74 now, before the ceiling is reached."
+    },
+    {
+      "time": "2026-10-11T10:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 72F = ceiling-m (inclusive): flip to cool/74 now, before the ceiling is reached."
+    },
+    {
+      "time": "2026-10-11T12:00:00",
+      "type": "temp_update",
+      "indoor_f": 73.0,
+      "outdoor_f": 66.0,
+      "note": "73F in the cool zone: stays cool."
+    },
+    {
+      "time": "2026-10-11T12:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 73F in the cool zone: stays cool."
+    },
+    {
+      "time": "2026-10-11T14:00:00",
+      "type": "temp_update",
+      "indoor_f": 75.0,
+      "outdoor_f": 69.0,
+      "note": "75F is above the 74F ceiling (breach): cool is armed and stays armed."
+    },
+    {
+      "time": "2026-10-11T14:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 75F is above the 74F ceiling (breach): cool is armed and stays armed."
+    },
+    {
+      "time": "2026-10-11T15:30:00",
+      "type": "temp_update",
+      "indoor_f": 74.0,
+      "outdoor_f": 68.0,
+      "note": "74F at the ceiling: stays cool."
+    },
+    {
+      "time": "2026-10-11T15:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 74F at the ceiling: stays cool."
+    },
+    {
+      "time": "2026-10-11T18:00:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 62.0,
+      "note": "71F back in the gap: keep cool (hysteresis memory), do NOT revert to heat yet."
+    },
+    {
+      "time": "2026-10-11T18:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 71F back in the gap: keep cool (hysteresis memory), do NOT revert to heat yet."
+    },
+    {
+      "time": "2026-10-11T19:00:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 58.0,
+      "note": "70F = floor+m: flip back to heat/68 before the floor is reached (non-breach, far beyond the 600 s dwell)."
+    },
+    {
+      "time": "2026-10-11T19:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 70F = floor+m: flip back to heat/68 before the floor is reached (non-breach, far beyond the 600 s dwell)."
+    },
+    {
+      "time": "2026-10-11T20:00:00",
+      "type": "temp_update",
+      "indoor_f": 69.0,
+      "outdoor_f": 55.0,
+      "note": "69F: heat zone, stays heat."
+    },
+    {
+      "time": "2026-10-11T20:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 69F: heat zone, stays heat."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-10-11T06:30:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "heating",
+        "indoor_f": 66.0,
+        "breach": true
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Indoor 66F is below the 68F floor: heat is armed on the first reading (breach)."
+    },
+    {
+      "at": "2026-10-11T10:30:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "cooling",
+        "indoor_f": 72.0,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Indoor reaches ceiling-m = 72F: the thermostat flips to cool/74 at the boundary, not after waiting for a breach. The 09:30 reading of 71F (inside the gap) left it in heat."
+    },
+    {
+      "at": "2026-10-11T10:30:00",
+      "expect": "event_emitted",
+      "event": "comfort_band_applied",
+      "payload_subset": {
+        "mode": "cool",
+        "active": "ceiling",
+        "indoor_f": 72.0
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The cool flip is a real command: a comfort band is sent in cool mode on the ceiling edge (74F) at 10:30."
+    },
+    {
+      "at": "2026-10-11T19:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "heating",
+        "indoor_f": 70.0,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Evening: indoor falls to floor+m = 70F and heat is armed before the floor is reached. The 18:00 reading of 71F (gap) had kept cool."
+    },
+    {
+      "at": "2026-10-11T20:00:00",
+      "expect": "comfort_family",
+      "family": "heating",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Final family is heating after the third change."
+    },
+    {
+      "at": "2026-10-11T20:00:00",
+      "expect": "last_hvac_mode",
+      "mode": "heat",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Final commanded mode is heat at comfort_heat."
+    },
+    {
+      "at": "2026-10-11T20:00:00",
+      "expect": "hvac_mode_never_commanded",
+      "forbidden_modes": [
+        "cool"
+      ],
+      "since": "2026-10-11T19:00:30",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "After the 19:00 heat arm, cool is never commanded again (no flap at the 69F reading)."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "On a mixed day the thermostat is armed on the nearest edge at every step: heat in the cold morning, cool from 72F, heat again from 70F in the evening.",
+    "observed_behavior": "Three genuine mode changes at 66F (breach), 72F and 70F; readings of 71F in the gap leave the mode untouched.",
+    "expected_behavior": "docs/08 section 6f mixed-day table."
+  }
+}

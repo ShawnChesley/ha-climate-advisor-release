@@ -1,155 +1,201 @@
 {
   "name": "issue_827_recovery_margin_prevents_sawtooth",
-  "description": "Extends issue_821_comfort_floor_fallback_no_confidence.json's own scenario shape past the point where the family first escalates to heating. Proves the new recovery-margin hysteresis (Design #1, new work -- neither ODE guard module had this before) is what prevents a naive same-threshold entry/exit pair from saw-toothing: (1) once escalated to heating, a small recovery just above the plain floor does NOT immediately revert (the recovery margin -- the same deadband value, applied in the comfort direction -- has not yet cleared); (2) only once indoor clears floor+margin AND sustain-confirms does it revert to the day's native family; (3) after reverting, a small dip back below the floor (within the plain deadband) does NOT immediately re-escalate -- the same deadband gate that protects entry also protects against an immediate re-flip right after a revert.",
-  "source": "Issue #827 Design #1 -- recovery-margin hysteresis on exit, and the Verification's own revert-test requirement ('neutralize the recovery-margin hysteresis -> saw-tooth scenario must fail').",
+  "description": "Hysteresis (anti-sawtooth) scenario, rewritten for Design D nearest-edge arming (Issue #1066, docs/08 section 6f; the #827 recovery-margin machinery it originally asserted is retired). Mild day, band 68F/74F, arming margin 2F (comfort_deadband_mild_f): heat is armed at indoor <= 70F, cool at indoor >= 72F, and 71F keeps whatever the thermostat is already doing. Readings that oscillate 70/71/70/71 inside the gap must NOT chatter the commanded mode; the mode changes only when indoor reaches an arming boundary, and a boundary reading inside the 600 s dwell window after a switch is held (locked out) rather than flipping the thermostat straight back.",
+  "source": "Issue #827 sawtooth-prevention intent, re-expressed for Issue #1066 Design D (nearest-edge arming with hysteresis memory instead of a recovery margin)",
   "issue": 827,
   "notes": [
+    "Rewritten for Issue #1066: the original scenario asserted the retired against-grain recovery margin (floor + deadband, 90 s sustain, native-family revert). That machinery is deleted. The intent it protected - no heat/cool sawtooth when indoor hovers near the floor - is now provided by (1) the strictly-between hysteresis rule (inside the gap the thermostat keeps its CURRENT mode) and (2) the 600 s dwell lock on non-breach switches.",
+    "Occupant impact: a house hovering in the middle of the comfort band must not hear the furnace and the AC trade places every few minutes.",
+    "Timeline (floor 68, ceiling 74, m=2): 08:00 indoor 69 -> heat. 08:10-08:25 readings 70, 71, 70, 71 stay in the heat zone / gap -> still heat. 08:40 reading 72 reaches ceiling-m -> cool (first legitimate boundary flip). 08:44 reading 70 reaches floor+m only 4 minutes later -> held by the 600 s dwell lock. 08:45-08:55 readings 71, 72, 71 -> stay cool. 09:10 reading 70 (30 minutes after the cool switch) -> heat. 09:15 reading 71 -> gap, stays heat. Exactly two genuine mode changes after the initial heat arm.",
     "Three-exercise protocol (CLAUDE.md #10):",
-    "(a) Scenario effectiveness (revert-test, per CLAUDE.md's Testing Requirements): if _decide_revert() in comfort_family_decision.py were reverted to a naive 'indoor >= floor' check (no recovery margin) instead of 'indoor >= floor + margin', the 08:40:00 tick would find indoor(71.5) >= floor(70) TRUE and revert to cooling immediately -- then the 08:50:00 dip below the floor again would re-arm a fresh heating candidate, and with enough repeated small oscillations the family would flap heating/cooling/heating (saw-tooth) instead of holding a stable state. This scenario's 08:40:00 assertion (comfort_family family read via expect_band ceiling-vs-floor -- see below) would FAIL under that reverted behavior, since the naive check would have already reverted to cooling (ceiling command) by then instead of still commanding heat (floor).",
-    "(b) Docs<->production alignment: docs/08-COMPUTATION-REFERENCE.md #6f documents the recovery-margin hysteresis and its saw-tooth-prevention rationale alongside this scenario as its test reference.",
-    "(c) Occupant experience: without a recovery margin, a home hovering right around its comfort floor (e.g. a cold front settling in) would have its HVAC mode flap between heat and cool every time indoor crosses the floor by even a fraction of a degree -- audible, wasteful short-cycling that erodes trust in the automation. With the recovery margin, once a genuine escalation happens, the system commits to it until indoor has recovered with real margin, then only reverts to the day's native family once that recovery genuinely holds -- and even then, a plain in-deadband dip right after the revert doesn't immediately re-trigger.",
-    "Uses the same config/day-type shape as issue_821_comfort_floor_fallback_no_confidence.json (warm day, comfort_heat=70F, comfort_deadband_warm_f default 2.0F) so the escalation timing (08:00 baseline -> 08:30 breach -> 08:32 confirm/escalate) is directly comparable -- this scenario picks up exactly where that one's own final assertion leaves off and adds the revert + post-revert-stability proof neither scenario covers on its own.",
-    "Recovery margin = comfort_deadband_warm_f = 2.0F (Design #1: 'gated by a recovery-margin -- not the entry deadband ... indoor must clear the floor/ceiling by deadband_against_grain_f in the comfort direction'). floor+margin = 70+2 = 72F."
+    "(a) Scenario effectiveness: on origin/main a mild day is natively cooling and heat is the against-grain direction, which required a floor breach beyond the deadband plus a 90 s sustain; indoor never goes below 68F here, so none of the heat switches asserted (or the cool/heat boundary flips at 72F/70F) would occur there. If the hysteresis memory were removed (re-deriving the edge from the day type inside the gap), the 71F readings would flip the mode and the 09:15 comfort_family=heating and 09:10 switch assertions would diverge. If the dwell lock were removed, the 08:44 reading would produce a heating switch instead of a comfort_family_switch_locked_out event.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f rule rows 'indoor <= floor + m -> heating', 'indoor >= ceiling - m -> cooling', 'strictly between -> the thermostat's actual current mode', and 'Reactive evaluation, dwell lock, decision memory'.",
+    "(c) Occupant outcome if this test fails to catch a regression: the HVAC would chatter between heating and cooling while the house sits comfortably mid-band, wasting energy and wearing out equipment.",
+    "Classification fields: day_type=mild with hvac_mode=off and windows_recommended=true match classifier.py's derivation for DAY_TYPE_MILD."
   ],
   "config": {
-    "comfort_heat": 70,
+    "comfort_heat": 68,
     "comfort_cool": 74,
-    "setback_heat": 62,
-    "setback_cool": 79,
+    "comfort_deadband_mild_f": 2.0,
+    "initial_thermostat_mode": "heat",
     "fan_mode": "disabled"
   },
   "events": [
     {
       "time": "2026-09-01T08:00:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "Baseline: warm day, comfort band arms at the ceiling (cool). base_family='cooling'."
-    },
-    {
-      "time": "2026-09-01T08:00:00",
-      "type": "temp_update",
-      "indoor_f": 71.0,
-      "outdoor_f": 60.0,
-      "note": "Indoor 71F, within band [70F, 74F]."
-    },
-    {
-      "time": "2026-09-01T08:30:00",
-      "type": "temp_update",
-      "indoor_f": 66.0,
-      "outdoor_f": 50.0,
-      "note": "Indoor decays to 66F, 4F below comfort_heat(70) -- clears comfort_deadband_warm_f(2.0F)."
-    },
-    {
-      "time": "2026-09-01T08:30:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "First below-floor tick. Fallback candidate arms, not yet sustain-confirmed."
-    },
-    {
-      "time": "2026-09-01T08:32:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "120s later (>90s). Cold start -- first-ever transition, no dwell gate. Sustain-confirmed: comfort family escalates to heating, commands heat at comfort_heat(70)."
-    },
-    {
-      "time": "2026-09-01T08:40:00",
-      "type": "temp_update",
-      "indoor_f": 71.5,
-      "outdoor_f": 65.0,
-      "note": "Indoor recovers to 71.5F -- ABOVE the plain floor(70) but BELOW floor+recovery_margin(70+2=72). A naive instant-revert design would flip back to cooling here (71.5 >= 70); the recovery-margin design does not."
-    },
-    {
-      "time": "2026-09-01T08:40:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "Re-evaluation while against-grain (heating). _decide_revert(): recovered = indoor(71.5) >= floor+margin(72) -> FALSE. Stays heating (HOLD, recovery margin not yet cleared)."
-    },
-    {
-      "time": "2026-09-01T08:45:00",
-      "type": "temp_update",
-      "indoor_f": 73.0,
-      "outdoor_f": 68.0,
-      "note": "Indoor recovers further to 73F -- now clears floor+recovery_margin(72)."
-    },
-    {
-      "time": "2026-09-01T08:45:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "Recovery margin cleared -- arms the recovery candidate (RECOVERING), not yet sustain-confirmed. Stays heating this tick."
-    },
-    {
-      "time": "2026-09-01T08:47:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "120s later (>90s) with indoor still holding above floor+margin (no new temp_update -- still 73F). Recovery sustain-confirms: REVERT to the day's native family (cooling)."
-    },
-    {
-      "time": "2026-09-01T08:50:00",
       "type": "temp_update",
       "indoor_f": 69.0,
       "outdoor_f": 55.0,
-      "note": "Indoor dips back to 69F -- 1F below comfort_heat(70), WITHIN comfort_deadband_warm_f(2.0F). This is the saw-tooth trigger: a naive design without deadband protection on re-entry would immediately re-arm/re-escalate right after the revert. The plain deadband gate (the same one that governed the original entry) still applies to a fresh entry from the native-family shape."
+      "note": "Indoor 69F: inside the heat arming zone (<= floor+m = 70F). Thermostat is already in heat."
+    },
+    {
+      "time": "2026-09-01T08:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Mild-day classification. Selector: 69 <= 70 -> heating; thermostat already heating, so no mode change."
+    },
+    {
+      "time": "2026-09-01T08:10:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 56.0,
+      "note": "70F: exactly floor+m (inclusive) -> heating. No change."
+    },
+    {
+      "time": "2026-09-01T08:15:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 57.0,
+      "note": "71F: strictly inside the gap (70 < 71 < 72) -> keep the current mode (heat). No chatter."
+    },
+    {
+      "time": "2026-09-01T08:20:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 57.0,
+      "note": "70F again -> heating. No change."
+    },
+    {
+      "time": "2026-09-01T08:25:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 58.0,
+      "note": "71F again -> gap, hold heat."
+    },
+    {
+      "time": "2026-09-01T08:40:00",
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 60.0,
+      "note": "72F reaches ceiling-m (74-2, inclusive) -> cooling. Non-breach switch; no earlier transition so the dwell lock is not holding."
+    },
+    {
+      "time": "2026-09-01T08:44:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 60.0,
+      "note": "70F reaches floor+m -> selector wants heat, but this is a non-breach switch 4 minutes (240 s < 600 s) after the last transition: held by the dwell lock."
+    },
+    {
+      "time": "2026-09-01T08:44:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Scheduled classification cycle at 08:44 re-runs the selector with indoor 70F: heating is wanted but the dwell lock holds it (comfort_family_switch_locked_out). The reactive temperature path itself stays silent while the lock would block, so the lock event is emitted by this full cycle."
+    },
+    {
+      "time": "2026-09-01T08:45:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 61.0,
+      "note": "71F back in the gap: keep cool (hysteresis memory)."
     },
     {
       "time": "2026-09-01T08:50:00",
-      "type": "classification",
-      "day_type": "warm",
-      "hvac_mode": "off",
-      "windows_recommended": false,
-      "note": "Re-evaluation: heat_breach_delta = 70-69 = 1F <= comfort_deadband_warm_f(2.0F) -> WITHIN_DEADBAND, no candidate armed. Comfort family stays 'cooling' -- no saw-tooth."
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 61.0,
+      "note": "72F -> cooling, already cool."
+    },
+    {
+      "time": "2026-09-01T08:55:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 62.0,
+      "note": "71F gap -> stay cool."
+    },
+    {
+      "time": "2026-09-01T09:10:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 62.0,
+      "note": "70F reaches floor+m, 30 minutes after the cool switch (>600 s): dwell lock expired, heat is armed."
+    },
+    {
+      "time": "2026-09-01T09:15:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 62.0,
+      "note": "71F gap: stay heat, no flip back to cool."
     }
   ],
   "assertions": [
     {
-      "at": "2026-09-01T08:32:00",
-      "expect": "expect_band",
-      "expect_band": { "floor": 70.0 },
-      "track": "logic",
-      "simulator_support": false,
-      "reason": "Confirms the base escalation from issue_821_comfort_floor_fallback_no_confidence.json's own shape: heat commanded at comfort_heat(70) once sustain-confirmed."
-    },
-    {
       "at": "2026-09-01T08:40:00",
-      "expect": "expect_band",
-      "expect_band": { "floor": 70.0 },
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "cooling",
+        "indoor_f": 72.0,
+        "breach": false
+      },
       "track": "logic",
       "simulator_support": false,
-      "reason": "Indoor (71.5F) is above the plain floor but has not cleared floor+recovery_margin(72F) -- still commanding heat (floor), NOT reverted to cool (ceiling). A naive instant-revert design would have already flipped to the cool ceiling here; the recovery-margin design has not. Time-scoped (unlike comfort_family, which reads only the engine's final state)."
+      "reason": "Indoor 72F = ceiling(74) - m(2) arms cooling on the boundary reading. Proves the mode only changes at the arming boundary, not inside the 70-72F gap where four earlier readings left it in heat."
     },
     {
-      "at": "2026-09-01T08:50:00",
+      "at": "2026-09-01T08:44:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch_locked_out",
+      "payload_subset": {
+        "candidate_family": "heating"
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "A non-breach flip 240 s after the last transition is held by the 600 s dwell lock instead of flipping the thermostat straight back to heat (the anti-sawtooth guard)."
+    },
+    {
+      "at": "2026-09-01T09:10:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "heating",
+        "indoor_f": 70.0,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "After the dwell window has elapsed, indoor 70F = floor(68) + m(2) re-arms heat before the floor is reached; a non-breach switch."
+    },
+    {
+      "at": "2026-09-01T09:15:00",
       "expect": "comfort_family",
-      "family": "cooling",
+      "family": "heating",
       "track": "logic",
       "simulator_support": false,
-      "reason": "Final state: after genuinely reverting at 08:47:00 (recovery margin cleared and sustain-confirmed), a subsequent small in-deadband dip (69F, 1F below floor) does NOT re-escalate -- the plain deadband gate still protects a fresh entry from the native-family shape, preventing the saw-tooth a same-threshold entry/exit pair would produce."
+      "reason": "Final state: a 71F reading inside the gap keeps the family heating (hysteresis memory), not the day-type default (cooling)."
     },
     {
-      "at": "2026-09-01T08:50:00",
-      "expect": "hvac_mode_never_commanded",
-      "forbidden_modes": ["heat"],
-      "since": "2026-09-01T08:47:00",
+      "at": "2026-09-01T09:15:00",
+      "expect": "last_hvac_mode",
+      "mode": "heat",
       "track": "logic",
       "simulator_support": false,
-      "reason": "Since the revert at 08:47:00, heat mode must never be commanded again in this scenario -- proves the post-revert dip genuinely did not re-trigger a heat command, not just that the internal family flag reads 'cooling'."
+      "reason": "The last commanded HVAC mode is heat."
+    },
+    {
+      "at": "2026-09-01T09:15:00",
+      "expect": "hvac_mode_never_commanded",
+      "forbidden_modes": [
+        "cool"
+      ],
+      "since": "2026-09-01T09:10:30",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "After the 09:10 heat arm no cool command is issued for the 71F gap reading: the thermostat does not sawtooth back."
     }
   ],
   "verdict": {
     "type": "positive",
-    "summary": "The recovery-margin hysteresis on exit prevents a same-threshold entry/exit saw-tooth: a small recovery just above the floor does not immediately revert, and once genuinely reverted, a small in-deadband dip does not immediately re-escalate.",
-    "observed_behavior": "Escalates to heating at 08:32:00 (comfort_heat=70). Holds heating through a partial recovery to 71.5F (08:40:00, below floor+margin=72). Reverts to cooling at 08:47:00 once 73F clears floor+margin and sustain-confirms. Stays cooling through a subsequent dip to 69F (08:50:00, within deadband) -- no re-escalation, no further heat command.",
-    "expected_behavior": "A recovery-margin-gated revert (not a same-threshold instant flip) is required to prevent HVAC mode from flapping every time indoor oscillates near the comfort floor -- the specific failure mode a naive design would produce and this scenario would catch."
+    "summary": "Readings that oscillate inside the 70-72F hysteresis gap never change the commanded mode; the mode flips only at the arming boundaries, and a boundary flip inside the 600 s dwell window is held.",
+    "observed_behavior": "Heat is held through 70/71/70/71, cool is armed at 72, a 70F reading four minutes later is locked out, cool holds through 71/72/71, heat is re-armed at 70 after 30 minutes, and the 71F reading afterwards leaves it in heat.",
+    "expected_behavior": "Nearest-edge arming with hysteresis memory and a non-breach dwell lock never chatters between heat and cool for readings inside the gap (docs/08 section 6f)."
   }
 }

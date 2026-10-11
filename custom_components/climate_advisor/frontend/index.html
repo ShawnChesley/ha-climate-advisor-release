@@ -2512,6 +2512,18 @@
               const remainMin = Math.max(0, Math.ceil(remainMs / 60000));
               return data.manual_override_mode + ' (active, ' + remainMin + ' min remaining)';
             })() : 'No'}</td></tr>
+            ${(() => {
+              const armed = data.comfort_family_armed;
+              const sw = data.comfort_family_last_switch;
+              if (!armed && !sw) { return ''; }
+              let txt = armed ? escapeHtml(String(armed)) : 'unknown';
+              if (sw) {
+                const when = sw.ts ? new Date(sw.ts).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : '';
+                txt += ' (last switch ' + escapeHtml(String(sw.from || '?')) + ' &rarr; ' + escapeHtml(String(sw.to || '?')) +
+                  (when ? ' at ' + escapeHtml(when) : '') + (sw.reason ? ': ' + escapeHtml(String(sw.reason)) : '') + ')';
+              }
+              return '<tr><td>Comfort Edge Armed</td><td>' + txt + '<span class="kv-desc">Which comfort edge the thermostat is guarding, and the last heat/cool switch</span></td></tr>';
+            })()}
           </table>
         </div>
         ${sensorRows ? `

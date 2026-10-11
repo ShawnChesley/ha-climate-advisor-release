@@ -25,12 +25,16 @@ key set is not enumerable; `diagnostics.py` still wraps its whole payload in
 
 from __future__ import annotations
 
+import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from .const import VERSION
+from .control_quality import build_control_quality, merge_chart_resolutions
 from .temperature import from_fahrenheit
+
+_LOGGER = logging.getLogger(__name__)
 
 REDACTED = "**REDACTED**"
 
@@ -244,11 +248,43 @@ def recent_hvac_events(coordinator: Any, limit: int = 40) -> list[dict[str, Any]
     return redact_sensitive(picked[-limit:])
 
 
-def build_diagnostic_snapshot(hass: Any, coordinator: Any) -> dict[str, Any]:
+def _build_control_quality_section(coordinator: Any, config: dict[str, Any]) -> dict[str, Any] | None:
+    """In-memory control-quality report (Issue #1066); ``None`` on any failure.
+
+    Reads only the chart log's in-memory ``get_entries()`` (no ``load()``/``save()``, no file
+    I/O), the indoor-temperature history and the engine's mode-change ring buffer, so it is safe
+    to call from async views. A broken report must never break a download, hence the blanket catch.
+    """
+    try:
+        chart_log = getattr(coordinator, "_chart_log", None)
+        if chart_log is None:
+            return None
+        now = datetime.now(UTC)
+        entries = merge_chart_resolutions(chart_log.get_entries("3d"), chart_log.get_entries("7d"), now)
+        engine = getattr(coordinator, "automation_engine", None)
+        changes = getattr(engine, "comfort_mode_changes", None)
+        history = getattr(coordinator, "_indoor_temp_history", None)
+        return build_control_quality(
+            now=now,
+            mode_changes=list(changes) if isinstance(changes, list) else [],
+            chart_entries=entries,
+            indoor_history=list(history) if isinstance(history, list) else None,
+            temp_unit=config.get("temp_unit", "fahrenheit"),
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never raise
+        _LOGGER.debug("control_quality section unavailable", exc_info=True)
+        return None
+
+
+def build_diagnostic_snapshot(hass: Any, coordinator: Any, *, include_control_quality: bool = True) -> dict[str, Any]:
     """Return version + live entity snapshot + thermostat capabilities + last command, redacted.
 
     Every identifying attribute is redacted here (see module docstring) so all consumers
     -- including the AI investigator, which sends this to the Claude API -- get safe output.
+
+    ``include_control_quality=False`` skips the (comparatively expensive) control-quality report and
+    omits the key entirely; the Activity Record footer passes it because the compact footer never
+    renders that block.
     """
     config = getattr(coordinator, "config", None) or {}
     snapshot: dict[str, Any] = {
@@ -291,6 +327,8 @@ def build_diagnostic_snapshot(hass: Any, coordinator: Any) -> dict[str, Any]:
         if fan_state is not None
         else None
     )
+    if include_control_quality:
+        snapshot["control_quality"] = _build_control_quality_section(coordinator, config)
 
     return snapshot
 
@@ -337,7 +375,33 @@ def render_diagnostic_snapshot_text(snapshot: dict[str, Any]) -> str:
         for key in sorted(fan_attrs):
             lines.append(f"    {key}: {fan_attrs[key]!r}")
 
+    lines.extend(_render_control_quality(snapshot.get("control_quality")))
+
     return "\n".join(lines) + "\n"
+
+
+def _render_control_quality(cq: Any) -> list[str]:
+    """Headline control-quality numbers for the text footer ("(no data)" when absent)."""
+    if not isinstance(cq, dict):
+        return ["  control_quality (24h / 7d): (no data)"]
+    windows = cq.get("windows") or {}
+
+    def pair(*path: str) -> str:
+        parts = []
+        for label in ("24h", "7d"):
+            node: Any = windows.get(label)
+            for key in path:
+                node = node.get(key) if isinstance(node, dict) else None
+            parts.append(str(node))
+        return " / ".join(parts)
+
+    return [
+        "  control_quality (24h / 7d): misarmed_min={} mode_changes={} prediction_mae_60m={}".format(
+            pair("misarmed", "minutes"),
+            pair("mode_changes", "count"),
+            pair("prediction_error", "horizons", "60m", "mean_abs_f"),
+        )
+    ]
 
 
 def render_diagnostic_snapshot_compact(snapshot: dict[str, Any]) -> str:

@@ -1,4 +1,4 @@
-"""Issue #827 prevention: registry-enforced coverage of every ``AutomationEngine``
+"""Issue #827 prevention (kept current by Issue #1066): registry-enforced coverage of every ``AutomationEngine``
 method that touches ``self._comfort_mode_family``.
 
 The comfort-family consolidation (Issue #827) replaced three previously
@@ -6,7 +6,11 @@ inconsistent authorities (``select_comfort_band()``'s day-type edge picker, the
 confidence-gated ``_resolve_comfort_family_mode()``, and the separately-armed
 ``_family_switch_locked_out()`` dwell timer) with a single FSM
 (``comfort_family_fsm.transition()``), reached through
-``_resolve_comfort_family_via_fsm()``. ``self._comfort_mode_family`` survives as a
+``_resolve_comfort_family_via_fsm()``. Issue #1066 (nearest-edge arming) made the
+FSM read the THERMOSTAT's live mode as its current state, so
+``_resolve_comfort_family_via_fsm()`` no longer reads the attribute itself and is
+not registered; it only writes it through ``_arm_comfort_family()``.
+``self._comfort_mode_family`` survives as a
 **compatibility attribute** (Design §2 preserved contract) so
 ``tools/sim_harness/outcomes.py``'s ``"comfort_family"`` assertion type and the 7
 out-of-scope legacy callers of ``_arm_comfort_family()`` (nat-vent/WHF activation,
@@ -58,11 +62,6 @@ _COVERAGE_REGISTRY: dict[str, str] = {
         "AND by the 7 out-of-scope legacy callers (nat-vent/WHF activation, "
         "_exit_nat_vent() and its bypass branches, the away-ceiling exit branches) "
         "left untouched by Issue #827 per that issue's own explicit scope note"
-    ),
-    "_resolve_comfort_family_via_fsm": (
-        "routed-through-fsm — reads the compatibility attribute to seed the FSM's "
-        "current_state on cold start (no prior family recorded), before handing off "
-        "to comfort_family_fsm.transition()"
     ),
 }
 

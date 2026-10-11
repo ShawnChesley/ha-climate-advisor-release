@@ -617,6 +617,9 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # the same resolution, matching the project's "computed once, not per-hour"
         # invariant already established for _compute_target_band_schedule().
         self._tou_phase_resolution: Any = None
+        # Issue #1066 (review fix 1): sticky key of the TOU precondition window last pushed to the engine
+        # (schedule_id, schedule_start, mode, away/vacation class). Not persisted: cleared on restart.
+        self._tou_precondition_sticky: tuple[Any, ...] | None = None
         self._tou_active_cost_resolution: Any = None
         # Phase 3d (Investigation D): dedup guard for the tou_schedule_window_active
         # Activity Record event — True while a resolved high-cost schedule window
@@ -2295,6 +2298,47 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._tou_av_stop_timer_cancel = None
         self._tou_av_stop_timer_schedule_start = None
 
+    def _tou_precondition_push(
+        self, resolution: Any, is_away_vacation: bool, now: datetime
+    ) -> tuple[datetime | None, str | None]:
+        """Issue #1066 (review fix 1): the (until, mode) TOU precondition window to push to the engine.
+
+        STICKY: the scheduler recomputes the lead time every cycle (delta / rate * 1.3), and as the
+        house banks the lead shrinks faster than the time remaining, so the phase can fall back to
+        NONE for a cycle or more before the window opens. Dropping the engine's window then lets the
+        comfort-edge selector resume with the house banked near the opposite edge, flip the thermostat
+        (cool -> heat -> cool) and run the furnace. Once PRECONDITIONING has been seen for a key
+        (schedule_id, schedule_start, mode, away/vacation class) the same ``until`` (= schedule_start)
+        keeps being pushed while the phase is NONE, until it lapses at schedule_start. It is dropped
+        when the resolution disappears, or the schedule id / start / mode / occupancy class changes.
+        """
+        if (
+            resolution is None
+            or resolution.schedule_id is None
+            or resolution.schedule_start is None
+            or resolution.mode is None
+        ):
+            self._tou_precondition_sticky = None
+            return None, None
+        key = (resolution.schedule_id, resolution.schedule_start, resolution.mode, bool(is_away_vacation))
+        if resolution.phase == TOUPhase.PRECONDITIONING:
+            self._tou_precondition_sticky = key
+            return resolution.schedule_start, resolution.mode
+        if getattr(self, "_tou_precondition_sticky", None) == key:
+            try:
+                lapsed = not now < resolution.schedule_start
+            except TypeError:  # naive vs aware mix: treat the window as lapsed
+                lapsed = True
+            if not lapsed:
+                _LOGGER.debug(
+                    "TOU precondition window held: phase gap before window start (mode=%s start=%s)",
+                    resolution.mode,
+                    resolution.schedule_start,
+                )
+                return resolution.schedule_start, resolution.mode
+        self._tou_precondition_sticky = None
+        return None, None
+
     def _sync_tou_away_vacation_state(self) -> None:
         """Push this cycle's away/vacation TOU state to the automation engine and
         (re)schedule the precise T_start guard timer (Issue #899).
@@ -2335,6 +2379,14 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             and resolution.schedule_start <= now < resolution.window_end
         )
         if self.automation_engine is not None:
+            # Issue #1066 (F1): tell the engine whether a TOU precondition (banking toward the
+            # cost window) owns the thermostat, so the comfort-edge selector defers until the
+            # window starts instead of flipping the bank back. Home/Guest and Away/Vacation alike.
+            _bank_until, _bank_mode = self._tou_precondition_push(resolution, is_away_vacation, now)
+            if _bank_until is not None:
+                self.automation_engine.set_tou_precondition_window(_bank_until, _bank_mode)
+            else:
+                self.automation_engine.set_tou_precondition_window(None)
             if window_active:
                 self.automation_engine._tou_av_expansion_f = resolution.expansion_f or 0.0
                 self.automation_engine._tou_av_active_schedule_id = resolution.schedule_id
@@ -2773,9 +2825,6 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 predicted_indoor=self._last_predicted_indoor,
                 indoor_temp=indoor_temp,
                 nat_vent_cutoff=(getattr(self, "_nat_vent_plan", None) or {}).get("nat_vent_cutoff"),
-                comfort_floor_crossing_time=(getattr(self, "_nat_vent_plan", None) or {}).get(
-                    "comfort_floor_crossing_time"
-                ),
             )
             _LOGGER.debug("[coalesce-diag] after apply_classification() [coalesce path]")
             hvac_commanded = True
@@ -4923,9 +4972,6 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 predicted_indoor=self._last_predicted_indoor,
                 indoor_temp=self._get_indoor_temp(),
                 nat_vent_cutoff=(getattr(self, "_nat_vent_plan", None) or {}).get("nat_vent_cutoff"),
-                comfort_floor_crossing_time=(getattr(self, "_nat_vent_plan", None) or {}).get(
-                    "comfort_floor_crossing_time"
-                ),
             )
 
             # Initialize today's learning record, preserving any counters already accumulated
@@ -5338,11 +5384,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         Only ``nat_vent_cutoff``/``nat_vent_cutoff_reason`` are held back while a new
         reason is unconfirmed — every other key in ``raw_plan`` passes through fresh,
         every cycle, unconditionally. This is deliberate, not an oversight:
-        ``comfort_floor_crossing_time`` (one of those other keys) is read by
-        ``ode_floor_guard.py`` for a real safety-relevant heating-escalation decision,
-        and it must never lag behind the live computation. Freezing the whole
-        ``self._nat_vent_plan`` dict while a reason flip settles would silently stall
-        that safety-relevant input — only the display-facing cutoff/reason pair is
+        ``comfort_floor_crossing_time`` (one of those other keys, shown on the status
+        cards and used by the nat-vent plan) must never lag behind the live computation.
+        Freezing the whole ``self._nat_vent_plan`` dict while a reason flip settles would
+        silently stall those inputs — only the display-facing cutoff/reason pair is
         protected here.
 
         DRY: reuses ``confirmed_transition.py``'s ``resolve_candidate_since()``/
@@ -5427,8 +5472,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         # Not yet confirmed — hold the previously-confirmed cutoff/reason/evening_open_time
         # as one coherent display pair (Issue #940), but let every other field through
-        # fresh (see safety-relevant rationale above — comfort_floor_crossing_time must
-        # never lag for ode_floor_guard.py).
+        # fresh (see rationale above — comfort_floor_crossing_time must never lag).
         held_plan = dict(raw_plan)
         held_plan["nat_vent_cutoff"] = previous_plan.get("nat_vent_cutoff")
         held_plan["nat_vent_cutoff_reason"] = previous_reason
@@ -7234,9 +7278,6 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 predicted_indoor=self._last_predicted_indoor,
                 indoor_temp=self._get_indoor_temp(),
                 nat_vent_cutoff=(getattr(self, "_nat_vent_plan", None) or {}).get("nat_vent_cutoff"),
-                comfort_floor_crossing_time=(getattr(self, "_nat_vent_plan", None) or {}).get(
-                    "comfort_floor_crossing_time"
-                ),
             )
             _LOGGER.info(
                 "Setpoint re-asserted after fan-off echo: reasserted day_type=%s hvac_mode=%s",
@@ -11633,6 +11674,16 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             "fan_remote_speed": self._read_fan_remote_speed() or ae._fan_remote_speed,
         }
 
+    @staticmethod
+    def _comfort_family_armed_label(ae: Any) -> str | None:
+        """Issue #1066: "heating"/"cooling"/None from the thermostat's actual mode (not the FSM flag)."""
+        try:
+            fam = ae._current_thermostat_family(dt_util.now())
+        except Exception:  # noqa: BLE001 - diagnostics must never break the debug view
+            return None
+        value = getattr(fam, "value", None)
+        return value if isinstance(value, str) else None
+
     def get_debug_state(self) -> dict[str, Any]:
         """Return serializable debug state for the dashboard."""
         ae = self.automation_engine
@@ -11714,6 +11765,14 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             "fan_remote_timer_ends": _fan_remote_fields["fan_remote_timer_ends"],
             "fan_remote_speed": _fan_remote_fields["fan_remote_speed"],
             "fan_mode_config": ae.config.get(CONF_FAN_MODE, FAN_MODE_DISABLED),
+            # Issue #1066: which comfort edge the thermostat is armed to guard ("heating"/"cooling"),
+            # and the last genuine selector switch {ts, from, to, reason} (None until one happens).
+            # Derived from the thermostat's real mode: ``_comfort_mode_family`` is overwritten by
+            # nat-vent/WHF/economizer callers and can say "cooling" while the thermostat heats.
+            "comfort_family_armed": self._comfort_family_armed_label(ae),
+            "comfort_family_last_switch": (
+                dict(ae._last_comfort_switch) if getattr(ae, "_last_comfort_switch", None) else None
+            ),
             "economizer_active": ae._economizer_active,
             "economizer_phase": ae._economizer_phase,
             "resumed_from_pause": ae._resumed_from_pause,

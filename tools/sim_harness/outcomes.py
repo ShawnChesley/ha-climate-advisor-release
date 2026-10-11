@@ -207,6 +207,19 @@ UNMAPPED_PRODUCTION_EVENTS: frozenset[str] = frozenset(
         "hvac_output_stall",
         "hvac_output_stall_recovered",
         "occupancy_restore_deferred",
+        # Issue #1066 (nearest-edge arming): comfort_family_switch / comfort_family_switch_locked_out
+        # record WHICH comfort edge the selector armed (or wanted to). They are emitted from inside the
+        # same cycle as the deciding event (classification_applied, setback_applied, resumed, ...) and
+        # always AFTER it, so under last-decision-wins they shadowed the real outcome. Before #1066 they
+        # fired only on a rare against-grain escalation; Design D fires them on every genuine edge
+        # switch, so the shadowing became routine (golden cool_all_day_heat_all_day, issue_637_..., ...).
+        # The previous semantics (unmapped -> 'unknown:<type>' decision) were wrong for the same reason
+        # as every sibling above: the event is an audit record, not an HVAC decision. Cannot hide a real
+        # failure: the family itself is asserted through engine state ("comfort_family") and the raw
+        # event_log ("comfort_family_switch_by"), neither of which reads this decision list, and the
+        # write the switch causes is still visible as the comfort_band_applied / set_temperature action.
+        "comfort_family_switch",
+        "comfort_family_switch_locked_out",
     }
 )
 
@@ -711,9 +724,9 @@ def check_assertion(
     # cycles later", which is exactly what this issue's regression protection
     # needs to prove (a floor/ceiling breach must resolve within one reactive
     # tick, not wait out the ~30-minute apply_classification() cycle). Scans
-    # the raw event_log directly for the #843 `comfort_family_switch` event
-    # (payload: resolved_family/reason/deadband_applied_f/minutes_since_*)
-    # timestamped at or before `by`. Payload: {"family": str, "by": ISO str}.
+    # the raw event_log directly for the `comfort_family_switch` event
+    # (Issue #1066 payload: resolved_family/reason/margin_applied_f/indoor_f/
+    # floor_f/ceiling_f/breach) timestamped at or before `by`. Payload: {"family": str, "by": ISO str}.
     if expect == "comfort_family_switch_by":
         expected_family = assertion.get("family")
         by = assertion.get("by", "")

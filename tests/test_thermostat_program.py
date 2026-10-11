@@ -475,15 +475,21 @@ class TestApplyComfortBandCoolOnly:
         # Single call even in steady-state (Issue #301: hvac_mode in call bypasses HA dedup)
         assert len(temp) == 1
 
-    def test_floor_band_no_op_cool_only_cannot_heat(self):
-        """active=floor on cool-only thermostat → no service calls (can't defend the floor)."""
+    def test_floor_band_arms_ceiling_on_cool_only(self):
+        """active=floor on cool-only thermostat → the only edge it can defend is armed (Issue #1066).
+
+        The nearest-edge selector never picks a mode the device lacks: a cool-only unit gets cool
+        at the band ceiling (it can cap heat gain; it cannot defend the floor, so it never claims to).
+        """
         eng = _make_apply_engine(hvac_modes=_COOL_MODES, supported_features=_COOL_FEATURES, current_mode="cool")
         band = ComfortBand(floor=70.0, ceiling=80.0, active="floor", reason="test")
-        asyncio.run(eng._apply_comfort_band(band, reason="test no-op"))
+        asyncio.run(eng._apply_comfort_band(band, reason="test cool-only"))
 
-        # Cool-only can't defend a floor threat — silent no-op, no false promise
-        assert len(_hvac_calls(eng)) == 0
-        assert len(_temp_calls(eng)) == 0
+        assert len(_hvac_calls(eng)) == 0  # already in cool
+        temp = _temp_calls(eng)
+        assert len(temp) == 1
+        assert temp[0].args[2]["hvac_mode"] == "cool"
+        assert temp[0].args[2]["temperature"] == 80.0
 
 
 class TestApplyComfortBandHeatOnly:
@@ -508,15 +514,21 @@ class TestApplyComfortBandHeatOnly:
         assert call_data.get("hvac_mode") == "heat"
         assert call_data["temperature"] == 70.0
 
-    def test_ceiling_band_no_op_heat_only_cannot_cool(self):
-        """active=ceiling on heat-only thermostat → no service calls (can't defend the ceiling)."""
+    def test_ceiling_band_arms_floor_on_heat_only(self):
+        """active=ceiling on heat-only thermostat → heat at the band floor (Issue #1066).
+
+        The nearest-edge selector never picks a mode the device lacks: a heat-only unit guards the
+        floor (the only edge it can defend) rather than silently arming nothing.
+        """
         eng = _make_apply_engine(hvac_modes=_HEAT_MODES, supported_features=_HEAT_FEATURES, current_mode="heat")
         band = ComfortBand(floor=60.0, ceiling=74.0, active="ceiling", reason="test")
-        asyncio.run(eng._apply_comfort_band(band, reason="test no-op"))
+        asyncio.run(eng._apply_comfort_band(band, reason="test heat-only"))
 
-        # Heat-only can't cool — silent no-op per the spec
-        assert len(_hvac_calls(eng)) == 0
-        assert len(_temp_calls(eng)) == 0
+        assert len(_hvac_calls(eng)) == 0  # already in heat
+        temp = _temp_calls(eng)
+        assert len(temp) == 1
+        assert temp[0].args[2]["hvac_mode"] == "heat"
+        assert temp[0].args[2]["temperature"] == 60.0
 
 
 class TestApplyComfortBandNoCapability:

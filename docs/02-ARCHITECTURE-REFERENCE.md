@@ -28,6 +28,8 @@
 | Where is the `incident_detected` payload built, and why is there no second emitter? | `incident_payload.build_incident_payload()` builds the common envelope for the coordinator's `_emit_incident()` and the engine's `_emit_engine_incident()`; each owner still emits through its own event callback. Issue #1049. | [Incident Payload Brief](incident-payload-brief.md) |
 | Which pure functions decide an explicit mode switch and the mode read-back? | `desired_state.decide_explicit_mode_switch()` (switch before a heat/cool setpoint write) and `setpoint_verify_decision.decide_mode_alignment()` (10 s / 130 s read-back); the shell lives in `automation.py` `_ensure_hvac_mode_for_write()` / `_check_mode_alignment()`. | [Command shapes since #301](08-COMPUTATION-REFERENCE.md#command-shapes-since-301-explicit-mode-switch-issue-1049) |
 | What does the diagnostics download / investigator snapshot contain about the thermostat? | `diagnostic_snapshot.build_diagnostic_snapshot()`: live climate attributes, a parsed `capabilities` block, a `last_command` block, plus `recent_hvac_events`, all redacted inside the builder. | [Debugging Guide](09-DEBUGGING-GUIDE.md#reading-the-thermostat-diagnostics-blocks-and-confirming-an-ignored-mode-issue-1049) |
+| Which edge of the comfort band does the thermostat guard (heat or cool), and which modules own that decision? | `comfort_family_decision.decide_comfort_family()` (pure leaf) + `comfort_family_fsm.transition()` (dwell anti-chatter), shelled by `AutomationEngine._resolve_comfort_family_via_fsm()`; reactive on every thermostat temperature change via `comfort_family_temperature_check()`. Nearest-edge arming, Issue #1066 (replaces the #827 against-grain design and the ODE floor guard). | [Comfort Edge Selector](#comfort-edge-selector-issue-1066) |
+| Where is the history of commanded HVAC mode changes kept, and what reads it? | A 200-entry ring buffer (`AutomationEngine.comfort_mode_changes`, written by `_record_commanded_mode()`, persisted in the state file); `control_quality.py` derives the `control_quality` block of `build_diagnostic_snapshot()` from it. | [Comfort Edge Selector](#comfort-edge-selector-issue-1066) and [Debugging Guide](09-DEBUGGING-GUIDE.md#control-quality-report-issue-1066) |
 | Which pure function decides the "house off-target, equipment not running" stall alert, and where do the shared notify/reminder helpers live? | `comfort_stall_decision.decide_comfort_stall()` (clock + exclusions; shell `coordinator._update_comfort_stall()`); `coordinator._notify_in_background(title, message, type, *, email=True)` is the one coordinator-side fire-and-forget owner-alert routine (entity health, invariant watchdog, stall; the engine-side indoor-blind alert in `automation.py` still has its own `_push_indoor_blind_alert` / `_notify_indoor_blind`) and `temperature.reminder_due()` its pure reminder predicate; `desired_state.decide_open_sensor_hold()` is the one open-window predicate. | [House-off-target stall alert](08-COMPUTATION-REFERENCE.md#house-off-target-stall-alert-issue-1050-part-of-1048) |
 
 ## File Structure
@@ -89,6 +91,9 @@ custom_components/climate_advisor/
 ├── fan_drift_reconciliation.py # Pure decision core: fan physical-state drift reconciliation (Issue #423).
 ├── fan_status.py          # Fan-status suppression predicate shared by the WHF/HVAC fan status cards (§ Fan Status Values, CLAUDE.md); fan_entity_on() -- the single True/False/None reading of a fan command entity's state (Issue #1050).
 ├── comfort_stall_decision.py  # Pure decision core: the "house off-target for 3 h with no equipment running in the needed direction" stall alert -- decide_comfort_stall() / StallDecision / StallReason (Issue #1050, #1048 change 9). Shell: coordinator._update_comfort_stall(). See docs/08-COMPUTATION-REFERENCE.md "House-off-target stall alert".
+├── comfort_family_decision.py  # Pure leaf: decide_comfort_family() / effective_margin() -- nearest-edge arming of the heat or cool family (Issue #1066; replaces the #827 against-grain decision). No HA imports.
+├── comfort_family_fsm.py  # Thin transition layer around the leaf: transition() / ComfortFamilyDwellState -- the 600 s anti-chatter dwell (breaches bypass it). Dwell clock is not restart-persisted.
+├── control_quality.py     # Pure builder of the `control_quality` diagnostic block from the commanded-mode ring buffer + chart log (Issue #1066). See Debugging Guide.
 ├── setpoint_verify_decision.py  # Pure decision cores: the post-fan setpoint verify check (architecture-reset Step 2), plus `decide_mode_alignment()` / `ModeAlignmentOutcome` -- the "did the thermostat take the requested mode?" read-back (Issue #1049). See docs/08-COMPUTATION-REFERENCE.md "Command shapes since #301".
 │
 ├── classification_fsm.py  # Classification decision FSM — stateless, composes decide_scheduled_band_gate() + decide_ode_ceiling_guard() (Issue #742). See §FSM Decision Layer.
@@ -383,13 +388,29 @@ Note: `config_flow.VERSION` (config entry schema) and `state.STATE_VERSION` (sta
 - Downsampling: raw points ≤3 days; hourly averages 4–30 days; daily summaries >30 days
 - Storage: `climate_advisor_chart_log.json` in HA config dir
 
+## Comfort Edge Selector (Issue #1066)
+
+A single-setpoint thermostat guards one comfort edge at a time. Every evaluation, the selector picks the edge nearer to indoor: below the floor heats and above the ceiling cools immediately; within an arming margin `m` of an edge it arms that edge; strictly between the margins it keeps the thermostat's actual current mode. Full rule, margin clamp, before/after table and mixed-day walk-through: [08-COMPUTATION-REFERENCE.md §6f](08-COMPUTATION-REFERENCE.md#6f-comfort-family-nearest-edge-arming-issue-1066--supersedes-827843858867).
+
+| Piece | Owner | Notes |
+|---|---|---|
+| Decision | `comfort_family_decision.decide_comfort_family()` | Stateless, no HA imports; heat-only/cool-only thermostats pick their one mode |
+| Anti-chatter | `comfort_family_fsm.transition()` | `comfort_mode_switch_min_interval_s` dwell between non-breach switches; breaches ignore it |
+| Shell | `AutomationEngine._resolve_comfort_family_via_fsm()` | Called by `_apply_comfort_band()` and `_set_temperature_for_mode()`; nat-vent/WHF, pause, override, occupancy and TOU keep their existing priority |
+| Trigger | `comfort_family_temperature_check()` from `coordinator._async_thermostat_changed()` | Every temperature change; re-enters `apply_classification()` only when the selector disagrees with the armed family |
+| Decision memory | The thermostat's real HVAC mode | Restart-safe; only the dwell timestamp is held in memory |
+| Mode-change history | `AutomationEngine.comfort_mode_changes` (cap 200) | Appended by `_record_commanded_mode()`, persisted in the state file; feeds `control_quality` |
+| Report | `control_quality.py` -> `diagnostic_snapshot` | Download Logs / Full Logs / HA diagnostics; reading guide in [09-DEBUGGING-GUIDE.md](09-DEBUGGING-GUIDE.md#control-quality-report-issue-1066) |
+
+The ODE floor guard (`ode_floor_guard.py`) was removed in this change. The ODE ceiling guard (`ode_ceiling_guard.py`) keeps its decision but skips its `cool` write while the selector is guarding the floor.
+
 ## Supported Thermostat Configuration
 
-CA issues separate `heat` and `cool` commands (dual `heat_cool` mode was dropped due to
-thermostat compatibility bugs). The underlying HVAC system must support **both** heating
-and cooling — heat-only or cool-only systems will not receive commands for their unsupported
-mode and `_apply_comfort_band` will no-op silently for that day type. This is expected
-behavior, not a defect.
+CA issues separate `heat` and `cool` commands, one single setpoint at a time (dual `heat_cool` mode was dropped
+in Issue #301 due to thermostat compatibility bugs; dual-capable thermostats are treated the same way).
+A thermostat that supports only one of heating or cooling is armed only in that mode (the comfort edge
+selector picks its one mode); a thermostat supporting neither receives no comfort-band commands.
+Dual heat-and-cool systems get nearest-edge switching between the two (see Comfort Edge Selector above).
 
 ## Observe-Only Mode (Disable Automation)
 

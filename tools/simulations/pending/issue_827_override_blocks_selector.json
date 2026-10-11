@@ -1,0 +1,114 @@
+{
+  "name": "issue_827_override_blocks_selector",
+  "description": "Issue #827 / #1066 (Design D nearest-edge arming, docs/08-COMPUTATION-REFERENCE.md section 6f, 'What keeps priority'). A confirmed manual override suppresses the comfort-edge selector: the occupant bumps the thermostat to heat on a hot-classified day, the override is confirmed after 300 s, and when indoor then falls to 60.5F, 7.5F below the 68F floor (a reading that would arm heat immediately with no override), CA does not fight the occupant's deliberate choice: comfort_family stays cooling and the override stays active. There is no deadband or 'how far below the floor' concept any more; the selector is skipped categorically while an override is active or pending. Renamed from issue_827_warm_day_override_within_deadband_respected.",
+  "source": "Issue #827 Design #1 (manual override is revealed preference); restated for Issue #1066 Design D, where an active/pending override skips the selector entirely.",
+  "issue": 827,
+  "notes": [
+    "Occupant impact: the person deliberately set the thermostat to heat. CA must not override that choice (for example by forcing the mode back) while the override is active, however far indoor drifts; the override grace (manual_grace_seconds 7200) ends it, not the temperature.",
+    "Negative control (verified when this scenario was rewritten): the same event list WITHOUT the 08:10 thermostat_state_changed event switches the family to heating on the 08:30:01 reading (comfort_family_switch resolved_family=heating, breach=true) and commands heat at 68F. So the cooling family at 08:30:02 is held by the override, not by the selector failing to run.",
+    "The window sensor_open/sensor_close events in this event list are inert in this run (no monitored sensor entities are configured, no nat-vent session starts). They are kept unchanged from the original scenario; the decisive events are the override confirmation (08:15) and the 60.5F reading (08:30:01) delivered through the coordinator's reactive comfort_family_temperature_check().",
+    "Mechanics: comfort_family_temperature_check() returns early while a manual override is active or an override confirmation is pending; the same guard is why apply_classification() defers to the override. The override is introduced BEFORE the temperature drop and at least several seconds after the baseline classification (coordinator suppresses override detection within 3 s of a CA command, _is_recent_hvac_command).",
+    "day_type is 'hot' so the baseline classification commands cool, matching initial_thermostat_mode=cool; avoids a confound where a warm-day classification (classifier hvac_mode=off, band still armed at the ceiling) looks like a pre-existing mismatch.",
+    "Three-exercise protocol (CLAUDE.md section 10):",
+    "(a) Scenario effectiveness: with the selector's override skip removed, the 60.5F reading at 08:30:01 arms heat (breach) and comfort_family becomes heating, so comfort_family=cooling fails (demonstrated by the negative control above). With nearest-edge arming deleted entirely (origin/main), the old machinery also held an override breach inside 2x the deadband, so this particular assertion would NOT discriminate between old and new designs; what it protects is the override-priority contract of Design D itself. override_detected/override_confirmed/override_active prove the override premise is real and still alive at the assertion time.",
+    "(b) Docs<->production alignment: docs/08 section 6f 'What keeps priority' (Manual override / override grace: comfort_family_temperature_check() returns early while an override or override confirmation is pending).",
+    "(c) Occupant outcome if this test fails to catch a regression: CA fights the occupant's manual thermostat change (flips the mode back at the first reading outside the band), the 'revealed preference' principle of the project is violated and the user loses trust in manual control."
+  ],
+  "use_coordinator": true,
+  "skip_startup_coalesce": true,
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "setback_heat": 60,
+    "setback_cool": 80,
+    "natural_vent_delta": 3.0,
+    "fan_mode": "whole_house_fan",
+    "fan_entity": "fan.whole_house",
+    "manual_grace_seconds": 7200,
+    "override_confirm_seconds": 300,
+    "initial_thermostat_mode": "cool"
+  },
+  "events": [
+    {
+      "time": "2026-09-01T08:00:00",
+      "type": "classification",
+      "day_type": "hot",
+      "hvac_mode": "cool",
+      "windows_recommended": true,
+      "note": "Hot-day classification, HVAC in cool mode -- matches the initial thermostat state, so nothing about the baseline itself looks like a pre-existing mismatch."
+    },
+    {
+      "time": "2026-09-01T08:00:00",
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 60.0,
+      "note": "Baseline: indoor 72F, outdoor 60F -- favorable for nat-vent later."
+    },
+    {
+      "time": "2026-09-01T08:10:00",
+      "type": "thermostat_state_changed",
+      "hvac_mode": "heat",
+      "note": "10 minutes after the baseline classification (well past the 3s recent-command suppression window), the user manually bumps the thermostat to heat mode -- a real, mismatched override. Detected via the real coordinator's _async_thermostat_changed listener."
+    },
+    {
+      "time": "2026-09-01T08:15:00",
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 60.0,
+      "note": "5 minutes later, thermostat still heat mode -> override_confirm_seconds(300) elapses -> override confirmed."
+    },
+    {
+      "time": "2026-09-01T08:15:01",
+      "type": "sensor_open",
+      "entity": "binary_sensor.bedroom_window",
+      "note": "Window opens. Inert in this run (no monitored sensors configured); kept from the original scenario. The override stays active and confirmed."
+    },
+    {
+      "time": "2026-09-01T08:30:01",
+      "type": "temp_update",
+      "indoor_f": 60.5,
+      "outdoor_f": 45.0,
+      "note": "Indoor 60.5F, 7.5F below comfort_heat(68). With no override this reading arms heat immediately (floor breach). With the confirmed override active the reactive check skips the selector, so the family stays cooling."
+    },
+    {
+      "time": "2026-09-01T08:30:02",
+      "type": "sensor_close",
+      "entity": "binary_sensor.bedroom_window",
+      "note": "Window closes. Inert in this run; kept from the original scenario. Final state is read here: cooling family held, override active."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-09-01T08:10:00",
+      "expect": "override_detected",
+      "track": "integration",
+      "reason": "Thermostat state changed to heat mode while classification says cool -- override detection fires in the coordinator's real listener."
+    },
+    {
+      "at": "2026-09-01T08:15:00",
+      "expect": "override_confirmed",
+      "track": "integration",
+      "reason": "5 minutes elapsed with thermostat still in heat mode -> override_confirm_seconds(300) expired -> override confirmed."
+    },
+    {
+      "at": "2026-09-01T08:30:02",
+      "expect": "comfort_family",
+      "family": "cooling",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Indoor is 7.5F below the floor, which would arm heat immediately without an override. With the manual override active the comfort-edge selector is skipped, so the family stays cooling and CA does not fight the occupant's deliberate heat setting."
+    },
+    {
+      "at": "2026-09-01T08:30:02",
+      "expect": "override_active",
+      "track": "integration",
+      "reason": "Confirms the override genuinely remained active (manual_grace_seconds=7200) at the moment of the held decision, so the premise is real and not an already-expired override."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "A confirmed manual override suppresses nearest-edge arming: a large below-floor reading does not change the comfort family while the override is active.",
+    "observed_behavior": "Override detected 08:10, confirmed 08:15; indoor 60.5F at 08:30:01 leaves the family cooling and the override active (the same run without the override switches to heating on that reading).",
+    "expected_behavior": "While a manual override or override confirmation is pending the selector does not run; the occupant's deliberate choice stands until the grace period ends."
+  }
+}
