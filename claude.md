@@ -444,6 +444,19 @@ When adding a new `category` value to CONFIG_METADATA in `const.py`, also update
 
 Skipping any of these will produce silent `assert cat in VALID_CATEGORIES` failures.
 
+### Config UI Field Standard (Issue #1061)
+
+Single source of truth for how config-flow and options-flow fields are built.
+
+- **Source of truth**: `strings.json`. `translations/en.json` must be byte-identical (HA uses `en.json` at runtime). Enforced by `tests/test_config_flow_strings.py` and `tools/validate.py::check_strings`.
+- **Labels** (`data.<key>`) render INSIDE the input box. At most 5 words; no unit; no parentheses; a friendly name. A raw key shown as a label is never acceptable (the `temp_unit` rule: the key appearing means the label string is missing). Detail goes in `data_description`.
+- **Completeness**: every schema key in every step needs BOTH `data` and `data_description`; every `errors[...]` key a step raises needs a string under that flow's `error`; every step_id needs a strings block (title/description). Radio (LIST mode) selects are allowed only for short exclusive choices and must have a friendly label.
+- **Units**: the unit appears once, from the selector's `unit_of_measurement`; never in the label. Temperature differences (setback depth, deadbands) are unit-neutral: shown in the user's unit via `convert_delta` with converted defaults, stored as degF deltas under the existing `_f` keys, and a stored value is overwritten only when the user changed the displayed value (no rounding drift).
+- **Initial setup vs options**: the initial flow contains only settings with no safe default or that are critical (entities, unit, setpoints, temp sources, door/window sensors and polarity, fan mode/entity, occupancy toggles and their invert flags, schedule, briefing notifications on/off). Tuning, advanced, and optional-hardware settings are options-only. Code reading a setting that is not asked at setup MUST use `config.get(KEY, DEFAULT)`.
+- **HA facts vs unknowns**: HA docs say `data` = field labels and `data_description` = text under the field, and labels should be succinct. The docs say nothing about label size or placement, so never claim to control label font size from the integration. The integration cannot and must not style HA's frontend or theme (HA Boundary Rule).
+- **Out of scope**: CONFIG_METADATA labels (dashboard Settings tab) intentionally keep units in their labels because that UI has no selector suffix.
+- **Checklist — adding a field**: add `data` + `data_description` to `strings.json` and `en.json`, unit via selector, label <=5 words, then run `tests/test_config_flow_strings.py`.
+
 ### Automation Logic Table (CRITICAL)
 
 **Decision**: The automation logic table in `docs/08-COMPUTATION-REFERENCE.md` is the definitive reference for expected behavior across all classification contexts and events.

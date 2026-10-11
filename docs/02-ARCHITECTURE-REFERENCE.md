@@ -37,7 +37,7 @@ custom_components/climate_advisor/
 ├── __init__.py          # Integration setup, service registration
 ├── manifest.json        # HA integration metadata (domain, dependencies, version)
 ├── const.py             # Constants: thresholds, defaults, attribute names
-├── config_flow.py       # 3-step setup wizard (entities → sensors → schedule)
+├── config_flow.py       # Setup flow (user → unit → setpoints → temperature_sources → sensors → occupancy → schedule) + options menu
 ├── strings.json         # UI text for config flow steps
 ├── coordinator.py       # Central brain: scheduling, events, data flow, state
 ├── classifier.py        # Day type + trend classification from forecast
@@ -268,6 +268,8 @@ Both are rendered in the dashboard as a stepped purple/magenta line: solid past,
 | `climate_advisor.respond_to_suggestion` | action (accept/dismiss), suggestion_key | User responds to learning suggestion |
 
 ## Configuration Data (from config flow)
+
+The initial setup flow (`ClimateAdvisorConfigFlow`) runs `user` → `unit` → `setpoints` → `temperature_sources` (+ optional `outdoor_temp_entity` / `indoor_temp_entity` steps) → `sensors` → `occupancy` → `schedule`; `schedule` creates the entry. The options flow (`ClimateAdvisorOptionsFlow`: `init` menu → `core`, `setpoints`, `temperature_sources`, `sensors`, `occupancy`, `schedule`, `scheduler`, `notifications`, `advanced`, `classification_thresholds`, `ai_settings`, `github_settings`) is a separate set of steps. Since Issue #1061 the initial flow no longer asks timing delays, HVAC fan restriction, advanced fan settings, the welcome-home period, or the sleep indoor sensor — those are options-only and read with `config.get(KEY, DEFAULT)`. Field-building rules (labels, descriptions, units, setup-vs-options split) live in the CLAUDE.md "Config UI Field Standard (Issue #1061)" section.
 
 ```
 weather_entity: weather.home

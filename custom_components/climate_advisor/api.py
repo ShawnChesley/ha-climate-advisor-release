@@ -784,8 +784,9 @@ class ClimateAdvisorConfigView(HomeAssistantView):
                     value = _temp_source_display(coordinator, key, value, _TEMP_SOURCE_LABELS.get(value, value), config)
 
                 # Issue #1048: temperature settings are stored in internal degF. Absolute ones are shown
-                # in the user's unit; the "degrees of tolerance" deltas keep their entry unit (degF),
-                # matching the settings screen where they are typed. `unit` lives in the response (not
+                # in the user's unit; the "degrees of tolerance" deltas keep their entry unit (degF).
+                # Issue #1061: the options form now types these in the user's unit, so for Celsius
+                # users this tab no longer matches it (tracked separately). `unit` lives in the response (not
                 # CONFIG_METADATA) because it depends on the installation's configured unit.
                 setting_unit: str | None = None
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
