@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.100] — 2026-10-11
+
+- Fix #1075: documented and tested what happens when the thermostat drops offline and comes back (comfort is restored on the first temperature reading if the house is outside the range, otherwise at the next 30-minute check). No behaviour change.
+
 ## [0.7.99] — 2026-10-11
 
 - Fix #1068: after the house cooled to your comfort floor (or warmed to the ceiling) with a window open, closing the window now brings heating or cooling back right away instead of leaving the thermostat off until the next check.
