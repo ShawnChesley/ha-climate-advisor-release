@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import math
 import re
 import uuid
 from typing import Any
@@ -113,7 +114,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
 )
 from .scheduler import ALL_DAYS, COST_TAG_HIGH, MAX_SCHEDULES, WEEKDAY_ABBREVS, _parse_hhmm
-from .temperature import CELSIUS, FAHRENHEIT, from_fahrenheit, ha_system_unit, to_fahrenheit
+from .temperature import CELSIUS, FAHRENHEIT, convert_delta, from_fahrenheit, ha_system_unit, to_fahrenheit
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -305,6 +306,67 @@ def _display_default(
     if hi < value <= hi + _DISPLAY_DEFAULT_EPSILON:
         return hi
     return value
+
+
+# Issue #1061: °F-delta advanced fields (key -> (min_f, max_f, default_f)). Stored in °F under
+# the SAME key regardless of the display unit and read raw by automation.py; only the options
+# form converts. These are DELTAS, so conversion is scale-only (``convert_delta``), never +/-32.
+_DELTA_FIELDS_F: dict[str, tuple[float, float, float]] = {
+    "max_setback_depth_f": (1.0, 10.0, 8.0),
+    "comfort_deadband_hot_f": (2.0, 8.0, 5.0),
+    "comfort_deadband_warm_f": (1.0, 5.0, 2.0),
+    "comfort_deadband_mild_f": (1.0, 5.0, 2.0),
+    "comfort_deadband_cool_f": (1.0, 5.0, 2.0),
+    "comfort_deadband_cold_f": (2.0, 8.0, 5.0),
+}
+_DELTA_STEP_F = 0.5
+_DELTA_STEP_C = 0.1
+
+
+def delta_field_display(key: str, stored_f: float | None, is_celsius: bool) -> tuple[float, float, float, float]:
+    """Return ``(default, min, max, step)`` in the display unit for a °F-delta field (Issue #1061).
+
+    Celsius values are rounded to 0.1; bounds are rounded OUTWARD so every stored value inside
+    the °F range still displays inside the displayed range (and the whole °F range stays
+    reachable — submit-time conversion clamps back to the °F bounds).
+    """
+    lo_f, hi_f, default_f = _DELTA_FIELDS_F[key]
+    value_f = default_f if stored_f is None else float(stored_f)
+    if not is_celsius:
+        return value_f, lo_f, hi_f, _DELTA_STEP_F
+    return (
+        round(convert_delta(value_f, CELSIUS), 1),
+        math.floor(convert_delta(lo_f, CELSIUS) * 10) / 10,
+        math.ceil(convert_delta(hi_f, CELSIUS) * 10) / 10,
+        _DELTA_STEP_C,
+    )
+
+
+def delta_fields_to_fahrenheit(user_input: dict[str, Any], stored: Any, unit: str) -> dict[str, Any]:
+    """Convert submitted display-unit delta fields back to °F storage (Issue #1061).
+
+    NO-DRIFT RULE: if a submitted value equals what the form displayed for the currently stored
+    value (same rounding), the stored °F value is kept verbatim — an untouched Celsius field
+    must never rewrite 8.0 °F as 8.01 °F. Otherwise the value is converted (scale only) and
+    clamped to the field's °F bounds.
+    """
+    is_celsius = unit == CELSIUS
+    result = dict(user_input)
+    for key, (lo_f, hi_f, default_f) in _DELTA_FIELDS_F.items():
+        if key not in user_input:
+            continue
+        stored_f = stored.get(key)
+        if stored_f is None:
+            stored_f = default_f
+        shown = delta_field_display(key, stored_f, is_celsius)[0]
+        submitted = float(user_input[key])
+        if submitted == shown:
+            result[key] = float(stored_f)
+        elif is_celsius:
+            result[key] = min(hi_f, max(lo_f, round(submitted * 9.0 / 5.0, 2)))
+        else:
+            result[key] = submitted
+    return result
 
 
 def setpoint_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, float, float]]:
@@ -515,9 +577,6 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             mode=selector.SelectSelectorMode.DROPDOWN,
                         )
                     ),
-                    vol.Optional("sleep_indoor_temp_entity"): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
-                    ),
                 }
             ),
         )
@@ -562,17 +621,12 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_sensors(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
-        """Handle the door/window sensor selection step."""
+        """Handle the door/window sensor and fan selection step.
+
+        Issue #1061: timing/debounce and fan-feedback fields live only in the options flow;
+        every engine read of those keys falls back to a default (``config.get(KEY, DEFAULT)``).
+        """
         if user_input is not None:
-            # Convert minutes (UI) to seconds (internal storage)
-            for key in (
-                CONF_SENSOR_DEBOUNCE,
-                CONF_MANUAL_GRACE_PERIOD,
-                CONF_AUTOMATION_GRACE_PERIOD,
-                CONF_OVERRIDE_CONFIRM_PERIOD,
-            ):
-                if key in user_input:
-                    user_input[key] = int(user_input[key] * 60)
             self._data.update(user_input)
             return await self.async_step_occupancy()
 
@@ -587,50 +641,6 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         )
                     ),
                     vol.Optional(CONF_SENSOR_POLARITY_INVERTED, default=False): selector.BooleanSelector(),
-                    vol.Optional(
-                        CONF_SENSOR_DEBOUNCE, default=DEFAULT_SENSOR_DEBOUNCE_SECONDS // 60
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=60,
-                            step=1,
-                            unit_of_measurement="minutes",
-                            mode="box",
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_MANUAL_GRACE_PERIOD, default=DEFAULT_MANUAL_GRACE_SECONDS // 60
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=240,
-                            step=1,
-                            unit_of_measurement="minutes",
-                            mode="box",
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_AUTOMATION_GRACE_PERIOD, default=DEFAULT_AUTOMATION_GRACE_SECONDS // 60
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=240,
-                            step=1,
-                            unit_of_measurement="minutes",
-                            mode="box",
-                        )
-                    ),
-                    vol.Optional(
-                        CONF_OVERRIDE_CONFIRM_PERIOD, default=DEFAULT_OVERRIDE_CONFIRM_SECONDS // 60
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=60,
-                            step=1,
-                            unit_of_measurement="minutes",
-                            mode="box",
-                        )
-                    ),
                     vol.Optional(CONF_FAN_MODE, default=DEFAULT_FAN_MODE): selector.SelectSelector(
                         selector.SelectSelectorConfig(
                             options=FAN_MODE_OPTIONS,
@@ -638,37 +648,9 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         )
                     ),
                     vol.Optional(
-                        CONF_HVAC_FAN_RESTRICT_MODE, default=DEFAULT_HVAC_FAN_RESTRICT_MODE
-                    ): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=HVAC_FAN_RESTRICT_OPTIONS,
-                            mode=selector.SelectSelectorMode.DROPDOWN,
-                        )
-                    ),
-                    vol.Optional(
                         CONF_FAN_ENTITY,
                         description={"suggested_value": None},
                     ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["fan", "switch"])),
-                    vol.Optional(
-                        CONF_FAN_STATE_ENTITY,
-                        description={"suggested_value": None},
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain=["fan", "binary_sensor", "input_boolean", "switch"])
-                    ),
-                    vol.Optional(
-                        CONF_FAN_STATE_FEEDBACK,
-                        description={"suggested_value": False},
-                    ): selector.BooleanSelector(),
-                    vol.Optional(
-                        CONF_FAN_REMOTE_ENTITY,
-                        description={"suggested_value": None},
-                    ): selector.EntitySelector(selector.EntitySelectorConfig(domain="event")),
-                    vol.Optional(
-                        CONF_FAN_MIN_RUNTIME_PER_HOUR,
-                        default=DEFAULT_FAN_MIN_RUNTIME_PER_HOUR,
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=0, max=60, step=1, unit_of_measurement="min", mode="box")
-                    ),
                 }
             ),
         )
@@ -676,8 +658,6 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_occupancy(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         """Handle the occupancy awareness step."""
         if user_input is not None:
-            if CONF_WELCOME_HOME_DEBOUNCE in user_input:
-                user_input[CONF_WELCOME_HOME_DEBOUNCE] = int(user_input[CONF_WELCOME_HOME_DEBOUNCE] * 60)
             self._data.update(user_input)
             return await self.async_step_schedule()
 
@@ -706,18 +686,6 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         selector.EntitySelectorConfig(domain=["input_boolean", "binary_sensor", "switch"])
                     ),
                     vol.Optional(CONF_GUEST_TOGGLE_INVERT, default=False): selector.BooleanSelector(),
-                    vol.Optional(
-                        CONF_WELCOME_HOME_DEBOUNCE,
-                        default=DEFAULT_WELCOME_HOME_DEBOUNCE_SECONDS // 60,
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=0,
-                            max=480,
-                            step=5,
-                            unit_of_measurement="minutes",
-                            mode="box",
-                        )
-                    ),
                 }
             ),
         )
@@ -772,6 +740,10 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required("wake_time", default="06:30:00"): _time_selector,
                     vol.Required("sleep_time", default="22:30:00"): _time_selector,
                     vol.Required("briefing_time", default="06:00:00"): _time_selector,
+                    vol.Required(
+                        CONF_BRIEFING_NOTIFICATIONS_ENABLED,
+                        default=zone_registry.default_briefing_notifications_enabled(self.hass),
+                    ): selector.BooleanSelector(),
                 }
             ),
             errors=errors,
@@ -889,14 +861,23 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             notify_svc = user_input.get("notify_service", "")
             if not _NOTIFY_SERVICE_RE.match(notify_svc):
                 errors["notify_service"] = "invalid_notify_service"
+            # Issue #1061: zone_name is the entry TITLE only — never stored in entry data.
+            new_title = str(user_input.get("zone_name", "")).strip()
+            if len(new_title) > 50:
+                errors["zone_name"] = "zone_name_too_long"
             if not errors:
-                await self._commit_section(user_input)
+                section = {k: v for k, v in user_input.items() if k != "zone_name"}
+                await self._commit_section(section)
+                if new_title and new_title != self.config_entry.title:
+                    _LOGGER.info("Zone renamed — old=%s new=%s", self.config_entry.title, new_title)
+                    self.hass.config_entries.async_update_entry(self.config_entry, title=new_title)
                 return await self.async_step_init()
 
         return self.async_show_form(
             step_id="core",
             data_schema=vol.Schema(
                 {
+                    vol.Required("zone_name", default=self.config_entry.title): selector.TextSelector(),
                     vol.Required(
                         "weather_entity",
                         default=current.get("weather_entity"),
@@ -1281,7 +1262,7 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                         CONF_FAN_MIN_RUNTIME_PER_HOUR,
                         default=current.get(CONF_FAN_MIN_RUNTIME_PER_HOUR, DEFAULT_FAN_MIN_RUNTIME_PER_HOUR),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=0, max=60, step=1, unit_of_measurement="min", mode="box")
+                        selector.NumberSelectorConfig(min=0, max=60, step=1, unit_of_measurement="minutes", mode="box")
                     ),
                     vol.Optional(
                         CONF_NAT_VENT_SOFT_START_ENABLED,
@@ -1612,10 +1593,28 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             if default_p > max_p:
                 errors["default_preheat_minutes"] = "preheat_default_exceeds_max"
             if not errors:
-                await self._commit_section(user_input)
+                await self._commit_section(
+                    delta_fields_to_fahrenheit(
+                        user_input, self.config_entry.data, self.config_entry.data.get(CONF_TEMP_UNIT, FAHRENHEIT)
+                    )
+                )
                 return await self.async_step_init()
 
         current = self.config_entry.data
+        unit = current.get(CONF_TEMP_UNIT, FAHRENHEIT)
+        unit_label = "°C" if unit == CELSIUS else "°F"
+
+        def _delta_selector(key: str) -> tuple[float, selector.NumberSelector]:
+            default, lo, hi, step = delta_field_display(key, current.get(key), unit == CELSIUS)
+            return default, selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=lo,
+                    max=hi,
+                    step=step,
+                    unit_of_measurement=unit_label,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
 
         return self.async_show_form(
             step_id="advanced",
@@ -1641,25 +1640,49 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                         "min_preheat_minutes",
                         default=current.get("min_preheat_minutes", 30),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=5, max=60, step=5, mode=selector.NumberSelectorMode.BOX)
+                        selector.NumberSelectorConfig(
+                            min=5,
+                            max=60,
+                            step=5,
+                            unit_of_measurement="minutes",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(
                         "max_preheat_minutes",
                         default=current.get("max_preheat_minutes", 240),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=30, max=240, step=15, mode=selector.NumberSelectorMode.BOX)
+                        selector.NumberSelectorConfig(
+                            min=30,
+                            max=240,
+                            step=15,
+                            unit_of_measurement="minutes",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(
                         "default_preheat_minutes",
                         default=current.get("default_preheat_minutes", 120),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=10, max=120, step=5, mode=selector.NumberSelectorMode.BOX)
+                        selector.NumberSelectorConfig(
+                            min=10,
+                            max=120,
+                            step=5,
+                            unit_of_measurement="minutes",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(
                         "default_tou_lead_minutes",
                         default=current.get("default_tou_lead_minutes", 45),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=30, max=240, step=5, mode=selector.NumberSelectorMode.BOX)
+                        selector.NumberSelectorConfig(
+                            min=30,
+                            max=240,
+                            step=5,
+                            unit_of_measurement="minutes",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(
                         "preheat_safety_margin",
@@ -1669,10 +1692,8 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                     ),
                     vol.Required(
                         "max_setback_depth_f",
-                        default=current.get("max_setback_depth_f", 8.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=1.0, max=10.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("max_setback_depth_f")[0],
+                    ): _delta_selector("max_setback_depth_f")[1],
                     vol.Required(
                         "aggressive_savings",
                         default=current.get("aggressive_savings", False),
@@ -1681,44 +1702,44 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                         "comfort_mode_switch_min_interval_s",
                         default=current.get("comfort_mode_switch_min_interval_s", 600),
                     ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=60, max=1800, step=30, mode=selector.NumberSelectorMode.BOX)
+                        selector.NumberSelectorConfig(
+                            min=60,
+                            max=1800,
+                            step=30,
+                            unit_of_measurement="seconds",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(
                         "comfort_deadband_hot_f",
-                        default=current.get("comfort_deadband_hot_f", 5.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=2.0, max=8.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("comfort_deadband_hot_f")[0],
+                    ): _delta_selector("comfort_deadband_hot_f")[1],
                     vol.Required(
                         "comfort_deadband_warm_f",
-                        default=current.get("comfort_deadband_warm_f", 2.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=1.0, max=5.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("comfort_deadband_warm_f")[0],
+                    ): _delta_selector("comfort_deadband_warm_f")[1],
                     vol.Required(
                         "comfort_deadband_mild_f",
-                        default=current.get("comfort_deadband_mild_f", 2.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=1.0, max=5.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("comfort_deadband_mild_f")[0],
+                    ): _delta_selector("comfort_deadband_mild_f")[1],
                     vol.Required(
                         "comfort_deadband_cool_f",
-                        default=current.get("comfort_deadband_cool_f", 2.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=1.0, max=5.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("comfort_deadband_cool_f")[0],
+                    ): _delta_selector("comfort_deadband_cool_f")[1],
                     vol.Required(
                         "comfort_deadband_cold_f",
-                        default=current.get("comfort_deadband_cold_f", 5.0),
-                    ): selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=2.0, max=8.0, step=0.5, mode=selector.NumberSelectorMode.BOX)
-                    ),
+                        default=_delta_selector("comfort_deadband_cold_f")[0],
+                    ): _delta_selector("comfort_deadband_cold_f")[1],
                     vol.Required(
                         "comfort_family_recency_window_min",
                         default=current.get("comfort_family_recency_window_min", 120.0),
                     ): selector.NumberSelector(
                         selector.NumberSelectorConfig(
-                            min=15.0, max=360.0, step=15.0, mode=selector.NumberSelectorMode.BOX
+                            min=15.0,
+                            max=360.0,
+                            step=15.0,
+                            unit_of_measurement="minutes",
+                            mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
                 }
@@ -1928,7 +1949,13 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                     CONF_AI_MAX_TOKENS,
                     default=current.get(CONF_AI_MAX_TOKENS, DEFAULT_AI_MAX_TOKENS),
                 ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=256, max=16384, step=256, mode=selector.NumberSelectorMode.BOX)
+                    selector.NumberSelectorConfig(
+                        min=256,
+                        max=16384,
+                        step=256,
+                        unit_of_measurement="tokens",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
                 ),
                 vol.Optional(
                     CONF_AI_TEMPERATURE,
@@ -1940,7 +1967,13 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                     CONF_AI_MONTHLY_BUDGET,
                     default=current.get(CONF_AI_MONTHLY_BUDGET, DEFAULT_AI_MONTHLY_BUDGET),
                 ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=0, max=100, step=1, mode=selector.NumberSelectorMode.BOX)
+                    selector.NumberSelectorConfig(
+                        min=0,
+                        max=100,
+                        step=1,
+                        unit_of_measurement="USD",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
                 ),
                 vol.Optional(
                     CONF_AI_AUTO_REQUESTS_PER_DAY,

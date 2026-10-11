@@ -6,7 +6,7 @@ DOMAIN = "climate_advisor"
 
 # Integration version — MUST match manifest.json "version" field.
 # A test in tests/test_version_sync.py enforces this.
-VERSION = "0.7.94"
+VERSION = "0.7.95"
 
 GITHUB_REPO = "gunkl/ClimateAdvisor"
 GITHUB_REPO_URL = "https://github.com/gunkl/ClimateAdvisor"
@@ -772,6 +772,7 @@ CONFIG_METADATA = {
             " restriction. 'Both' (default) applies no restriction — current behavior."
         ),
         "category": "fan",
+        "default": DEFAULT_HVAC_FAN_RESTRICT_MODE,
     },
     "nat_vent_soft_start_enabled": {
         "label": "Nat-Vent Soft-Start (Purge Mode)",
@@ -836,6 +837,7 @@ CONFIG_METADATA = {
             " based on when HA started."
         ),
         "category": "fan",
+        "default": DEFAULT_FAN_MIN_RUNTIME_PER_HOUR,
     },
     "home_toggle_entity": {
         "label": "Home/Away Toggle",

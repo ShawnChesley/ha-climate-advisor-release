@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.95] — 2026-10-11
+
+- Fix #1061: every setting in the setup and options screens now has a clear name (no more raw names like temp_unit), the unit is shown once instead of twice, and Celsius households see setback depth and comfort deadbands in °C. Setup now asks only the essentials (timing delays, advanced fan options, the welcome-home period and the sleep sensor are in Settings with the same defaults), asks whether to send the daily briefing, and a zone can be renamed in Core Settings.
+
 ## [0.7.94] — 2026-10-10
 
 - Fix #1048 (part 2 of 2, #1050): if the house stays more than 1 °F outside the comfort band you are using for 3 hours and the heating or cooling has not run, you now get one push notification (no email), a Status line and an Activity Log entry, then a reminder every 12 hours and a note when it clears. It stays quiet while you have manual control, a door or window is open, the thermostat is offline or cannot do the needed mode, or the house is within Climate Advisor's own comfort tolerance.

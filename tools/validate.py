@@ -179,6 +179,17 @@ def check_strings(component_dir):
     except (KeyError, TypeError):
         result.error("Missing required key path: config.step.user")
 
+    # Issue #1061: HA reads translations/en.json at runtime, so it must equal strings.json.
+    en_path = os.path.join(component_dir, "translations", "en.json")
+    try:
+        with open(strings_path, encoding="utf-8") as f_strings, open(en_path, encoding="utf-8") as f_en:
+            if f_strings.read() != f_en.read():
+                result.error("translations/en.json differs from strings.json (copy strings.json over it)")
+            elif verbose:
+                print("  OK: translations/en.json matches strings.json")
+    except OSError as e:
+        result.error(f"Cannot compare translations/en.json with strings.json: {e}")
+
     return result
 
 
