@@ -250,11 +250,13 @@ class TestSetbackModifier:
             _compute_target_band_schedule([_ts(14)], _BASE_CONFIG, "away", _NOW, setback_modifier=2.0)  # type: ignore[call-arg]
 
     def test_classification_modifier_does_not_shift_away_band(self):
+        """Invariant guard: a classification trend modifier never shifts the away setback edges."""
         cls = SimpleNamespace(setback_modifier=2.0, hvac_mode="heat", day_type="cold")
         result = _compute_target_band_schedule([_ts(14)], _BASE_CONFIG, "away", _NOW, classification=cls)
         assert (result[0]["lower"], result[0]["upper"]) == (60.0, 80.0)
 
     def test_restore_hold_uses_unshifted_setback(self):
+        """Invariant guard: the restore-hold band uses the unshifted setback edges."""
         cls = SimpleNamespace(setback_modifier=-3.0, hvac_mode="cool", day_type="hot")
         result = _compute_target_band_schedule(
             [_NOW - timedelta(hours=1)], _BASE_CONFIG, "home", _NOW, classification=cls, restore_hold=True
@@ -264,7 +266,8 @@ class TestSetbackModifier:
     @pytest.mark.parametrize("modifier", [-3.0, -2.0, 0.0, 2.0, 3.0])
     @pytest.mark.parametrize("occupancy", ["away", "vacation"])
     def test_chart_band_equals_select_comfort_band(self, occupancy, modifier):
-        """Parity with the engine's real band selector for away/vacation, for any trend modifier."""
+        """Parity guard (invariant, not a regression catcher): chart band equals the engine's real
+        band selector for away/vacation, for any trend modifier."""
         from custom_components.climate_advisor.automation import select_comfort_band
 
         cls = SimpleNamespace(setback_modifier=modifier, hvac_mode="cool", day_type="hot")

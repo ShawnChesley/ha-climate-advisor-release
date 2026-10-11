@@ -12953,7 +12953,6 @@ def _build_predicted_indoor_future(
     skipped_past = 0
     _t_current = current_indoor_temp  # running indoor temp for physics simulation
     _prev_ts = now  # previous timestamp for dt calculation
-    _arm_family: str | None = None  # carried comfort family (Issue #1067)
 
     for entry in hourly_forecast:
         dt_str = entry.get("datetime") or entry.get("time")
@@ -13010,10 +13009,13 @@ def _build_predicted_indoor_future(
         # (decide_comfort_family) and the SAME band the chart displays (_band), so no band math is
         # duplicated. Only a below-floor BREACH overrides the day mode: inside the band the armed edge
         # exerts no force in the ODE, so margin/hysteresis-gap picks cannot change the curve.
-        # The ABOVE-ceiling direction is deliberately UNCHANGED (day-mode driven): this curve also feeds
-        # the ODE ceiling guard (automation.py -> decide_ode_ceiling_guard, with the 1.0F bridge
-        # tolerance), the briefing and the chart-log archive. Clamping the curve at the ceiling would
-        # make the guard see NO_BREACH_PREDICTED where it used to ESCALATE.
+        # The ABOVE-ceiling direction of THIS function is deliberately UNCHANGED (day-mode driven; we never
+        # clamp the curve at the ceiling). BUT the curve's LATER hours can now be higher: after a morning
+        # floor-heating the whole remaining curve starts from the floor instead of drifting below it, so
+        # the ODE ceiling guard (automation.py -> decide_ode_ceiling_guard) may predict an afternoon
+        # ceiling breach sooner, or for the first time. This is deliberate and more realistic (the real
+        # thermostat does heat), and it also shifts the nat-vent plan cutoff, the briefing, the
+        # chart-log archive and control_quality prediction_error.
         # Divergence (documented in docs/08-COMPUTATION-REFERENCE.md): the settling guard (Issue #1073)
         # is left disabled (recency_window_min=0) -- the forecast has no equipment-run clock.
         # Physics hours only: the setpoint-schedule fallback is a coarse ramp, left untouched. The
@@ -13024,7 +13026,7 @@ def _build_predicted_indoor_future(
                 _tou_active_hour = tou_precondition_window[0] <= local_ts < tou_precondition_window[1]
             _arm_decision = decide_comfort_family(
                 ComfortFamilyInputs(
-                    current_family=_arm_family,
+                    current_family=None,  # no carried family: only used by the (disabled) settling guard
                     default_family="heating" if mode == "heat" else "cooling",
                     indoor=_t_current,
                     floor=float(_band["lower"]),
@@ -13037,18 +13039,21 @@ def _build_predicted_indoor_future(
                     tou_precondition_active=_tou_active_hour,
                 )
             )
-            if _arm_decision.outcome is not ComfortFamilyOutcome.NOT_APPLICABLE and _arm_decision.target_family:
-                _arm_family = _arm_decision.target_family
-                if _arm_decision.breach and _arm_decision.target_family == "heating" and mode != "heat":
-                    _LOGGER.debug(
-                        "_build_predicted_indoor_future: hour=%s nearest-edge arming overrides day mode %s -> heat "
-                        "(indoor=%.1f floor=%.1f)",
-                        local_ts.strftime("%H:%M"),
-                        mode,
-                        _t_current,
-                        float(_band["lower"]),
-                    )
-                    mode = "heat"
+            if (
+                _arm_decision.outcome is not ComfortFamilyOutcome.NOT_APPLICABLE
+                and _arm_decision.breach
+                and _arm_decision.target_family == "heating"
+                and mode != "heat"
+            ):
+                _LOGGER.debug(
+                    "_build_predicted_indoor_future: hour=%s nearest-edge arming overrides day mode %s -> heat "
+                    "(indoor=%.1f floor=%.1f)",
+                    local_ts.strftime("%H:%M"),
+                    mode,
+                    _t_current,
+                    float(_band["lower"]),
+                )
+                mode = "heat"
 
         if _use_physics_for_hour and _t_current is not None and outdoor is not None:
             if mode == "heat":

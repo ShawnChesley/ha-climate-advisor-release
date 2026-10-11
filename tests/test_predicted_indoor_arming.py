@@ -20,6 +20,11 @@ from custom_components.climate_advisor.comfort_family_decision import (
     ComfortFamilyOutcome,
 )
 from custom_components.climate_advisor.coordinator import _build_predicted_indoor_future
+from custom_components.climate_advisor.ode_ceiling_guard import (
+    OdeCeilingGuardInputs,
+    OdeCeilingGuardOutcome,
+    decide_ode_ceiling_guard,
+)
 
 _CONFIG = {
     "comfort_heat": 70,
@@ -164,3 +169,48 @@ class TestNotApplicableRegimes:
         with _arming_disabled():
             legacy = _predict(entries, indoor=66.0, tou=tou)
         assert deferred == legacy
+
+
+class TestCeilingGuardOutcomeShift:
+    """Honest pin: floor-heating raises the curve's LATER hours, so the real ODE ceiling guard
+    sees a breach it previously did not. Deliberate (the real thermostat does heat)."""
+
+    _OUTDOOR = [55, 56, 58, 61, 64, 67, 70, 72, 76, 77, 78, 78, 78, 77, 75, 73]
+    _SOLAR_MODEL = {
+        "confidence": "low",
+        "k_passive": -0.12,
+        "k_active_heat": 3.0,
+        "k_active_cool": -2.5,
+        "k_solar": 0.7,
+        "confidence_k_passive": "low",
+    }
+
+    def _guard(self, curve, indoor):
+        return decide_ode_ceiling_guard(
+            OdeCeilingGuardInputs(
+                predicted_indoor=curve,
+                hvac_mode="off",
+                k_passive=-0.12,
+                confidence_k_passive="low",
+                k_passive_via_bridge=False,
+                k_active_cool=-2.5,
+                comfort_cool=75.0,
+                outdoor=55.0,
+                indoor=indoor,
+                natural_vent_active=False,
+                ceiling_threshold=75.0,
+                now=_NOW,
+            )
+        )
+
+    def test_mild_off_day_below_floor_guard_outcome_changes(self):
+        entries = _entries([float(t) for t in self._OUTDOOR])
+        armed = _predict(entries, indoor=64.0, model=self._SOLAR_MODEL)
+        with _arming_disabled():
+            legacy = _predict(entries, indoor=64.0, model=self._SOLAR_MODEL)
+        assert max(p["temp"] for p in legacy) < 74.5
+        assert max(p["temp"] for p in armed) > 75.0, "later hours are higher after floor-heating"
+        legacy_guard = self._guard(legacy, 64.0)
+        armed_guard = self._guard(armed, 64.0)
+        assert legacy_guard.outcome is OdeCeilingGuardOutcome.NO_BREACH_PREDICTED
+        assert armed_guard.outcome is not OdeCeilingGuardOutcome.NO_BREACH_PREDICTED
