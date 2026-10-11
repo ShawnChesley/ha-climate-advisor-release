@@ -9899,13 +9899,17 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         """
         classification = self.current_classification
         if classification is not None:
-            band = select_comfort_band(
-                classification,
-                self.config,
-                occupancy_mode=(self.automation_engine._occupancy_mode if self.automation_engine else OCCUPANCY_HOME),
-                in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
-                aggressive_savings=bool(self.config.get("aggressive_savings", False)),
-            )
+            if self.automation_engine is not None:
+                # Issue #1054: one resolver -- the engine's -- for both incident emitters.
+                band = self.automation_engine._resolved_comfort_band(classification)
+            else:
+                band = select_comfort_band(
+                    classification,
+                    self.config,
+                    occupancy_mode=OCCUPANCY_HOME,
+                    in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
+                    aggressive_savings=bool(self.config.get("aggressive_savings", False)),
+                )
             return band.floor, band.ceiling
         if _in_sleep_window(dt_util.now(), self.config):
             comfort_heat = self.config.get("sleep_heat", self.config.get("comfort_heat"))

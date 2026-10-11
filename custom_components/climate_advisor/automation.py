@@ -3850,13 +3850,23 @@ class AutomationEngine:
         """Emit an engine-side ``incident_detected`` via the shared payload builder (Issue #1049)."""
         if not self._emit_event_callback:
             return
+        # Issue #1054: report the band actually in force (sleep / setback / aggressive savings),
+        # not always the flat daytime config numbers. Same resolver the restores use.
+        _band_heat: float | None
+        _band_cool: float | None
+        if self._current_classification is not None:
+            _band = self._resolved_comfort_band(self._current_classification)
+            _band_heat, _band_cool = _band.floor, _band.ceiling
+        else:
+            _band_heat = self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT)
+            _band_cool = self.config.get("comfort_cool", DEFAULT_COMFORT_COOL)
         self._emit_event_callback(
             "incident_detected",
             build_incident_payload(
                 incident_class,
                 dt_util.now().isoformat(),
-                comfort_heat=self.config.get("comfort_heat", DEFAULT_COMFORT_HEAT),
-                comfort_cool=self.config.get("comfort_cool", DEFAULT_COMFORT_COOL),
+                comfort_heat=_band_heat,
+                comfort_cool=_band_cool,
                 occupancy_mode=getattr(self, "_occupancy_mode", None),
                 extra=extra,
             ),
@@ -5570,27 +5580,59 @@ class AutomationEngine:
             # below is driven by self._pre_pause_mode's own truthiness, the same input
             # the FSM's ALL_SENSORS_CLOSED transition consults (pre_pause_mode_active,
             # Step 2's fix), so they agree on when to act.
+            _paused_entity_before = self._paused_entity
             self._resolve_door_window_pause_flags(kind=DoorWindowFsmEventKind.ALL_SENSORS_CLOSED)
             self._paused_entity = None
             self._paused_since = None
             if self._pre_pause_mode:
-                # Issue #1066 (item 5): deliberately a blind mode restore BEFORE the comfort write.
-                # The restored mode is the selector's "gap memory": a paused thermostat reads
-                # Off/unknown and the selector would fall back to the day-type default family in the
-                # hysteresis gap. If indoor moved across a margin during the pause, the selector's
-                # follow-up write in _set_temperature_for_mode() corrects the mode in the same call.
-                with self._mode_change_context("restore"):
-                    await self._set_hvac_mode(
-                        self._pre_pause_mode,
-                        reason=f"door/window closed — restoring {self._pre_pause_mode} mode",
-                    )
-                    if self._current_classification:
-                        await self._set_temperature_for_mode(
-                            self._current_classification,
-                            reason="door/window closed — restoring comfort",
-                        )
-                self._start_grace_period("automation", trigger="sensor_closed_resume")
+                await self._restore_comfort_after_door_window_close(
+                    restore_mode=self._pre_pause_mode,
+                    trigger="sensor_closed_resume",
+                )
+            elif _paused_entity_before == "nat-vent-exit" and self._current_classification:
+                # Issue #1068: nat-vent ended with the window still open and the thermostat Off
+                # (cooled to the floor / hot ceiling exit), so _exit_nat_vent() stored
+                # _pre_pause_mode=None. Gated on the nat-vent-exit pause so this handler does
+                # not arm a thermostat the occupant left Off by choice (the periodic cycle
+                # still behaves as it always did).
+                await self._restore_comfort_after_door_window_close(
+                    restore_mode=None,
+                    trigger="sensor_closed_resume",
+                )
             self._pre_pause_mode = None
+
+    async def _restore_comfort_after_door_window_close(self, *, restore_mode: str | None, trigger: str) -> None:
+        """Shared door/window-closed restore: optional blind mode restore, comfort write, grace.
+
+        ``restore_mode`` is the pre-pause HVAC mode (None for the Issue #1068 nat-vent-exit
+        case where the thermostat was Off and the comfort resolver must re-arm it).
+        """
+        # Issue #1066 (item 5): deliberately a blind mode restore BEFORE the comfort write.
+        # The restored mode is the selector's "gap memory": a paused thermostat reads
+        # Off/unknown and the selector would fall back to the day-type default family in the
+        # hysteresis gap. If indoor moved across a margin during the pause, the selector's
+        # follow-up write in _set_temperature_for_mode() corrects the mode in the same call.
+        with self._mode_change_context("restore"):
+            if restore_mode:
+                await self._set_hvac_mode(
+                    restore_mode,
+                    reason=f"door/window closed — restoring {restore_mode} mode",
+                )
+            write_result = None
+            if self._current_classification:
+                write_result = await self._set_temperature_for_mode(
+                    self._current_classification,
+                    reason="door/window closed — restoring comfort",
+                )
+        self._start_grace_period("automation", trigger=trigger)
+        _LOGGER.info(
+            "Door/window closed: comfort restore dispatched "
+            "(restore_mode=%s, rearmed_from_off=%s, write_result=%s, indoor=%s)",
+            restore_mode,
+            restore_mode is None,
+            write_result,
+            self._get_indoor_temp_f(),
+        )
 
     async def check_natural_vent_conditions(self) -> None:
         """Re-evaluate natural ventilation vs pause when temperatures change.

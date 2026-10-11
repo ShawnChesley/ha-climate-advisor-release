@@ -175,6 +175,16 @@ def _make_update_data_coord(
     ae._dedup_timestamps = {}
     ae._recent_duplicate = types.MethodType(AutomationEngine._recent_duplicate, ae)
     coord.automation_engine = ae
+    # Issue #1054: the coordinator delegates band resolution to the engine; a MagicMock engine
+    # would hand back MagicMock edges, so give it a concrete flat band from the coordinator config.
+    from custom_components.climate_advisor.automation import ComfortBand as _ComfortBand
+
+    ae._resolved_comfort_band = lambda _c, _coord=coord: _ComfortBand(
+        floor=_coord.config.get("comfort_heat", 70.0),
+        ceiling=_coord.config.get("comfort_cool", 75.0),
+        active="ceiling",
+        reason="test flat band",
+    )
 
     coord._emit_event = MagicMock()
     coord._async_save_state = AsyncMock()
@@ -314,6 +324,16 @@ def _make_chart_data_coord(
     ae = MagicMock()
     ae._thermal_model = None
     coord.automation_engine = ae
+    # Issue #1054: the coordinator delegates band resolution to the engine; a MagicMock engine
+    # would hand back MagicMock edges, so give it a concrete flat band from the coordinator config.
+    from custom_components.climate_advisor.automation import ComfortBand as _ComfortBand
+
+    ae._resolved_comfort_band = lambda _c, _coord=coord: _ComfortBand(
+        floor=_coord.config.get("comfort_heat", 70.0),
+        ceiling=_coord.config.get("comfort_cool", 75.0),
+        active="ceiling",
+        reason="test flat band",
+    )
 
     learning = MagicMock()
     learning.get_thermal_model = MagicMock(return_value={})

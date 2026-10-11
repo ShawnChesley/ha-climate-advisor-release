@@ -3,6 +3,11 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.99] — 2026-10-11
+
+- Fix #1068: after the house cooled to your comfort floor (or warmed to the ceiling) with a window open, closing the window now brings heating or cooling back right away instead of leaving the thermostat off until the next check.
+- Fix #1054: incident records created by the automation now show the comfort range that was actually in force (sleep, away, savings) instead of always the daytime numbers.
+
 ## [0.7.98] — 2026-10-11
 
 - Fix #1073: after the heater or AC has just run (or you changed the thermostat yourself), a small overshoot past your comfort range no longer flips the thermostat to the opposite mode. A time-of-use pre-cool can no longer be followed by the furnace starting at the beginning of the peak-price window, and your own manual cooling or heating is left alone. A deeper miss still switches at once, and a day's natural side (cooling on a hot day, heating on a cold day) is never delayed.
