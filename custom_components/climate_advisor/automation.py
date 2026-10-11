@@ -715,6 +715,49 @@ _RESTORE_DEFERRED_TEXT: dict[str, str] = {
 }
 
 
+def resolve_active_band(
+    classification: DayClassification,
+    config: dict,
+    *,
+    occupancy_mode: str,
+    now: datetime,
+    tou_expansion_f: float = 0.0,
+) -> ComfortBand:
+    """The comfort band the thermostat is armed with right now (Issue #1080).
+
+    The ONE place the per-cycle ``select_comfort_band()`` inputs are assembled -- sleep window,
+    aggressive savings, and the TOU away/vacation expansion -- so the engine's restore resolver,
+    the status API and the incident payloads all read the same numbers the setpoint-writing
+    handlers write. ``tou_expansion_f`` matters only for away/vacation (``select_comfort_band``
+    ignores it for home/guest); ``handle_occupancy_away/vacation`` arm the expanded band during a
+    TOU window, so every read-only surface must pass it too.
+    """
+    return select_comfort_band(
+        classification,
+        config,
+        occupancy_mode=occupancy_mode,
+        in_sleep_window=_in_sleep_window(now, config),
+        aggressive_savings=bool(config.get("aggressive_savings", False)),
+        tou_expansion_f=tou_expansion_f,
+    )
+
+
+def fallback_edges_without_classification(now: datetime, config: dict) -> tuple[float | None, float | None]:
+    """Display-only (heat, cool) edges before the first classification exists (Issue #1080).
+
+    Right after an HA restart/unit change there is no classification, so ``select_comfort_band()``
+    cannot run (and the engine arms nothing -- ``NO_CLASSIFICATION``). The status API and the
+    incident resolver still need a number, so they share this sleep/day-only heuristic instead of
+    each keeping a private copy. It ignores occupancy and savings on purpose: it is a placeholder,
+    not a band anything is armed with.
+    """
+    if _in_sleep_window(now, config):
+        return config.get("sleep_heat", config.get("comfort_heat")), config.get(
+            "sleep_cool", config.get("comfort_cool")
+        )
+    return config.get("comfort_heat"), config.get("comfort_cool")
+
+
 def _in_sleep_window(now: datetime, config: dict) -> bool:
     """Return True if ``now`` falls in the configured sleep window (Issue #249).
 
@@ -4622,12 +4665,14 @@ class AutomationEngine:
         ``comfort_heat``/``comfort_cool`` band if the resolver cannot run, so a restore is never
         skipped by a resolver fault (graceful degradation)."""
         try:
-            return select_comfort_band(
+            return resolve_active_band(
                 c,
                 self.config,
                 occupancy_mode=self._occupancy_mode,
-                in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
-                aggressive_savings=bool(self.config.get("aggressive_savings", False)),
+                now=dt_util.now(),
+                # Issue #1080: handle_occupancy_away/vacation arm the TOU-expanded band, so the
+                # read-only readers (status, incidents, override matching) must resolve it too.
+                tou_expansion_f=self._tou_av_expansion_f,
             )
         except Exception:  # noqa: BLE001 - a resolver fault must not strand a restore
             _LOGGER.warning(

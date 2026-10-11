@@ -520,7 +520,14 @@ def _make_classification(**overrides):
 
 
 def _status_get_with_climate_state(
-    config: dict, climate_state, indoor_temp=70.0, outdoor_temp=None, occupancy_mode="home", classification=None
+    config: dict,
+    climate_state,
+    indoor_temp=70.0,
+    outdoor_temp=None,
+    occupancy_mode="home",
+    classification=None,
+    tou_expansion_f=0.0,
+    no_classification=False,
 ):
     """Build a minimal coordinator and drive the real status view, for setpoint/ca-target tests."""
     coord = MagicMock()
@@ -530,8 +537,12 @@ def _status_get_with_climate_state(
     coord._last_outdoor_temp = outdoor_temp
     coord.automation_enabled = True
     coord._occupancy_mode = occupancy_mode
-    coord.current_classification = classification if classification is not None else _make_classification()
+    if no_classification:
+        coord.current_classification = None
+    else:
+        coord.current_classification = classification if classification is not None else _make_classification()
     ae = MagicMock()
+    ae._tou_av_expansion_f = tou_expansion_f
     ae._manual_override_active = False
     ae._override_confirm_pending = False
     ae._fan_override_active = False
@@ -561,7 +572,7 @@ class TestCATargetSleepAware:
         "wake_time": "07:00",
     }
 
-    def _get_ca_targets(self, config: dict, now, occupancy_mode="home"):
+    def _get_ca_targets(self, config: dict, now, occupancy_mode="home", **status_kwargs):
         """Drive the real ClimateAdvisorStatusView.get(), patching dt_util.now()."""
         from unittest.mock import patch
 
@@ -571,7 +582,7 @@ class TestCATargetSleepAware:
         state.state = "heat"
         state.attributes = {"temperature": 70, "target_temp_low": None, "target_temp_high": None}
         with patch.object(dt_util, "now", return_value=now):
-            response = _status_get_with_climate_state(config, state, occupancy_mode=occupancy_mode)
+            response = _status_get_with_climate_state(config, state, occupancy_mode=occupancy_mode, **status_kwargs)
         return response["ca_target_heat"], response["ca_target_cool"]
 
     def test_daytime_uses_comfort_band(self):
@@ -631,6 +642,51 @@ class TestCATargetSleepAware:
         assert heat == 60.0 - VACATION_SETBACK_EXTRA
         assert cool == 80.0 + VACATION_SETBACK_EXTRA
 
+    def test_away_tou_window_shows_the_expanded_band_the_thermostat_holds(self):
+        """Issue #1080: handle_occupancy_away() arms select_comfort_band(tou_expansion_f=...) during a
+        TOU window, so ca_target_* must show that widened edge -- not the plain setback -- or the
+        dashboard flags a divergence that does not exist. A heat day widens only the floor."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 21, 14, 0, 0)
+        config = {**self._CONFIG, "setback_heat": 60.0, "setback_cool": 80.0}
+        heat, cool = self._get_ca_targets(config, now, occupancy_mode="away", tou_expansion_f=3.0)
+        assert heat == 57.0
+        assert cool == 80.0
+
+    def test_home_ignores_tou_expansion(self):
+        """Issue #1080: the expansion is an away/vacation-only concept; home/guest never widen."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 21, 14, 0, 0)
+        heat, cool = self._get_ca_targets(self._CONFIG, now, occupancy_mode="home", tou_expansion_f=3.0)
+        assert (heat, cool) == (68.0, 74.0)
+
+    def test_aggressive_savings_widens_the_comfort_band(self):
+        """Issue #1080: aggressive_savings widens the awake comfort band the thermostat is armed with."""
+        from datetime import datetime
+
+        from custom_components.climate_advisor.const import CEILING_ESCALATION_SAVINGS_MARGIN_F
+
+        now = datetime(2026, 7, 21, 14, 0, 0)
+        config = {**self._CONFIG, "aggressive_savings": True}
+        heat, cool = self._get_ca_targets(config, now)
+        assert heat == 68.0 - CEILING_ESCALATION_SAVINGS_MARGIN_F
+        assert cool == 74.0 + CEILING_ESCALATION_SAVINGS_MARGIN_F
+
+    def test_no_classification_daytime_uses_shared_fallback(self):
+        """Issue #1080: before the first classification the shared sleep/day heuristic applies."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 21, 14, 0, 0)
+        assert self._get_ca_targets(self._CONFIG, now, no_classification=True) == (68.0, 74.0)
+
+    def test_no_classification_sleep_window_uses_sleep_edges(self):
+        from datetime import datetime
+
+        now = datetime(2026, 7, 21, 2, 0, 0)
+        assert self._get_ca_targets(self._CONFIG, now, no_classification=True) == (64.0, 72.0)
+
 
 class TestCATargetAndNatVentCelsiusConversion:
     """Issue #903: ca_target_heat/cool and the nat-vent cycling band are internal-Fahrenheit
@@ -672,6 +728,7 @@ class TestCATargetAndNatVentCelsiusConversion:
             else {"nat_vent_target": None, "nat_vent_on_threshold": None, "nat_vent_off_threshold": None}
         )
         ae = MagicMock()
+        ae._tou_av_expansion_f = 0.0
         ae._manual_override_active = False
         ae._override_confirm_pending = False
         ae._fan_override_active = False

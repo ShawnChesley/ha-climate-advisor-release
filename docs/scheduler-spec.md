@@ -172,7 +172,11 @@ band builder and the ODE prediction curve) is unaffected — it reads the same
 carries, which `resolve_tou_away_vacation_phase()` populates identically. The precool/preheat
 leg is therefore automatically chart-covered; the widened-band leg during the window itself is
 not currently reflected on the chart (a scoped gap, not an oversight — tracked for a future
-pass rather than expanding this issue's surface further).
+pass rather than expanding this issue's surface further). The *read-only* surfaces — the status
+API's `ca_target_heat/cool`, incident payload bands and manual-override matching — do include the
+widening since Issue #1080: they all resolve the band through `automation.resolve_active_band()`
+(via `AutomationEngine._resolved_comfort_band()`), which passes the engine's
+`_tou_av_expansion_f` into `select_comfort_band()`.
 
 ## Lead-Time Computation
 

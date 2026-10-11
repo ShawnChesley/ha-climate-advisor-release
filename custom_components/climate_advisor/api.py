@@ -287,29 +287,29 @@ class ClimateAdvisorStatusView(HomeAssistantView):
             # setback band — exactly the kind of divergence this field exists to catch.
             from homeassistant.util import dt as dt_util  # noqa: PLC0415
 
-            from .automation import _in_sleep_window, select_comfort_band  # noqa: PLC0415
+            from .automation import fallback_edges_without_classification, resolve_active_band  # noqa: PLC0415
 
             classification = coordinator.current_classification
             if classification is not None:
-                _band = select_comfort_band(
+                # Issue #1080: same assembly as the engine's resolver, including the TOU
+                # away/vacation expansion the thermostat is actually armed with.
+                _ae = coordinator.automation_engine
+                _band = resolve_active_band(
                     classification,
                     coordinator.config,
                     occupancy_mode=coordinator._occupancy_mode,
-                    in_sleep_window=_in_sleep_window(dt_util.now(), coordinator.config),
-                    aggressive_savings=bool(coordinator.config.get("aggressive_savings", False)),
+                    now=dt_util.now(),
+                    tou_expansion_f=(_ae._tou_av_expansion_f if _ae is not None else 0.0),
                 )
                 _ca_target_heat = _band.floor
                 _ca_target_cool = _band.ceiling
             else:
                 # No classification yet (e.g., right after HA restart, before the first
-                # classification cycle completes) — fall back to the old sleep/day-only
-                # heuristic so the field is never simply absent.
-                if _in_sleep_window(dt_util.now(), coordinator.config):
-                    _ca_target_heat = coordinator.config.get("sleep_heat", coordinator.config.get("comfort_heat"))
-                    _ca_target_cool = coordinator.config.get("sleep_cool", coordinator.config.get("comfort_cool"))
-                else:
-                    _ca_target_heat = coordinator.config.get("comfort_heat")
-                    _ca_target_cool = coordinator.config.get("comfort_cool")
+                # classification cycle completes) — shared sleep/day-only heuristic so the
+                # field is never simply absent.
+                _ca_target_heat, _ca_target_cool = fallback_edges_without_classification(
+                    dt_util.now(), coordinator.config
+                )
 
             if classification is not None:
                 trend_direction_display = classification.trend_direction
