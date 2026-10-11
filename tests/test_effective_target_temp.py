@@ -23,6 +23,7 @@ if "homeassistant" not in sys.modules:
 
 sys.modules["homeassistant.util.dt"].now = lambda: datetime(2026, 7, 15, 14, 0, 0)
 
+from custom_components.climate_advisor.automation import AutomationEngine  # noqa: E402
 from custom_components.climate_advisor.classifier import DayClassification  # noqa: E402
 from custom_components.climate_advisor.coordinator import ClimateAdvisorCoordinator  # noqa: E402
 
@@ -41,6 +42,11 @@ def _make_coordinator(config: dict, *, day_type: str = "warm") -> object:
     coord.automation_engine = MagicMock()
     coord.automation_engine._occupancy_mode = "home"
     coord.automation_engine._natural_vent_active = False
+    # Issue #1054: the coordinator delegates band resolution to the engine -- bind the REAL resolver.
+    coord.automation_engine.config = config
+    coord.automation_engine._resolved_comfort_band = types.MethodType(
+        AutomationEngine._resolved_comfort_band, coord.automation_engine
+    )
     coord._current_classification = DayClassification(
         day_type=day_type,
         trend_direction="stable",
