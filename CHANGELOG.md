@@ -3,6 +3,14 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.98] — 2026-10-11
+
+- Fix #1073: after the heater or AC has just run (or you changed the thermostat yourself), a small overshoot past your comfort range no longer flips the thermostat to the opposite mode. A time-of-use pre-cool can no longer be followed by the furnace starting at the beginning of the peak-price window, and your own manual cooling or heating is left alone. A deeper miss still switches at once, and a day's natural side (cooling on a hot day, heating on a cold day) is never delayed.
+- Fix #1073: the five "Deadband" settings (hot, warm, mild, cool, cold) again mean how far past a comfort edge the house may go, right after the opposite mode ran, before the opposite mode is switched on (hot and cold 5 degrees, the others 2). The distance at which the thermostat pre-arms the nearer side is now a fixed 2 degrees and is no longer one of these settings.
+- Fix #1073: every real thermostat mode change and every hold now appears in the activity record with its reason, and the downloaded control-quality summary now reports how often a hold happened and whether the house recovered without the opposite mode running.
+- Fix #1070: after a door or window closes, a fan stops, or you return home, the thermostat is restored to the setpoint for the current sleep, away or savings range instead of the plain comfort range, and a thermostat change you make on a mild or warm day is now recognized correctly.
+- Fix #1071: a small overshoot after a time-of-use pre-cool or pre-heat no longer starts the opposite mode at the start of the high-price window.
+
 ## [0.7.97] — 2026-10-11
 
 - Fix #1066: on a cool morning the thermostat now heats as soon as the house is near the bottom of your comfort range, instead of sitting in cool mode below it. The system now guards whichever side of the comfort range the house is closer to and switches in the middle of the range, so a restart, a door or window closing, or a fan stopping no longer flips a working heater to cool (or the reverse on a hot day).

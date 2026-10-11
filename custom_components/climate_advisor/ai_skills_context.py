@@ -2924,6 +2924,9 @@ def _render_comfort_family_switch(p: dict, unit: str) -> tuple[str, str]:
     # Events persisted by v0.7.96 and earlier carry the retired deadband/recency keys; they still render.
     resolved_family = p.get("resolved_family", "")
     label = f"Switched to {resolved_family}" if resolved_family else "Comfort family switched"
+    # Issue #1073: also emitted when the thermostat's previous mode could not be read ("unknown").
+    if p.get("from_family") == "unknown":
+        label += " (previous mode unknown)"
     detail_parts = [p.get("reason", "")]
     indoor, floor, ceiling = p.get("indoor_f"), p.get("floor_f"), p.get("ceiling_f")
     if all(isinstance(v, (int, float)) for v in (indoor, floor, ceiling)):
@@ -2940,6 +2943,66 @@ def _render_comfort_family_switch(p: dict, unit: str) -> tuple[str, str]:
     if legacy_deadband is not None:
         detail_parts.append(f"deadband applied: {format_temp_delta(legacy_deadband, unit, 1)}")
     return label, " — ".join(part for part in detail_parts if part)
+
+
+def _render_thermostat_mode_set(p: dict, unit: str) -> tuple[str, str]:
+    # Issue #1073: one row per ACTUAL thermostat mode write (re-affirms are never emitted). The detail
+    # answers "who asked and why" so a heat/cool flip can be traced without raw logs.
+    to_mode = p.get("to_mode") or ""
+    from_mode = p.get("from_mode")
+    label = f"Thermostat set to {to_mode}" if to_mode else "Thermostat mode set"
+    if from_mode and from_mode != to_mode:
+        label = f"{label} (was {from_mode})"
+    detail_parts = [p.get("reason", "")]
+    source = p.get("source")
+    # The row is written when the change is REQUESTED; confirmation/failure are separate rows (#1049).
+    detail_parts.append(f"requested by: {source}" if source else "requested")
+    indoor, floor, ceiling = p.get("indoor_f"), p.get("floor_f"), p.get("ceiling_f")
+    if isinstance(indoor, (int, float)):
+        indoor_text = f"indoor {format_temp(indoor, unit, 0)}"
+        if isinstance(floor, (int, float)) and isinstance(ceiling, (int, float)):
+            indoor_text += f", comfort range {format_temp(floor, unit, 0)}-{format_temp(ceiling, unit, 0)}"
+        detail_parts.append(indoor_text)
+    outcome = p.get("outcome")
+    if outcome and outcome not in ("sent", "requested"):
+        detail_parts.append(f"not applied ({outcome})")
+    return label, " — ".join(part for part in detail_parts if part)
+
+
+_OPPOSITE_SIDE_LABEL = {"heating": "cooling", "cooling": "heating", "heat": "cooling", "cool": "heating"}
+
+
+def _render_comfort_switch_held(p: dict, unit: str) -> tuple[str, str]:
+    # Issue #1073: the settling guard deliberately did not flip the mode (shallow breach shortly after the
+    # opposite side ran or the user acted). Surfaced so a "why isn't it heating yet?" question is answerable.
+    candidate = p.get("candidate_family") or ""
+    label = f"Switch to {candidate} held" if candidate else "Switch held"
+    label += " (opposite side ran recently)"
+    detail_parts = []
+    indoor = p.get("indoor_f")
+    if isinstance(indoor, (int, float)):
+        detail_parts.append(f"indoor {format_temp(indoor, unit, 0)}")
+    depth, tolerance = p.get("depth_f"), p.get("tolerance_f")
+    if p.get("zone") == "margin":
+        # Inside the comfort range, near the edge: the opposite side ran recently so the mode was not flipped.
+        margin_text = "still inside the comfort range, near the edge"
+        if isinstance(tolerance, (int, float)):
+            margin_text += f" (a swing up to {format_temp_delta(tolerance, unit, 1)} past it would still be held)"
+        detail_parts.append(margin_text)
+    elif isinstance(depth, (int, float)):
+        depth_text = f"{format_temp_delta(depth, unit, 1)} past the edge"
+        if isinstance(tolerance, (int, float)):
+            depth_text += f", within the {format_temp_delta(tolerance, unit, 1)} tolerance"
+        detail_parts.append(depth_text)
+    ran = p.get("opposite_ran_min_ago")
+    if isinstance(ran, (int, float)):
+        side = _OPPOSITE_SIDE_LABEL.get(str(candidate), "the other side")
+        ran_text = f"{side} ran {int(round(ran))} min ago"
+        window = p.get("window_min")
+        if isinstance(window, (int, float)):
+            ran_text += f" (hold lasts up to {int(round(window))} min)"
+        detail_parts.append(ran_text)
+    return label, " — ".join(detail_parts)
 
 
 # Registry: event_type -> renderer
@@ -2961,6 +3024,8 @@ EVENT_RENDERERS: dict[str, Callable[[dict, str], tuple[str, str]]] = {
     "occupancy_setback_suppressed_paused": _render_occupancy_setback_suppressed_paused,
     "comfort_family_switch_locked_out": _render_comfort_family_switch_locked_out,
     "comfort_family_switch": _render_comfort_family_switch,
+    "thermostat_mode_set": _render_thermostat_mode_set,
+    "comfort_switch_held": _render_comfort_switch_held,
     "setpoint_rejected": _render_setpoint_rejected,
     "hvac_mode_not_applied": _render_hvac_mode_not_applied,
     "hvac_mode_applied_recovered": _render_hvac_mode_applied_recovered,

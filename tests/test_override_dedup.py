@@ -379,6 +379,7 @@ class TestOverrideEventDeduplication:
                 "The fix must update the signature to accept these optional keyword args."
             ) from exc
 
+        emitted = [e for e in emitted if e[0] != "thermostat_mode_set"]  # Issue #1073 audit row
         assert emitted, "No events emitted — start_override_confirmation() did not call callback"
         _, payload = emitted[0]
         missing = required_keys - set(payload.keys())
@@ -409,6 +410,7 @@ class TestOverrideEventDeduplication:
                 "start_override_confirmation()."
             ) from exc
 
+        emitted = [e for e in emitted if e[0] != "thermostat_mode_set"]  # Issue #1073 audit row
         assert emitted, "No events emitted — handle_manual_override() must forward kwargs"
         _, payload = emitted[0]
         assert payload.get("old_mode") == "off", (

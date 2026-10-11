@@ -144,7 +144,8 @@ class TestEngineModeSwitchBeforeWrite:
     def test_failed_mode_switch_aborts_the_setpoint_and_announces_once(self):
         engine = _mock_engine("off")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         engine.hass.services.async_call.side_effect = RuntimeError("boom")
         asyncio.run(engine._set_temperature(70.0, reason="t", mode="heat"))
         asyncio.run(engine._set_temperature(70.0, reason="t", mode="heat"))
@@ -156,7 +157,8 @@ class TestEngineModeSwitchBeforeWrite:
     def test_rejected_mode_switch_aborts_quietly(self, caplog):
         engine = _mock_engine("off")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
         engine.hass.services.async_call.side_effect = ServiceValidationError("mode not offered")
         with caplog.at_level(logging.WARNING, logger="custom_components.climate_advisor.automation"):
             asyncio.run(engine._set_temperature(70.0, reason="t", mode="heat"))
@@ -183,7 +185,8 @@ class TestEngineModeSwitchBeforeWrite:
         """Deep-setback targets outside the thermostat's min/max surface as HA validation errors."""
         engine = _mock_engine("heat")
         emitted = []
-        engine._emit_event_callback = lambda n, d: emitted.append((n, d))
+        # Issue #1073: thermostat_mode_set is an orthogonal audit row (tested in test_mode_write_events.py).
+        engine._emit_event_callback = lambda n, d: emitted.append((n, d)) if n != "thermostat_mode_set" else None
 
         async def call(domain, service, data, **kw):
             raise ServiceValidationError("Provided temperature 40 is not valid. Accepted range is 45 to 95")

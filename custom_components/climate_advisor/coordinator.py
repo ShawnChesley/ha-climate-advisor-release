@@ -1038,16 +1038,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         current_setpoint_f: float | None = None
         target_setpoint_f: float | None = None
+        # Issue #1073: the same decision inputs production compares (selector family + resolved band),
+        # via the engine's read-only helper -- not classification.hvac_mode / the flat band.
+        decision_mode, decision_target_f = ae._override_match_inputs(classification)
         try:
-            if classification is not None and classification_mode in ("heat", "cool"):
-                band = select_comfort_band(
-                    classification,
-                    config,
-                    occupancy_mode=ae._occupancy_mode,
-                    in_sleep_window=_in_sleep_window(now, config),
-                    aggressive_savings=bool(config.get("aggressive_savings", False)),
-                )
-                target_setpoint_f = band.floor if classification_mode == "heat" else band.ceiling
+            if classification is not None and decision_mode in ("heat", "cool"):
+                target_setpoint_f = decision_target_f
                 state = self.hass.states.get(ae.climate_entity)
                 raw_setpoint = state.attributes.get("temperature") if state else None
                 if raw_setpoint is not None:
@@ -1075,6 +1071,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 any_sensor_open=ae._any_monitored_sensor_open(),
                 grace_source=ae._last_resume_source or "automation",
                 now=now,
+                decision_mode=decision_mode,
+                decision_mode_resolved=True,
             ),
         )
         result = _override_grace_transition(self._override_grace_fsm_state, event)
@@ -10041,7 +10039,19 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 continue
             if self._equipment_last_active is None:
                 self._equipment_last_active = {}
-            self._equipment_last_active[direction] = now or dt_util.now()
+            stamp = now or dt_util.now()
+            self._equipment_last_active[direction] = stamp
+            # Issue #1073 (S4): ONE "last ran" source. This event-driven stamp (every thermostat
+            # hvac_action event) also feeds the engine's persisted ISO fields, which the 30-min
+            # cycle writer in _async_update_data() otherwise only refreshes at cycle grain. The
+            # engine's minutes_since_equipment_ran() reads those fields (restored after restart).
+            ae = getattr(self, "automation_engine", None)
+            if ae is not None:
+                iso = stamp.isoformat()
+                if direction == "heat":
+                    ae._last_hvac_heating_active = iso
+                else:
+                    ae._last_hvac_cooling_active = iso
 
     def _update_comfort_stall(
         self, indoor: float | None, comfort_heat: float | None, comfort_cool: float | None, now: datetime
@@ -11684,6 +11694,52 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         value = getattr(fam, "value", None)
         return value if isinstance(value, str) else None
 
+    @staticmethod
+    def _comfort_family_hold_label(ae: Any, now: datetime, unit: str = "fahrenheit") -> str | None:
+        """Issue #1073: plain-language settling-guard hold ("holding cooling: ..."), None when not holding.
+
+        Built from ``AutomationEngine._last_comfort_hold``. "until" is the ABSOLUTE time the recency window
+        lapses (the ran timestamp + window, stored as ``until_ts`` when the hold starts/refreshes); it falls
+        back to now + (window - ran) only for a record without ``until_ts``. Temperatures are shown in the
+        user's display unit (``unit``) and the text carries no entity identifiers.
+        """
+        try:
+            hold = getattr(ae, "_last_comfort_hold", None)
+            if not isinstance(hold, dict):
+                return None
+            candidate = hold.get("candidate_family")
+            depth = hold.get("depth_f")
+            tolerance = hold.get("tolerance_f")
+            ran = hold.get("opposite_ran_min_ago")
+            window = hold.get("window_min")
+            if not isinstance(candidate, str) or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in (depth, tolerance, ran, window)
+            ):
+                return None
+            side = "floor" if candidate == "heating" else "ceiling"
+            opposite = "cooling" if candidate == "heating" else "heating"
+            until_dt: datetime | None = None
+            until_raw = hold.get("until_ts")
+            if isinstance(until_raw, str):
+                try:
+                    until_dt = datetime.fromisoformat(until_raw)
+                except ValueError:
+                    until_dt = None
+            if until_dt is None:
+                until_dt = now + timedelta(minutes=max(0.0, float(window) - float(ran)))
+            until = until_dt.strftime("%H:%M")
+            tol_txt = format_temp_delta(float(tolerance), unit, 1)
+            if hold.get("zone") == "margin":
+                where = f"near the {side}, still inside the comfort range"
+            else:
+                where = f"{format_temp_delta(float(depth), unit, 1)} past {side}"
+            return (
+                f"holding {candidate}: {where}, tolerance {tol_txt}, "
+                f"{opposite} ran {int(round(ran))} min ago (until ~{until})"
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never break the debug view
+            return None
+
     def get_debug_state(self) -> dict[str, Any]:
         """Return serializable debug state for the dashboard."""
         ae = self.automation_engine
@@ -11770,6 +11826,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # Derived from the thermostat's real mode: ``_comfort_mode_family`` is overwritten by
             # nat-vent/WHF/economizer callers and can say "cooling" while the thermostat heats.
             "comfort_family_armed": self._comfort_family_armed_label(ae),
+            "comfort_family_hold": self._comfort_family_hold_label(ae, dt_util.now(), unit),
             "comfort_family_last_switch": (
                 dict(ae._last_comfort_switch) if getattr(ae, "_last_comfort_switch", None) else None
             ),

@@ -22,6 +22,9 @@ Confirmed input shapes (read from the code, Issue #1066):
 * Indoor history (``coordinator._indoor_temp_history``): ``list[(iso_ts, float_F)]``.
 * Mode changes (``AutomationEngine.comfort_mode_changes``): list of dicts, newest last,
   ``{ts, from_mode, to_mode, indoor_f, floor_f, ceiling_f, margin_f, reason}``.
+* Settling-guard holds (``AutomationEngine.comfort_holds``, Issue #1073): list of dicts
+  ``{start_ts, end_ts|None, end_reason "recovered"|"switched"|"lapsed"|None, candidate_family,
+  max_depth_f, tolerance_f, model_confidence "none"|"low"|"medium"|"high"|None}``.
 
 All temperature values in the output are internal Fahrenheit (``temp_unit`` only reports the
 user's display unit so a reader knows what the thermostat UI shows).
@@ -60,18 +63,30 @@ Definitions
   actual change (``indoor(b) - indoor(a)``) for the nearest later row b within +/-15 min of
   the horizon -- the quantity a drift-based deferral relies on. Signed = predicted - actual.
   ``archive_lead`` is the plain ``pred_indoor - indoor`` at the same row (the ~4 h lead error).
+* Settling guard (Issue #1073, schema 2): a *hold* is an episode where the settling guard declined to
+  flip heat/cool because the house was only slightly past an edge shortly after the opposite side ran.
+  An episode is counted in a window when it overlaps it. ``hold_minutes_total`` is the overlap with the
+  window (an open episode runs to ``now``); ``median_hold_minutes`` is over completed episodes only.
+  ``outcomes``: ``recovered`` (indoor came back inside the band, no opposite run needed), ``switched``
+  (the guard gave way and the mode flipped), ``lapsed`` (the recency window ran out), ``open`` (still
+  holding). ``recovered_share`` = recovered / completed, ``None`` with no completed episodes. A live
+  engine that recorded no holds reports ``hold_episodes`` 0 (a real zero); no hold data at all (the
+  attribute is absent) makes the hold fields ``None``. ``mode_writes.by_reason`` counts ring-buffer
+  records in the window per reason (free-text reasons are bucketed as ``other`` so nothing identifying
+  leaks). The whole block is ``None`` when there is neither hold data nor a ring buffer.
 """
 
 from __future__ import annotations
 
 import bisect
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import Any
 
-CONTROL_QUALITY_SCHEMA = 1
+CONTROL_QUALITY_SCHEMA = 2
 
 # (window label, hours)
 _WINDOWS: tuple[tuple[str, int], ...] = (("24h", 24), ("7d", 168))
@@ -86,6 +101,9 @@ _PRED_TOLERANCE = timedelta(minutes=15)
 _HORIZONS: tuple[tuple[str, int], ...] = (("30m", 30), ("60m", 60), ("120m", 120))
 _RUNNING = ("heating", "cooling")
 _RAW_RANGE_DAYS = 3
+_HOLD_OUTCOMES = ("recovered", "switched", "lapsed")
+_MODEL_CONFIDENCES = ("none", "low", "medium", "high")
+_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +128,7 @@ class _Change:
     indoor: float | None
     floor: float | None
     ceiling: float | None
+    reason: str | None = None
 
     @property
     def scorable(self) -> bool:
@@ -220,9 +239,54 @@ def _normalise_changes(mode_changes: Any) -> list[_Change]:
                 _num(c.get("indoor_f")),
                 _num(c.get("floor_f")),
                 _num(c.get("ceiling_f")),
+                _reason_bucket(c.get("reason")),
             )
         )
     out.sort(key=lambda c: c.t)
+    return out
+
+
+def _reason_bucket(value: Any) -> str | None:
+    """Short machine-style reasons pass through; anything free-text becomes ``other`` (no leakage)."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value if _REASON_RE.match(value) else "other"
+
+
+@dataclass(frozen=True, slots=True)
+class _Hold:
+    """One validated settling-guard hold episode."""
+
+    start: datetime
+    end: datetime | None
+    outcome: str  # recovered | switched | lapsed | open
+    max_depth: float | None
+    confidence: str  # none | low | medium | high | unknown
+
+
+def _normalise_holds(holds: Any) -> list[_Hold] | None:
+    """``None`` when no hold data was supplied at all; otherwise the validated (possibly empty) list."""
+    if not isinstance(holds, list):
+        return None
+    out: list[_Hold] = []
+    for h in holds:
+        if not isinstance(h, dict):
+            continue
+        start = _ts(h.get("start_ts"))
+        if start is None:
+            continue
+        end = _ts(h.get("end_ts"))
+        reason = h.get("end_reason")
+        if end is None:
+            outcome = "open"
+        elif reason in _HOLD_OUTCOMES:
+            outcome = reason
+        else:
+            continue  # closed with an unrecognised reason: not countable in any outcome bucket
+        conf = h.get("model_confidence")
+        confidence = conf if conf in _MODEL_CONFIDENCES else "unknown"
+        out.append(_Hold(start, end, outcome, _num(h.get("max_depth_f")), confidence))
+    out.sort(key=lambda x: x.start)
     return out
 
 
@@ -493,6 +557,69 @@ def _latencies(
     return {"median": _r1(median(values)), "max": _r1(max(values)), "n": len(values)}
 
 
+def _settling_guard(
+    holds: list[_Hold] | None, changes: list[_Change], all_changes_empty: bool, start: datetime, now: datetime
+) -> dict[str, Any] | None:
+    """Settling-guard report for one window (Issue #1073); ``None`` when there is no data source."""
+    if holds is None and all_changes_empty:
+        return None
+    by_reason: dict[str, int] | None = None
+    if not all_changes_empty:
+        by_reason = {}
+        for c in changes:
+            if start <= c.t <= now:
+                key = c.reason or "unknown"
+                by_reason[key] = by_reason.get(key, 0) + 1
+        by_reason = dict(sorted(by_reason.items()))
+    mode_writes = {"by_reason": by_reason}
+    if holds is None:
+        return {
+            "hold_episodes": None,
+            "hold_minutes_total": None,
+            "median_hold_minutes": None,
+            "outcomes": None,
+            "recovered_share": None,
+            "max_depth_f": None,
+            "holds_by_model_confidence": None,
+            "mode_writes": mode_writes,
+        }
+    inside = [h for h in holds if h.start < now and (h.end or now) > start]
+    outcomes = dict.fromkeys((*_HOLD_OUTCOMES, "open"), 0)
+    confidence = dict.fromkeys((*_MODEL_CONFIDENCES, "unknown"), 0)
+    total = 0.0
+    completed: list[float] = []
+    depths: list[float] = []
+    for h in inside:
+        outcomes[h.outcome] += 1
+        confidence[h.confidence] += 1
+        total += max(0.0, _minutes(min(h.end or now, now) - max(h.start, start)))
+        if h.end is not None:
+            completed.append(max(0.0, _minutes(h.end - h.start)))
+        if h.max_depth is not None:
+            depths.append(h.max_depth)
+    done = len(completed)
+    return {
+        "hold_episodes": len(inside),
+        "hold_minutes_total": _r1(total),
+        "median_hold_minutes": _r1(median(completed)) if completed else None,
+        "outcomes": outcomes,
+        "recovered_share": round(outcomes["recovered"] / done, 3) if done else None,
+        "max_depth_f": _r1(max(depths)) if depths else None,
+        "holds_by_model_confidence": confidence,
+        "mode_writes": mode_writes,
+    }
+
+
+def _guarded_settling(
+    holds: list[_Hold] | None, changes: list[_Change], all_changes_empty: bool, start: datetime, now: datetime
+) -> dict[str, Any] | None:
+    """``_settling_guard`` under the module's never-raise contract: any failure yields ``None``."""
+    try:
+        return _settling_guard(holds, changes, all_changes_empty, start, now)
+    except Exception:  # noqa: BLE001 - a bad hold record must never break a download
+        return None
+
+
 def _window(
     label: str,
     hours: int,
@@ -503,6 +630,7 @@ def _window(
     rows: list[_Row],
     times: list[datetime],
     series: list[tuple[datetime, float]],
+    holds: list[_Hold] | None = None,
 ) -> dict[str, Any]:
     start = now - timedelta(hours=hours)
     intervals = _intervals(rows, start, now)
@@ -529,6 +657,7 @@ def _window(
             "heating_minutes": _r1(_deferrable_minutes(intervals, rows, times, cooling=False)) if have_chart else None,
         },
         "prediction_error": _prediction_error(rows, times, start, now),
+        "settling_guard": _guarded_settling(holds, changes, all_changes_empty, start, now),
     }
 
 
@@ -539,6 +668,7 @@ def build_control_quality(
     chart_entries: list[dict[str, Any]],
     indoor_history: list[Any] | None = None,
     temp_unit: str = "fahrenheit",
+    comfort_holds: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the control-quality report (see module docstring for every definition)."""
     now = _aware(now)
@@ -546,6 +676,10 @@ def build_control_quality(
     changes = _normalise_changes(mode_changes)
     times = [r.t for r in rows]
     series = _indoor_series(rows, changes, indoor_history)
+    try:
+        holds = _normalise_holds(comfort_holds)
+    except Exception:  # noqa: BLE001 - never raise on odd input
+        holds = None
     return {
         "schema": CONTROL_QUALITY_SCHEMA,
         "generated_at": now.isoformat(),
@@ -560,6 +694,7 @@ def build_control_quality(
                 rows=rows,
                 times=times,
                 series=series,
+                holds=holds,
             )
             for label, hours in _WINDOWS
         },

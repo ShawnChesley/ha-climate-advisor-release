@@ -175,6 +175,13 @@ class OverrideGraceFsmInputs:
     grace_source: str
     now: datetime
     grace_would_start: bool = True
+    # Issue #1073 (S6): what production's ``_override_matches_current_decision()`` actually compares
+    # against -- the comfort-edge selector's family and the resolved band edge, NOT
+    # ``classification_mode`` (which is "off" on warm/mild days). Resolved by the caller via
+    # ``AutomationEngine._override_match_inputs()``; ``classification_mode`` still feeds the
+    # confirm-path decisions unchanged. ``decision_mode_resolved`` False keeps the legacy behaviour.
+    decision_mode: str | None = None
+    decision_mode_resolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -220,7 +227,7 @@ def _grace_expiry_outcome_str(inputs: OverrideGraceFsmInputs) -> str:
         manual_override_active=inputs.manual_override_active,
         manual_override_mode=inputs.manual_override_mode,
         manual_override_source=inputs.manual_override_source,
-        classification_mode=inputs.classification_mode,
+        classification_mode=inputs.decision_mode if inputs.decision_mode_resolved else inputs.classification_mode,
         current_setpoint_f=inputs.current_setpoint_f,
         target_setpoint_f=inputs.target_setpoint_f,
         tolerance_f=inputs.tolerance_f,

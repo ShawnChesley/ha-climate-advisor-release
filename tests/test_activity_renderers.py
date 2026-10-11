@@ -2017,6 +2017,73 @@ class TestIssue913PlainLanguageLabels:
         assert ev == "Switched to cooling"
         assert "deadband applied" in st
 
+    def test_comfort_family_switch_unknown_prior_mode_is_called_out(self):
+        ev, _st = self._render(
+            "comfort_family_switch",
+            {"resolved_family": "cooling", "from_family": "unknown", "reason": "above the ceiling", "breach": True},
+        )
+        assert ev == "Switched to cooling (previous mode unknown)"
+
+    # -- thermostat_mode_set / comfort_switch_held: Issue #1073 --
+
+    def test_thermostat_mode_set_shows_from_to_reason_source_and_band(self):
+        ev, st = self._render(
+            "thermostat_mode_set",
+            {
+                "zone": "z1",
+                "from_mode": "cool",
+                "to_mode": "heat",
+                "reason": "door/window closed, restoring",
+                "source": "restore",
+                "indoor_f": 67.0,
+                "floor_f": 68.0,
+                "ceiling_f": 74.0,
+                "outcome": "requested",
+            },
+        )
+        assert ev == "Thermostat set to heat (was cool)"
+        assert "door/window closed, restoring" in st
+        assert "requested by: restore" in st
+        assert "indoor 67" in st and "68" in st and "74" in st
+        assert "not applied" not in st
+
+    def test_thermostat_mode_set_unknown_prior_and_blocked_outcome(self):
+        ev, st = self._render("thermostat_mode_set", {"to_mode": "cool", "reason": "x", "outcome": "blocked"})
+        assert ev == "Thermostat set to cool"
+        assert "not applied (blocked)" in st
+
+    def test_thermostat_mode_set_empty_payload_does_not_raise(self):
+        ev, _st = self._render("thermostat_mode_set", {})
+        assert ev == "Thermostat mode set"
+
+    def test_comfort_switch_held_plain_language_both_directions(self):
+        ev, st = self._render(
+            "comfort_switch_held",
+            {
+                "candidate_family": "heating",
+                "depth_f": 1.0,
+                "tolerance_f": 5.0,
+                "opposite_ran_min_ago": 12.0,
+                "window_min": 120.0,
+                "indoor_f": 67.0,
+                "floor_f": 68.0,
+                "ceiling_f": 74.0,
+            },
+        )
+        assert ev == "Switch to heating held (opposite side ran recently)"
+        assert "1.0" in st and "past the edge" in st and "5.0" in st and "tolerance" in st
+        assert "cooling ran 12 min ago" in st
+        _ev2, st2 = self._render(
+            "comfort_switch_held",
+            {"candidate_family": "cooling", "depth_f": 1.0, "tolerance_f": 2.0, "opposite_ran_min_ago": 5.0},
+        )
+        assert "heating ran 5 min ago" in st2
+
+    def test_comfort_switch_held_empty_payload_does_not_raise(self):
+        ev, st = self._render("comfort_switch_held", {})
+        assert ev.startswith("Switch held")
+        assert st == ""
+
 
 # ---------------------------------------------------------------------------
 # TestUnprotectedGraceStartedHidden

@@ -2524,6 +2524,7 @@
               }
               return '<tr><td>Comfort Edge Armed</td><td>' + txt + '<span class="kv-desc">Which comfort edge the thermostat is guarding, and the last heat/cool switch</span></td></tr>';
             })()}
+            ${data.comfort_family_hold ? '<tr><td>Comfort Switch Hold</td><td>' + escapeHtml(String(data.comfort_family_hold)) + '<span class="kv-desc">The thermostat is deliberately not flipping heat/cool yet: the house is only slightly past an edge shortly after the other side ran</span></td></tr>' : ''}
           </table>
         </div>
         ${sensorRows ? `

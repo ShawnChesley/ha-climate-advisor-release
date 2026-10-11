@@ -285,7 +285,11 @@ class TestTouBankNotUndoneBySelector:
 
     def test_negative_control_preheat_without_the_window_flips_to_cool(self):
         engine, clock, c = self._banked(hvac_mode="heat", target=76.0, indoor=70.0, mode="off", window=False)
-        for reading in (73.0, 75.0):
+        # Issue #1073: 73.0 twice (cool margin zone, a non-breach switch). The old 75.0 is a 1 F ceiling
+        # breach right after the heat bank -- exactly the overshoot the settling guard now HOLDS, so it can
+        # no longer serve as the "selector flips without the window" control. The first reading (+5 min) is
+        # inside the 600 s lock, the second (+10 min) is past it.
+        for reading in (73.0, 73.0):
             self._cycle(engine, clock, c, 76.0, reading)
         assert "cool" in _mode_writes(engine)
 
@@ -682,7 +686,9 @@ class TestStickyTouPreconditionWindow:
         self._drive(coord, engine, clock, c, [("P", 70.5)])
         engine.set_tou_precondition_window(None)  # what the pre-fix coordinator did on a NONE cycle
         _set_indoor(engine, 69.6)
-        clock.advance(minutes=5)
+        # Issue #1073 (S3): the TOU bank write now arms the 600 s mode-change lock, which would
+        # also stop this non-breach flip; advance past it so the control still isolates the window.
+        clock.advance(minutes=11)
         with patch(f"{_AUTOMATION}.dt_util.now", side_effect=clock):
             _run(engine.comfort_family_temperature_check(69.6, predicted_indoor=None))
         assert "heat" in _mode_writes(engine)
@@ -829,7 +835,7 @@ class TestBypassWriteDoesNotSuppressARealSwitch:
     """Fix 3: after a mode change made WITHOUT the selector (TOU bank here), a genuine later switch back
     to the previously resolved family must emit its INFO / event / _last_comfort_switch."""
 
-    def _scenario(self, *, indoor_first: float, mode: str, bank_mode: str, target: float):
+    def _scenario(self, *, indoor_first: float, indoor_second: float, mode: str, bank_mode: str, target: float):
         engine = _make_engine(indoor=indoor_first, mode=mode)
         events: list[str] = []
         engine._emit_event_callback = lambda n, d: events.append(n)
@@ -844,16 +850,23 @@ class TestBypassWriteDoesNotSuppressARealSwitch:
             assert _mode(engine) == bank_mode
             clock.advance(minutes=30)
             engine._current_classification = c
+            # Issue #1073: the second breach is deeper than the mild 2 F tolerance, otherwise the settling
+            # guard HOLDS it (the bank just ran the opposite side) and there is no second switch to emit.
+            _set_indoor(engine, indoor_second)
             _run(engine.apply_classification(c))  # selector wants the SAME family as switch #1 again
         return engine, events
 
     def test_heat_then_bank_cool_then_heat_again_emits_second_event(self):
-        engine, events = self._scenario(indoor_first=66.0, mode="cool", bank_mode="cool", target=64.0)
+        engine, events = self._scenario(
+            indoor_first=66.0, indoor_second=62.0, mode="cool", bank_mode="cool", target=64.0
+        )
         assert _mode(engine) == "heat"
         assert events.count("comfort_family_switch") == 2
 
     def test_cool_then_bank_heat_then_cool_again_emits_second_event(self):
-        engine, events = self._scenario(indoor_first=76.0, mode="heat", bank_mode="heat", target=76.0)
+        engine, events = self._scenario(
+            indoor_first=76.0, indoor_second=80.0, mode="heat", bank_mode="heat", target=76.0
+        )
         assert _mode(engine) == "cool"
         assert events.count("comfort_family_switch") == 2
 
