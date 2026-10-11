@@ -6,7 +6,7 @@ DOMAIN = "climate_advisor"
 
 # Integration version — MUST match manifest.json "version" field.
 # A test in tests/test_version_sync.py enforces this.
-VERSION = "0.7.95"
+VERSION = "0.7.96"
 
 GITHUB_REPO = "gunkl/ClimateAdvisor"
 GITHUB_REPO_URL = "https://github.com/gunkl/ClimateAdvisor"
@@ -16,6 +16,11 @@ GITHUB_ISSUES_LIMIT = 15  # max issues to include in context
 
 CONF_GITHUB_TOKEN = "github_token"
 CONF_GITHUB_REPO = "github_repo"
+# Issue #1062: config keys whose values must never appear in diagnostics output (download
+# or dump_diagnostics log). Not CONFIG_METADATA "sensitive" flags: that dict also drives the
+# Settings tab and the suggestion-accept write allowlist, which a secret must not join.
+# ai_api_key is covered by its CONFIG_METADATA "sensitive" flag; diagnostics.TO_REDACT unions both.
+REDACTED_CONFIG_KEYS = frozenset({"notify_service", CONF_GITHUB_TOKEN})
 API_SUBMIT_GITHUB_ISSUE = "/api/climate_advisor/submit_github_issue"
 
 # Default setpoints (°F) — reformatted to match a real, tuned installation's own

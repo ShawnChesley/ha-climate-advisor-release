@@ -337,6 +337,36 @@ class TestConfigViewDisplayTransform:
         resp = asyncio.run(ClimateAdvisorConfigView().get(_make_view_request(coord)))
         return {s["key"]: s["value"] for s in resp.json_data["settings"]}["indoor_temp_source"]
 
+    @staticmethod
+    def _settings(config: dict) -> dict:
+        import asyncio
+
+        from custom_components.climate_advisor.api import ClimateAdvisorConfigView
+
+        coord = MagicMock()
+        coord.config = config
+        resp = asyncio.run(ClimateAdvisorConfigView().get(_make_view_request(coord)))
+        return {s["key"]: s for s in resp.json_data["settings"]}
+
+    def test_temp_delta_settings_shown_in_celsius_for_celsius_users(self):
+        """Issue #1063: degree-difference settings are converted (scale-only), not left in degF."""
+        s = self._settings({"temp_unit": "celsius", "max_setback_depth_f": 8.0, "comfort_deadband_hot_f": 5.0})
+        assert (s["max_setback_depth_f"]["value"], s["max_setback_depth_f"]["unit"]) == (4.4, "°C")
+        assert (s["comfort_deadband_hot_f"]["value"], s["comfort_deadband_hot_f"]["unit"]) == (2.8, "°C")
+
+    def test_temp_delta_settings_unchanged_for_fahrenheit_users(self):
+        s = self._settings({"temp_unit": "fahrenheit", "max_setback_depth_f": 7.5})
+        assert (s["max_setback_depth_f"]["value"], s["max_setback_depth_f"]["unit"]) == (7.5, "°F")
+
+    def test_temp_delta_settings_match_the_options_form(self):
+        """Same stored value -> same number on the Settings tab and in the options form."""
+        from custom_components.climate_advisor.config_flow import delta_field_display
+
+        stored = {"max_setback_depth_f": 4.3, "comfort_deadband_cold_f": 6.0}
+        s = self._settings({"temp_unit": "celsius", **stored})
+        for key, value_f in stored.items():
+            assert s[key]["value"] == delta_field_display(key, value_f, True)[0]
+
     def test_indoor_sensor_failure_says_decisions_paused(self):
         text = self._indoor_source_text(
             {"indoor_temp_source": "sensor", "indoor_temp_entity": "sensor.indoor"}, reason="stale"

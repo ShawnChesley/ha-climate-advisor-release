@@ -186,7 +186,7 @@ class TestSensorAttributeUnits:
 
 class TestConfigViewTemperatureUnits:
     """Settings tab: absolute temperatures in the user's unit (with `unit` in the response);
-    the six tolerance deltas keep their entry unit (degF)."""
+    the six tolerance deltas too (scale-only conversion, Issue #1063)."""
 
     ABS_KEYS = (
         "comfort_heat",
@@ -238,11 +238,13 @@ class TestConfigViewTemperatureUnits:
         s = self._settings({"comfort_heat": 71.6})
         assert (s["comfort_heat"]["value"], s["comfort_heat"]["unit"]) == (71.6, "\u00b0F")
 
-    def test_delta_settings_report_fahrenheit_in_both_units(self):
-        for unit in ("celsius", "fahrenheit"):
+    def test_delta_settings_follow_the_users_unit(self):
+        """Issue #1063 (supersedes the #1048 'deltas stay degF' rule): scale-only conversion, no +32."""
+        cases = {"celsius": (1.1, 4.4, "\u00b0C"), "fahrenheit": (2.0, 8, "\u00b0F")}
+        for unit, (deadband, depth, symbol) in cases.items():
             s = self._settings({"temp_unit": unit, "comfort_deadband_hot_f": 2.0, "max_setback_depth_f": 8})
-            assert (s["comfort_deadband_hot_f"]["value"], s["comfort_deadband_hot_f"]["unit"]) == (2.0, "\u00b0F")
-            assert s["max_setback_depth_f"]["value"] == 8
+            assert (s["comfort_deadband_hot_f"]["value"], s["comfort_deadband_hot_f"]["unit"]) == (deadband, symbol)
+            assert s["max_setback_depth_f"]["value"] == depth
 
     def test_non_temperature_settings_carry_no_unit(self):
         s = self._settings({"temp_unit": "celsius"})

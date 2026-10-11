@@ -783,19 +783,21 @@ class ClimateAdvisorConfigView(HomeAssistantView):
                 elif transform == "temp_source_label" and isinstance(value, str):
                     value = _temp_source_display(coordinator, key, value, _TEMP_SOURCE_LABELS.get(value, value), config)
 
-                # Issue #1048: temperature settings are stored in internal degF. Absolute ones are shown
-                # in the user's unit; the "degrees of tolerance" deltas keep their entry unit (degF).
-                # Issue #1061: the options form now types these in the user's unit, so for Celsius
-                # users this tab no longer matches it (tracked separately). `unit` lives in the response (not
-                # CONFIG_METADATA) because it depends on the installation's configured unit.
+                # Issue #1048: temperature settings are stored in internal degF and shown in the user's
+                # unit: absolute ones via display_temp, the "degrees of tolerance" deltas (scale-only,
+                # no offset) via display_delta -- the same conversion the options form uses (Issues
+                # #1061/#1063). `unit` lives in the response (not CONFIG_METADATA) because it depends
+                # on the installation's configured unit.
                 setting_unit: str | None = None
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    if transform == "temp_abs":
-                        user_unit = config.get("temp_unit", FAHRENHEIT)
-                        value = display_temp(value, user_unit)
-                        setting_unit = UNIT_SYMBOL.get(user_unit, UNIT_SYMBOL[FAHRENHEIT])
-                    elif transform == "temp_delta":
-                        setting_unit = UNIT_SYMBOL[FAHRENHEIT]
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and transform in ("temp_abs", "temp_delta")
+                ):
+                    user_unit = config.get("temp_unit", FAHRENHEIT)
+                    convert = display_temp if transform == "temp_abs" else display_delta
+                    value = convert(value, user_unit)
+                    setting_unit = UNIT_SYMBOL.get(user_unit, UNIT_SYMBOL[FAHRENHEIT])
 
                 entry = {
                     "key": key,

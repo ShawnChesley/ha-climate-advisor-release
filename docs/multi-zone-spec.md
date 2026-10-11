@@ -2081,9 +2081,9 @@ grew the function by 5 lines) instead builds
 entirely on the final `async_redact_data(payload, TO_REDACT)` call
 (`diagnostics.py:91`, was `:86` pre-Phase-B) to protect both `notify_service`
 and `ai_api_key`
-(`TO_REDACT = {"notify_service"} | {key for key, meta in
-CONFIG_METADATA.items() if meta.get("sensitive")}`, `diagnostics.py:32`,
-unchanged) —
+(`TO_REDACT = set(REDACTED_CONFIG_KEYS) | {key for key, meta in
+CONFIG_METADATA.items() if meta.get("sensitive")}`, `diagnostics.py`;
+`REDACTED_CONFIG_KEYS` = `notify_service` + `github_token` since Issue #1062) —
 and HA's `async_redact_data` **replaces** a matching key's value with the
 literal string `"**REDACTED**"` wherever it appears in the payload (including
 nested dicts), rather than dropping the key, which is a stronger guarantee
