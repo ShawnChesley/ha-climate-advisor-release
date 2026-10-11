@@ -124,7 +124,7 @@ graph TD
     I[10:30 PM - Bedtime\ndefault] --> J[clear_manual_override\n+ clear_fan_override]
     J --> JJ[Deactivate fan + economizer\nif active]
     JJ --> K{hvac_mode?}
-    K -->|heat| L[Set temp:\ncomfort_heat - 4 + setback_modifier]
+    K -->|heat| L[Set temp:\nbedtime setback sleep_heat\nno setback_modifier since #1076]
     K -->|cool| M[Set temp:\ncomfort_cool + 3]
 
     N[11:59 PM - End of Day] --> O[Compute avg indoor temp]

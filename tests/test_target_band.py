@@ -11,6 +11,8 @@ from datetime import UTC, datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 # ── HA module stubs (must happen before importing climate_advisor) ──
 if "homeassistant" not in sys.modules:
     from conftest import _install_ha_stubs
@@ -237,29 +239,80 @@ class TestMidnightWraparound:
         assert entry["upper"] == 75.0, f"Night-owl noon: expected awake upper=75.0, got {entry['upper']}"
 
 
-# ---------------------------------------------------------------------------
-# NEW-3: setback_modifier shifts away and vacation bands (I3)
+# NEW-3 (revised Issue #1076): the trend setback_modifier does NOT shift away/vacation bands.
+# The engine's select_comfort_band() never applies it (dropped by #249 P3), so the chart must
+# show exactly what the thermostat holds.
 # ---------------------------------------------------------------------------
 class TestSetbackModifier:
-    def test_setback_modifier_shifts_away_band(self):
-        """setback_modifier=+2 must shift both bounds of the away band up by 2°F."""
-        ts_today = _ts(14)
-        result = _compute_target_band_schedule([ts_today], _BASE_CONFIG, "away", _NOW, setback_modifier=2.0)
-        assert len(result) == 1
-        entry = result[0]
-        assert entry["lower"] == 62.0, (  # setback_heat(60) + modifier(2)
-            f"Away + modifier=2: expected lower=62.0, got {entry['lower']}"
-        )
-        assert entry["upper"] == 82.0, (  # setback_cool(80) + modifier(2)
-            f"Away + modifier=2: expected upper=82.0, got {entry['upper']}"
-        )
+    def test_signature_no_longer_accepts_setback_modifier(self):
+        """The parameter was removed: nothing can shift the setback edges by the trend modifier."""
+        with pytest.raises(TypeError):
+            _compute_target_band_schedule([_ts(14)], _BASE_CONFIG, "away", _NOW, setback_modifier=2.0)  # type: ignore[call-arg]
 
-    def test_setback_modifier_zero_unchanged(self):
-        """modifier=0 must produce identical output to calling without modifier."""
-        ts_today = _ts(14)
-        result_no_mod = _compute_target_band_schedule([ts_today], _BASE_CONFIG, "away", _NOW)
-        result_zero = _compute_target_band_schedule([ts_today], _BASE_CONFIG, "away", _NOW, setback_modifier=0.0)
-        assert result_no_mod == result_zero
+    def test_classification_modifier_does_not_shift_away_band(self):
+        cls = SimpleNamespace(setback_modifier=2.0, hvac_mode="heat", day_type="cold")
+        result = _compute_target_band_schedule([_ts(14)], _BASE_CONFIG, "away", _NOW, classification=cls)
+        assert (result[0]["lower"], result[0]["upper"]) == (60.0, 80.0)
+
+    def test_restore_hold_uses_unshifted_setback(self):
+        cls = SimpleNamespace(setback_modifier=-3.0, hvac_mode="cool", day_type="hot")
+        result = _compute_target_band_schedule(
+            [_NOW - timedelta(hours=1)], _BASE_CONFIG, "home", _NOW, classification=cls, restore_hold=True
+        )
+        assert (result[0]["lower"], result[0]["upper"]) == (60.0, 80.0)
+
+    @pytest.mark.parametrize("modifier", [-3.0, -2.0, 0.0, 2.0, 3.0])
+    @pytest.mark.parametrize("occupancy", ["away", "vacation"])
+    def test_chart_band_equals_select_comfort_band(self, occupancy, modifier):
+        """Parity with the engine's real band selector for away/vacation, for any trend modifier."""
+        from custom_components.climate_advisor.automation import select_comfort_band
+
+        cls = SimpleNamespace(setback_modifier=modifier, hvac_mode="cool", day_type="hot")
+        engine_band = select_comfort_band(
+            cls, _BASE_CONFIG, occupancy_mode=occupancy, in_sleep_window=False, aggressive_savings=False
+        )
+        chart = _compute_target_band_schedule([_ts(14)], _BASE_CONFIG, occupancy, _NOW, classification=cls)
+        assert chart[0]["lower"] == engine_band.floor
+        assert chart[0]["upper"] == engine_band.ceiling
+
+    @pytest.mark.parametrize("occupancy", ["away", "vacation"])
+    def test_build_target_band_for_trend_day_matches_select_comfort_band(self, occupancy):
+        """Real coordinator entry point (_build_target_band_for) with classification.setback_modifier=3.0:
+        fails if a caller re-passes the modifier to _compute_target_band_schedule (signature removed)."""
+        import types
+
+        from custom_components.climate_advisor.automation import select_comfort_band
+        from custom_components.climate_advisor.coordinator import ClimateAdvisorCoordinator
+
+        cls = object.__new__(DayClassification)
+        for k, v in dict(
+            day_type="hot",
+            hvac_mode="cool",
+            setback_modifier=3.0,
+            pre_condition=False,
+            pre_condition_target=None,
+            trend_direction="warming",
+            trend_magnitude=6.0,
+            windows_recommended=False,
+            window_open_time=None,
+            window_close_time=None,
+        ).items():
+            object.__setattr__(cls, k, v)
+        coord = object.__new__(ClimateAdvisorCoordinator)
+        coord.config = dict(_BASE_CONFIG)
+        coord._current_classification = cls
+        coord._occupancy_mode = occupancy
+        coord._occupancy_restore_held_cache = False
+        coord._hourly_forecast_temps = [{"datetime": _ts(14).isoformat(), "temperature": 90.0}]
+        coord._compute_pre_cool_trigger_time = lambda: None
+        coord._tou_precondition_window_tuple = lambda: None
+        with patch("custom_components.climate_advisor.coordinator.dt_util.as_local", side_effect=lambda x: x):
+            band = types.MethodType(ClimateAdvisorCoordinator._build_target_band_for, coord)(_NOW, None)
+        engine_band = select_comfort_band(
+            cls, _BASE_CONFIG, occupancy_mode=occupancy, in_sleep_window=False, aggressive_savings=False
+        )
+        assert band[0]["lower"] == engine_band.floor
+        assert band[0]["upper"] == engine_band.ceiling
 
 
 # ---------------------------------------------------------------------------

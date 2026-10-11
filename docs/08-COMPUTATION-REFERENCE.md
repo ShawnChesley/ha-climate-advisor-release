@@ -107,7 +107,7 @@ trend_magnitude = abs(avg_delta)
 
 ## 3. Setback Modifier
 
-The setback modifier adjusts how aggressively the system setbacks or pre-conditions based on the incoming trend. It is consumed by the overnight pre-cool target (`compute_pre_cool_target()`, §5a-i) and by the chart's target band (§5d). The earlier claim that it is applied on top of away/vacation/bedtime setbacks in the automation engine is not supported by the code (see §5 note).
+The setback modifier adjusts how aggressively the system setbacks or pre-conditions based on the incoming trend. It is consumed ONLY by the overnight pre-cool target (`compute_pre_cool_target()`, §5a-i). It is not applied to away/vacation/bedtime setbacks by the automation engine, and (Issue #1076) not by the chart's target band either (§5d). The earlier claims that either applies it are not supported by the code (see §5 note).
 
 | trend_direction | trend_magnitude condition | setback_modifier | pre_condition_target | Notes |
 |---|---|---|---|---|
@@ -146,7 +146,7 @@ Default values used in examples (from `const.py`: `DEFAULT_COMFORT_HEAT = 68`, `
 | Context | Heat Mode Formula | Cool Mode Formula | Example (heat) | Example (cool) |
 |---|---|---|---|---|
 | Home (comfort) | `comfort_heat` | `comfort_cool` | 68°F | 74°F |
-| Away | `setback_heat` (see note on `setback_modifier` below) | `setback_cool` | 63°F | 79°F |
+| Away | `setback_heat` (no trend modifier; see note on `setback_modifier` below) | `setback_cool` | 63°F | 79°F |
 | Vacation | `setback_heat - VACATION_SETBACK_EXTRA` | `setback_cool + VACATION_SETBACK_EXTRA` | 60°F | 82°F |
 | Guest | Same as Home — dispatches to `handle_occupancy_home()` | Same as Home | 68°F | 74°F |
 | Bedtime | `compute_bedtime_setback()` (see §5a) | `compute_bedtime_setback()` (see §5a) | 64°F (`DEFAULT_SLEEP_HEAT`, no model) | 72°F (`DEFAULT_SLEEP_COOL`, no model) |
@@ -158,7 +158,7 @@ Default values used in examples (from `const.py`: `DEFAULT_COMFORT_HEAT = 68`, `
 **Notes:**
 - Bedtime setback depth is now computed by `compute_bedtime_setback()` in `automation.py` (see §5a). When `sleep_heat` / `sleep_cool` are explicitly configured (#101), those values are used directly as the bedtime setpoint, bypassing the adaptive depth computation. The hardcoded defaults (`DEFAULT_SLEEP_HEAT = 66°F`, `DEFAULT_SLEEP_COOL = 78°F`) apply when neither sleep temps are configured nor thermal model data is available.
 - Bedtime cool still applies the same `+3°F` offset logic at default; when the thermal model is active, the depth is scaled to ensure the house warms/cools back to comfort within the overnight recovery window.
-- **`setback_modifier` (verified by grep, Issue #1073):** `automation.py` reads `setback_modifier` only in `compute_pre_cool_target()` / `resolve_pre_cool_modifier()` and as a logged field of the `bedtime_setback` event. The away/vacation/bedtime band edges come from `select_comfort_band()` and `compute_bedtime_setback()`, which do not apply it. Only the chart's `_compute_target_band_schedule()` adds `setback_modifier` to both setback edges. Earlier text that said the automation engine applies it to away/vacation/bedtime setbacks was not supported by the code; if that is intended behavior it is a code gap to file, not a doc fact.
+- **`setback_modifier` (verified by grep, Issue #1073):** `automation.py` reads `setback_modifier` only in `compute_pre_cool_target()` / `resolve_pre_cool_modifier()` and as a logged field of the `bedtime_setback` event. The away/vacation/bedtime band edges come from `select_comfort_band()` and `compute_bedtime_setback()`, which do not apply it. Since Issue #1076 the chart's `_compute_target_band_schedule()` no longer applies it either (it used to add it to both away/vacation setback edges, which shifted the chart band 2-3 °F away from what the thermostat held on trend days); chart and `select_comfort_band()` are now identical for away/vacation. Earlier text that said the automation engine applies it to away/vacation/bedtime setbacks was not supported by the code.
 - `VACATION_SETBACK_EXTRA = 3` degrees beyond the normal setback.
 - Guest mode calls `handle_occupancy_home()` directly — no separate handler.
 - Morning wakeup is skipped when occupancy is `away` or `vacation` (Issue #85).
@@ -260,7 +260,9 @@ T(t+dt) = T_outdoor + (T - T_outdoor) * exp(k_p * dt) + (Q/k_p) * (exp(k_p * dt)
 
 `_simulate_indoor_physics()` in `coordinator.py` implements one ODE time step. `_build_predicted_indoor_future()` drives the simulation forward through the schedule, switching `Q` between `k_active_heat`, `k_active_cool`, and `0` depending on the HVAC mode in each period.
 
-`_build_predicted_indoor_future()` accepts `occupancy_mode` (default `OCCUPANCY_HOME`) and `classification` parameters. It pre-computes the band schedule once via `_compute_target_band_schedule()` — passing `thermal_model`, `classification`, and `setback_modifier` — before iterating forecast hours. This means the predicted indoor curve uses the same adaptive sleep setpoints as the automation engine, and correctly targets setback temperatures on away/vacation days. Vacation mode propagates setback to all forecast days; away mode applies setback to today only.
+`_build_predicted_indoor_future()` accepts `occupancy_mode` (default `OCCUPANCY_HOME`) and `classification` parameters. It pre-computes the band schedule once via `_compute_target_band_schedule()` — passing `thermal_model` and `classification` — before iterating forecast hours. This means the predicted indoor curve uses the same adaptive sleep setpoints as the automation engine, and correctly targets setback temperatures on away/vacation days. Vacation mode propagates setback to all forecast days; away mode applies setback to today only.
+
+**Nearest-edge arming in the predicted curve (Issue #1067), heating direction only:** the real thermostat defends whichever comfort edge the house is outside of (`decide_comfort_family()`, `docs/comfort-edge-selection-spec.md`), not just the day-level mode. On a cool mild morning (day mode `off`) that starts under the floor, the engine heats; before #1067 the curve instead drifted down with `Q=0`. Per forecast hour on the **physics path** (hours that use the ODE; the leaf is not called on setpoint-schedule fallback hours), `_build_predicted_indoor_future()` calls the same pure leaf with the running ODE state (`_t_current`), that hour's band edges from the displayed band schedule (no band math duplicated), and `COMFORT_MIN_ARMING_MARGIN_F`. Only a **below-floor breach** overrides the day mode: heat mode, the floor setpoint and `k_active_heat` are used. Inside the band the day-mode behaviour is unchanged (an armed edge exerts no force there in the ODE). **The above-ceiling (cooling) direction is deliberately unchanged and stays day-mode driven**, because the same curve (`_last_predicted_indoor`) feeds the ODE ceiling guard (`decide_ode_ceiling_guard`, with the 1.0 F bridge tolerance, section 6c), the briefing and the chart-log archive: clamping it at the ceiling would make the guard return `NO_BREACH_PREDICTED` where it used to escalate. The leaf is not applicable, so the day mode stands, in open-window (nat-vent) hours and during an active TOU precondition window. Documented divergences: (a) the **settling guard** (Issue #1073) is left disabled (`recency_window_min=0`), because a forecast has no equipment-run clock; (b) the setpoint-schedule **fallback** path (no calibrated model) is unchanged. Mirror not yet fixed (tracked in Issue #1079): `_walk_forward_regime()` still uses the day-mode-only shape.
 
 **Gate bridge self-healing (Issue #126 Phase A):** When `k_passive` is `None` but
 `k_vent_window` is available (homes with ventilated-only observations and no passive or
@@ -298,14 +300,14 @@ Install states handled:
 
 From Issue #119, the chart's "Target Band" overlay is no longer two static scalars. `get_chart_data()` calls `_compute_target_band_schedule()` once (pre-computed before the loop) to produce a time-series `[{ts, lower, upper}]` covering every forecast hour, and passes this as `target_band` in the API response.
 
-**Function signature:** `_compute_target_band_schedule(hourly_timestamps, config, occupancy_mode, now, setback_modifier=0.0, thermal_model=None, classification=None) → list[{ts, lower, upper}]`
+**Function signature:** `_compute_target_band_schedule(hourly_timestamps, config, occupancy_mode, now, thermal_model=None, classification=None, ...) → list[{ts, lower, upper}]`
 
 **Per-timestamp band logic:**
 
 | Occupancy / time condition | lower | upper |
 |---|---|---|
-| Away — today only | `setback_heat + setback_modifier` | `setback_cool − setback_modifier` |
-| Vacation — **all forecast days** | `setback_heat + setback_modifier − VACATION_SETBACK_EXTRA` | `setback_cool − setback_modifier + VACATION_SETBACK_EXTRA` |
+| Away — today only | `setback_heat` | `setback_cool` |
+| Vacation — **all forecast days** | `setback_heat − VACATION_SETBACK_EXTRA` | `setback_cool + VACATION_SETBACK_EXTRA` |
 | Home/guest — pre-wake (`h_n < wake_h`) | `sleep_heat` | `sleep_cool` |
 | Home/guest — wake ramp (2h linear) | Interpolates `sleep_heat → comfort_heat` | Interpolates `sleep_cool → comfort_cool` |
 | Home/guest — awake (`wake_h+2h ≤ h_n < sleep_h`) | `comfort_heat` | `comfort_cool` |
@@ -313,7 +315,7 @@ From Issue #119, the chart's "Target Band" overlay is no longer two static scala
 | Home/guest — post-sleep (`h_n ≥ sleep_h+1h`) | `sleep_heat` | `sleep_cool` |
 | Away — **future days** (tomorrow+) | Normal home/guest schedule (assumes return) | Same |
 
-**`setback_modifier` parameter:** The trend-based offset from `DayClassification` (see §3). The chart adds the value to BOTH setback edges (`setback_heat + modifier`, `setback_cool + modifier`; the table above shows the older sign convention, the code at `coordinator.py :: _compute_target_band_schedule()` is authoritative). **Issue #1073 doc correction:** the automation engine does NOT apply `setback_modifier` to the away/vacation/bedtime edges (verified by grep, see §5), so the former claim that chart and engine use identical setback bounds on trend days is unverified/false; flagged as a code/doc contradiction.
+**No `setback_modifier` parameter (Issue #1076):** `_compute_target_band_schedule()` no longer accepts or applies the trend `setback_modifier`; the away/vacation setback edges are the raw config values, identical to `select_comfort_band()` (the engine never applied the modifier to those edges either, verified by grep in section 5). Earlier text saying the chart added it to both setback edges is superseded. The modifier is consumed only by pre-cool (`pre_cool_target`, passed in by the caller).
 
 **Vacation scope:** Vacation mode applies deep setback to **all** forecast days (today and future), not just today. This reflects that a vacationing household is away for the entire forecast window. Away mode applies setback to today only (assumes a return by tomorrow).
 

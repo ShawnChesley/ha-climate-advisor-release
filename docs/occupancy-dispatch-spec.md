@@ -165,10 +165,10 @@ Invoked immediately (no grace) when VACATION mode is detected. Shares the exact 
 | Mode | Heat setpoint | Cool setpoint |
 |---|---|---|
 | HOME / GUEST | `comfort_heat` | `comfort_cool` |
-| AWAY | `setback_heat + c.setback_modifier` | `setback_cool - c.setback_modifier` |
-| VACATION | `setback_heat + c.setback_modifier - 3` | `setback_cool - c.setback_modifier + 3` |
+| AWAY | `setback_heat` | `setback_cool` |
+| VACATION | `setback_heat - 3` | `setback_cool + 3` |
 
-`c.setback_modifier` comes from the `DayClassification` (e.g., trend days adjust the setback depth). `VACATION_SETBACK_EXTRA = 3` (°F, defined in `const.py:L8383`).
+The trend `c.setback_modifier` is NOT applied to away/vacation setbacks (the engine's `select_comfort_band()` does not, and since Issue #1076 neither does the chart band); it only moves the pre-cool target. `VACATION_SETBACK_EXTRA = 3` (°F, defined in `const.py:L8383`).
 
 **Comfort-band definition:** `comfort_heat` is the lower bound; `comfort_cool` is the upper bound. In-band condition: `comfort_heat ≤ T ≤ comfort_cool`.
 

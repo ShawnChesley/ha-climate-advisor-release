@@ -982,11 +982,11 @@ The dashboard is a single-file HTML/CSS/JS panel. When adding new status grid ca
 
 **Target Band (Issue #119):** The chart overlay previously called "Comfort Band" is now "Target Band". The `get_chart_data()` API response sends `target_band: [{ts, lower, upper}]` — a time-series array, not static scalars. The frontend renders this as a stepped/interpolated shaded region that changes with time of day and occupancy mode. If modifying chart rendering code, never assume `target_band` is a single pair of values; always iterate the array. The `_compute_target_band_schedule()` function in `coordinator.py` is the single source of truth for band logic — do not replicate band calculations in `index.html`.
 
-`_compute_target_band_schedule()` full signature: `(hourly_timestamps, config, occupancy_mode, now, setback_modifier=0.0, thermal_model=None, classification=None)`. Key behaviors:
+`_compute_target_band_schedule()` full signature: `(hourly_timestamps, config, occupancy_mode, now, thermal_model=None, classification=None, pre_cool_trigger_h=None, pre_cool_target=None, tou_precondition_window=None, restore_hold=False)`. Key behaviors:
 - When `thermal_model` + `classification` are both provided, sleep temps are derived from `compute_bedtime_setback(config, thermal_model, classification)` — the same function used by `automation.py`. Chart band, prediction curve, and automation engine all use identical adaptive sleep setpoints.
 - Vacation mode applies deep setback to **all** forecast days; away mode applies setback to today only.
 - Night-owl schedules (`sleep_time < wake_time`) are handled via midnight wraparound: `sleep_h += 24`; per-timestamp `h_n = h + 24 if night_owl and h < wake_h else h`.
-- `setback_modifier` is applied to setback bounds so chart and automation agree on trend days.
+- The away/vacation setback edges are the raw config values, identical to the engine's `select_comfort_band()`; the trend `setback_modifier` is NOT applied to them (Issue #1076) — it only moves the pre-cool target.
 - The function is pre-computed once before the forecast-hour loop (not called per-hour).
 
 #### API-Frontend Contract

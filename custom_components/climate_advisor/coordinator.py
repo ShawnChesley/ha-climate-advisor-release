@@ -52,7 +52,13 @@ from .automation import (
 from .briefing import generate_briefing
 from .chart_log import ChartStateLog
 from .classifier import DayClassification, ForecastSnapshot, classify_day
-from .comfort_family_decision import _native_family
+from .comfort_family_decision import (
+    COMFORT_MIN_ARMING_MARGIN_F,
+    ComfortFamilyInputs,
+    ComfortFamilyOutcome,
+    _native_family,
+    decide_comfort_family,
+)
 from .comfort_stall_decision import StallReason, decide_comfort_stall, stall_margins
 from .confirmed_transition import is_confirmed, resolve_candidate_since
 from .const import (
@@ -5252,11 +5258,6 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 self.config,
                 self._occupancy_mode,
                 now,
-                setback_modifier=(
-                    getattr(self._current_classification, "setback_modifier", 0.0)
-                    if self._current_classification is not None
-                    else 0.0
-                ),
                 thermal_model=thermal_model,
                 classification=self._current_classification,
                 pre_cool_trigger_h=_pc_trigger_h,
@@ -12466,7 +12467,6 @@ def _compute_target_band_schedule(
     config: dict,
     occupancy_mode: str,
     now: Any,
-    setback_modifier: float = 0.0,
     thermal_model: dict | None = None,
     classification: Any | None = None,
     pre_cool_trigger_h: float | None = None,
@@ -12479,8 +12479,13 @@ def _compute_target_band_schedule(
     Returns a list of dicts: [{"ts": ISO_str, "lower": float, "upper": float}].
 
     Logic per timestamp:
-    - Away today: flat setback band (shifted by setback_modifier).
-    - Vacation (any day): deep setback band (setback ± VACATION_SETBACK_EXTRA + modifier).
+    - Away today: flat setback band ``[setback_heat, setback_cool]``.
+    - Vacation (any day): deep setback band (setback ± VACATION_SETBACK_EXTRA).
+
+    The trend ``setback_modifier`` is deliberately NOT applied to the away/vacation edges (Issue #1076):
+    the engine's ``select_comfort_band()`` does not apply it either (dropped by #249 P3), and this chart
+    must show what the thermostat actually holds. The modifier is consumed only by pre-cool
+    (``pre_cool_target``, passed in by the caller).
     - Home/guest or future days when away: wake/sleep schedule with ramps.
       Wake ramp: 2h linear interpolation from sleep setback → comfort band.
       Sleep ramp: 1h linear interpolation from comfort band → sleep setback.
@@ -12526,9 +12531,8 @@ def _compute_target_band_schedule(
         elif _hvac_mode == "cool":
             sleep_cool = compute_bedtime_setback(config, thermal_model, classification)
 
-    # I3: apply setback_modifier to setback bounds (mirrors automation.py behaviour)
-    setback_heat_eff = setback_heat + setback_modifier
-    setback_cool_eff = setback_cool + setback_modifier
+    # Issue #1076: the away/vacation setback edges are the raw config values, exactly what the engine's
+    # select_comfort_band() commands -- no trend setback_modifier (see docstring).
 
     wake_time = _parse_time(config.get("wake_time", "06:30"))
     sleep_time_cfg = _parse_time(config.get("sleep_time", "22:30"))
@@ -12552,11 +12556,11 @@ def _compute_target_band_schedule(
 
         # I5: vacation applies setback to ALL days (not just today); away only applies to today
         if occupancy_mode == OCCUPANCY_VACATION:
-            lower = setback_heat_eff - VACATION_SETBACK_EXTRA
-            upper = setback_cool_eff + VACATION_SETBACK_EXTRA
+            lower = setback_heat - VACATION_SETBACK_EXTRA
+            upper = setback_cool + VACATION_SETBACK_EXTRA
         elif ts_date == now_date and (occupancy_mode == OCCUPANCY_AWAY or (restore_hold and ts <= now)):
-            lower = setback_heat_eff
-            upper = setback_cool_eff
+            lower = setback_heat
+            upper = setback_cool
         else:
             # Home/guest schedule (or future days when away)
             h = ts.hour + ts.minute / 60.0
@@ -12949,6 +12953,7 @@ def _build_predicted_indoor_future(
     skipped_past = 0
     _t_current = current_indoor_temp  # running indoor temp for physics simulation
     _prev_ts = now  # previous timestamp for dt calculation
+    _arm_family: str | None = None  # carried comfort family (Issue #1067)
 
     for entry in hourly_forecast:
         dt_str = entry.get("datetime") or entry.get("time")
@@ -12998,6 +13003,52 @@ def _build_predicted_indoor_future(
                 "(k_vent_window not valid for envelope-only decay)",
                 local_ts.strftime("%H:%M"),
             )
+
+        # Issue #1067: nearest-edge arming, HEATING breach only. The real thermostat defends whichever
+        # comfort edge the house is outside of, so a cool mild morning that starts under the floor heats
+        # even though the day mode is "off"/"cool". Uses the SAME pure leaf as the engine
+        # (decide_comfort_family) and the SAME band the chart displays (_band), so no band math is
+        # duplicated. Only a below-floor BREACH overrides the day mode: inside the band the armed edge
+        # exerts no force in the ODE, so margin/hysteresis-gap picks cannot change the curve.
+        # The ABOVE-ceiling direction is deliberately UNCHANGED (day-mode driven): this curve also feeds
+        # the ODE ceiling guard (automation.py -> decide_ode_ceiling_guard, with the 1.0F bridge
+        # tolerance), the briefing and the chart-log archive. Clamping the curve at the ceiling would
+        # make the guard see NO_BREACH_PREDICTED where it used to ESCALATE.
+        # Divergence (documented in docs/08-COMPUTATION-REFERENCE.md): the settling guard (Issue #1073)
+        # is left disabled (recency_window_min=0) -- the forecast has no equipment-run clock.
+        # Physics hours only: the setpoint-schedule fallback is a coarse ramp, left untouched. The
+        # leaf reads the ODE state (_t_current), never a fallback band-edge value.
+        if _use_physics_for_hour and outdoor is not None and _t_current is not None:
+            _tou_active_hour = False
+            if tou_precondition_window is not None:
+                _tou_active_hour = tou_precondition_window[0] <= local_ts < tou_precondition_window[1]
+            _arm_decision = decide_comfort_family(
+                ComfortFamilyInputs(
+                    current_family=_arm_family,
+                    default_family="heating" if mode == "heat" else "cooling",
+                    indoor=_t_current,
+                    floor=float(_band["lower"]),
+                    ceiling=float(_band["upper"]),
+                    margin_f=COMFORT_MIN_ARMING_MARGIN_F,
+                    # Open-window hours are nat-vent hours: the engine's selector defers there.
+                    natural_vent_active=_hour_windows_open,
+                    whf_owns_hvac=False,
+                    now=local_ts,
+                    tou_precondition_active=_tou_active_hour,
+                )
+            )
+            if _arm_decision.outcome is not ComfortFamilyOutcome.NOT_APPLICABLE and _arm_decision.target_family:
+                _arm_family = _arm_decision.target_family
+                if _arm_decision.breach and _arm_decision.target_family == "heating" and mode != "heat":
+                    _LOGGER.debug(
+                        "_build_predicted_indoor_future: hour=%s nearest-edge arming overrides day mode %s -> heat "
+                        "(indoor=%.1f floor=%.1f)",
+                        local_ts.strftime("%H:%M"),
+                        mode,
+                        _t_current,
+                        float(_band["lower"]),
+                    )
+                    mode = "heat"
 
         if _use_physics_for_hour and _t_current is not None and outdoor is not None:
             if mode == "heat":
