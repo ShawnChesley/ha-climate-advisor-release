@@ -340,6 +340,8 @@ def _sanitize_comfort_hold(item: Any) -> dict[str, Any] | None:
         return None
     end_reason = item.get("end_reason") if item.get("end_reason") in ("recovered", "switched", "lapsed") else None
     conf = item.get("model_confidence") if item.get("model_confidence") in ("none", "low", "medium", "high") else None
+    # Issue #1077: absent (rows persisted before zone was recorded) or unrecognised -> None ("unknown").
+    zone = item.get("zone") if item.get("zone") in ("breach", "margin") else None
 
     def _num(val: Any) -> float | None:
         return None if isinstance(val, bool) or not isinstance(val, int | float) else float(val)
@@ -349,6 +351,7 @@ def _sanitize_comfort_hold(item: Any) -> dict[str, Any] | None:
         "end_ts": end,
         "end_reason": end_reason if end is not None else None,
         "candidate_family": family,
+        "zone": zone,
         "max_depth_f": _num(item.get("max_depth_f")),
         "tolerance_f": _num(item.get("tolerance_f")),
         "model_confidence": conf,
@@ -2718,10 +2721,15 @@ class AutomationEngine:
             _user_mode = new_mode if isinstance(new_mode, str) and new_mode else detected_mode
             if _real_hvac_mode(_user_mode) is not None and _user_mode != old_mode:
                 self._append_mode_change(old_mode, _user_mode, "user")
-                # NOT updating ``_last_commanded_hvac_mode`` here (asked for, then reverted): the override
-                # self-resolve path compares the live mode with the last COMMAND, and the locked golden
-                # ``override_self_resolve_transient`` pins that. ``_record_commanded_mode`` instead judges a
-                # "real change" against the LIVE mode, so a CA write that reverses this user change is recorded.
+                # NOT updating ``_last_commanded_hvac_mode`` here (asked for, then reverted): it means
+                # "CA-issued only". The coordinator's override detector (state listener) fires only when
+                # the live mode != (``_last_commanded_hvac_mode`` or classification mode); if this field
+                # followed the user's flip, the user's return to the original mode would look like a fresh
+                # override, and the locked golden ``override_self_resolve_transient`` (flip at 10:00, back
+                # at 10:04:59, self-resolve at 10:10) would become a second ``override_detected``.
+                # ``_confirm_override_expired`` itself does not read this field.
+                # ``_record_commanded_mode`` instead judges a "real change" against the LIVE mode, so a CA
+                # write that reverses this user change is recorded.
         confirm_seconds = int(self.config.get(CONF_OVERRIDE_CONFIRM_PERIOD, DEFAULT_OVERRIDE_CONFIRM_SECONDS))
 
         # Issue #714: a manual override to an active HVAC mode structurally conflicts
@@ -10752,6 +10760,7 @@ class AutomationEngine:
             self._close_comfort_hold_episode(now, "lapsed")
             episode = None
         depth = decision.hold_depth_f
+        zone = decision.hold_zone  # Issue #1077: passed through from the decision, never recomputed
         merged = episode is not None
         holds = getattr(self, "_comfort_holds", None)
         if holds is None:
@@ -10776,6 +10785,7 @@ class AutomationEngine:
                 "end_ts": None,
                 "end_reason": None,
                 "candidate_family": candidate,
+                "zone": zone if zone in ("breach", "margin") else None,
                 "max_depth_f": float(depth) if isinstance(depth, int | float) else None,
                 "tolerance_f": decision.hold_tolerance_f,
                 "model_confidence": self._model_confidence_for_log(),
@@ -10789,6 +10799,10 @@ class AutomationEngine:
             episode["max_depth_f"] = (
                 float(depth) if not isinstance(prev_depth, int | float) else max(prev_depth, float(depth))
             )
+        # Issue #1077: escalate margin/unknown -> breach if any reading in the episode is a breach; a
+        # later margin reading never downgrades a breach.
+        if zone == "breach" or (episode.get("zone") not in ("breach", "margin") and zone == "margin"):
+            episode["zone"] = zone
         return merged
 
     def _close_comfort_hold_episode(self, now: datetime, reason: str) -> None:

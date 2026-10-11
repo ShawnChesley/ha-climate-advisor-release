@@ -24,7 +24,9 @@ Confirmed input shapes (read from the code, Issue #1066):
   ``{ts, from_mode, to_mode, indoor_f, floor_f, ceiling_f, margin_f, reason}``.
 * Settling-guard holds (``AutomationEngine.comfort_holds``, Issue #1073): list of dicts
   ``{start_ts, end_ts|None, end_reason "recovered"|"switched"|"lapsed"|None, candidate_family,
-  max_depth_f, tolerance_f, model_confidence "none"|"low"|"medium"|"high"|None}``.
+  zone "breach"|"margin"|None, max_depth_f, tolerance_f, model_confidence "none"|"low"|"medium"|"high"|None}``.
+  ``zone`` (Issue #1077) is None ("unknown") for rows stored before it was recorded; ``max_depth_f``
+  is reported over breach-zone holds only.
 
 All temperature values in the output are internal Fahrenheit (``temp_unit`` only reports the
 user's display unit so a reader knows what the thermostat UI shows).
@@ -86,7 +88,7 @@ from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import Any
 
-CONTROL_QUALITY_SCHEMA = 2
+CONTROL_QUALITY_SCHEMA = 3
 
 # (window label, hours)
 _WINDOWS: tuple[tuple[str, int], ...] = (("24h", 24), ("7d", 168))
@@ -102,6 +104,7 @@ _HORIZONS: tuple[tuple[str, int], ...] = (("30m", 30), ("60m", 60), ("120m", 120
 _RUNNING = ("heating", "cooling")
 _RAW_RANGE_DAYS = 3
 _HOLD_OUTCOMES = ("recovered", "switched", "lapsed")
+_HOLD_ZONES = ("breach", "margin")
 _MODEL_CONFIDENCES = ("none", "low", "medium", "high")
 _REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
@@ -262,6 +265,7 @@ class _Hold:
     outcome: str  # recovered | switched | lapsed | open
     max_depth: float | None
     confidence: str  # none | low | medium | high | unknown
+    zone: str = "unknown"  # breach | margin | unknown (Issue #1077)
 
 
 def _normalise_holds(holds: Any) -> list[_Hold] | None:
@@ -285,7 +289,12 @@ def _normalise_holds(holds: Any) -> list[_Hold] | None:
             continue  # closed with an unrecognised reason: not countable in any outcome bucket
         conf = h.get("model_confidence")
         confidence = conf if conf in _MODEL_CONFIDENCES else "unknown"
-        out.append(_Hold(start, end, outcome, _num(h.get("max_depth_f")), confidence))
+        zone = h.get("zone")
+        out.append(
+            _Hold(
+                start, end, outcome, _num(h.get("max_depth_f")), confidence, zone if zone in _HOLD_ZONES else "unknown"
+            )
+        )
     out.sort(key=lambda x: x.start)
     return out
 
@@ -580,22 +589,27 @@ def _settling_guard(
             "outcomes": None,
             "recovered_share": None,
             "max_depth_f": None,
+            "holds_by_zone": None,
             "holds_by_model_confidence": None,
             "mode_writes": mode_writes,
         }
     inside = [h for h in holds if h.start < now and (h.end or now) > start]
     outcomes = dict.fromkeys((*_HOLD_OUTCOMES, "open"), 0)
     confidence = dict.fromkeys((*_MODEL_CONFIDENCES, "unknown"), 0)
+    by_zone = dict.fromkeys((*_HOLD_ZONES, "unknown"), 0)
     total = 0.0
     completed: list[float] = []
     depths: list[float] = []
     for h in inside:
         outcomes[h.outcome] += 1
         confidence[h.confidence] += 1
+        by_zone[h.zone] += 1
         total += max(0.0, _minutes(min(h.end or now, now) - max(h.start, start)))
         if h.end is not None:
             completed.append(max(0.0, _minutes(h.end - h.start)))
-        if h.max_depth is not None:
+        # Issue #1077: depth is only an overshoot for a real breach; margin holds are 0.0 by construction
+        # and unknown-zone (pre-#1077) rows cannot be told apart, so neither feeds the deepest overshoot.
+        if h.zone == "breach" and h.max_depth is not None:
             depths.append(h.max_depth)
     done = len(completed)
     return {
@@ -605,6 +619,7 @@ def _settling_guard(
         "outcomes": outcomes,
         "recovered_share": round(outcomes["recovered"] / done, 3) if done else None,
         "max_depth_f": _r1(max(depths)) if depths else None,
+        "holds_by_zone": by_zone,
         "holds_by_model_confidence": confidence,
         "mode_writes": mode_writes,
     }

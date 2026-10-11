@@ -388,6 +388,44 @@ class TestHoldEpisodes:
         assert h["tolerance_f"] == pytest.approx(2.0)
         assert h["model_confidence"] == "medium"
 
+    def _held_at(self, indoor):
+        engine = _make_engine(indoor=indoor, mode="cool")
+        clock = _Clock()
+        _stamp_ran(engine, "cool", 40.0, clock.now)
+        _apply(engine, clock, "mild", indoor)
+        return engine, clock
+
+    def test_zone_is_recorded_from_the_decision(self):
+        assert self._held()[0].comfort_holds[0]["zone"] == "breach"  # 67.0 is below the 68 floor
+        engine, _ = self._held_at(69.0)  # inside the band, near the floor
+        assert engine.comfort_holds[0]["zone"] == "margin"
+        assert engine.comfort_holds[0]["max_depth_f"] == pytest.approx(0.0)
+
+    def test_margin_episode_escalates_to_breach_and_never_downgrades(self):
+        engine, clock = self._held_at(69.0)
+        clock.advance(minutes=2)
+        _apply(engine, clock, "mild", 67.0)  # now a real breach, same episode
+        assert len(engine.comfort_holds) == 1 and engine.comfort_holds[0]["zone"] == "breach"
+        clock.advance(minutes=2)
+        _apply(engine, clock, "mild", 69.0)  # back to margin: the breach stays recorded
+        assert engine.comfort_holds[0]["zone"] == "breach"
+        assert engine.comfort_holds[0]["max_depth_f"] == pytest.approx(1.0)
+
+    def test_zone_survives_a_restart_and_old_rows_load_as_none(self):
+        engine, _ = self._held_at(69.0)
+        fresh = _make_engine(indoor=70.0, mode="off")
+        fresh.restore_state(json.loads(json.dumps(engine.get_serializable_state())))
+        assert fresh.comfort_holds[0]["zone"] == "margin"
+        legacy = _make_engine(indoor=67.0, mode="cool")
+        legacy._restore_comfort_holds(
+            [{"start_ts": _T0.isoformat(), "end_ts": None, "candidate_family": "heating", "max_depth_f": 1.0}]
+        )
+        assert legacy.comfort_holds[0]["zone"] is None
+        legacy._restore_comfort_holds(
+            [{"start_ts": _T0.isoformat(), "candidate_family": "heating", "zone": "sideways"}]
+        )
+        assert legacy.comfort_holds[0]["zone"] is None
+
     def test_unknown_or_missing_model_confidence_is_none(self):
         assert self._held()[0].comfort_holds[0]["model_confidence"] is None
         assert self._held(confidence="bogus")[0].comfort_holds[0]["model_confidence"] is None

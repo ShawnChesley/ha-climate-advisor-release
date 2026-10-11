@@ -25,12 +25,13 @@ def ts(minutes_ago: float) -> str:
     return (NOW - timedelta(minutes=minutes_ago)).isoformat()
 
 
-def hold(start_ago, end_ago=None, reason=None, depth=1.0, conf="none", family="heating", tol=2.0):
+def hold(start_ago, end_ago=None, reason=None, depth=1.0, conf="none", family="heating", tol=2.0, zone="breach"):
     return {
         "start_ts": ts(start_ago),
         "end_ts": ts(end_ago) if end_ago is not None else None,
         "end_reason": reason,
         "candidate_family": family,
+        "zone": zone,
         "max_depth_f": depth,
         "tolerance_f": tol,
         "model_confidence": conf,
@@ -53,6 +54,35 @@ def change(ago, to_mode="heat", reason="selector"):
 def sg(holds=None, changes=(), window="24h"):
     r = build_control_quality(now=NOW, mode_changes=list(changes), chart_entries=[], comfort_holds=holds)
     return r["windows"][window]["settling_guard"]
+
+
+class TestHoldZone:
+    """Issue #1077: holds are reported by zone and the deepest overshoot counts breach holds only."""
+
+    def test_margin_only_holds_do_not_pollute_max_depth(self):
+        g = sg(
+            [hold(60, 30, "recovered", depth=0.0, zone="margin"), hold(20, 10, "recovered", depth=0.0, zone="margin")]
+        )
+        assert g["holds_by_zone"] == {"breach": 0, "margin": 2, "unknown": 0}
+        assert g["max_depth_f"] is None
+
+    def test_max_depth_is_over_breach_holds_only(self):
+        g = sg(
+            [hold(120, 90, "recovered", depth=1.5, zone="breach"), hold(60, 30, "recovered", depth=9.0, zone="margin")]
+        )
+        assert g["max_depth_f"] == 1.5
+        assert g["holds_by_zone"] == {"breach": 1, "margin": 1, "unknown": 0}
+
+    def test_rows_without_zone_are_unknown_and_excluded_from_depth(self):
+        old = hold(60, 30, "recovered", depth=3.0)
+        del old["zone"]
+        junk = hold(25, 20, "recovered", depth=4.0, zone="sideways")
+        g = sg([old, junk])
+        assert g["holds_by_zone"] == {"breach": 0, "margin": 0, "unknown": 2}
+        assert g["max_depth_f"] is None
+
+    def test_no_hold_data_reports_none(self):
+        assert sg(None, changes=[change(10)])["holds_by_zone"] is None
 
 
 class TestEpisodesAndOutcomes:
@@ -166,6 +196,7 @@ class TestRedaction:
             "outcomes",
             "recovered_share",
             "max_depth_f",
+            "holds_by_zone",
             "holds_by_model_confidence",
             "mode_writes",
         }
