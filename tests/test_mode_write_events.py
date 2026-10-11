@@ -411,6 +411,15 @@ class TestHoldEpisodes:
         assert engine.comfort_holds[0]["zone"] == "breach"
         assert engine.comfort_holds[0]["max_depth_f"] == pytest.approx(1.0)
 
+    def test_restored_unzoned_episode_with_depth_is_not_downgraded_to_margin(self):
+        engine, clock = self._held_at(67.0)  # breach, depth 1.0
+        engine._comfort_hold_episode["zone"] = None  # as if restored from before zones were recorded
+        clock.advance(minutes=2)
+        _apply(engine, clock, "mild", 69.0)  # next reading is margin (depth 0.0), same episode
+        assert len(engine.comfort_holds) == 1
+        assert engine.comfort_holds[0]["zone"] == "breach"
+        assert engine.comfort_holds[0]["max_depth_f"] == pytest.approx(1.0)
+
     def test_zone_survives_a_restart_and_old_rows_load_as_none(self):
         engine, _ = self._held_at(69.0)
         fresh = _make_engine(indoor=70.0, mode="off")

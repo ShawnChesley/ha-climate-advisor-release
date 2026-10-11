@@ -65,13 +65,15 @@ Definitions
   actual change (``indoor(b) - indoor(a)``) for the nearest later row b within +/-15 min of
   the horizon -- the quantity a drift-based deferral relies on. Signed = predicted - actual.
   ``archive_lead`` is the plain ``pred_indoor - indoor`` at the same row (the ~4 h lead error).
-* Settling guard (Issue #1073, schema 2): a *hold* is an episode where the settling guard declined to
+* Settling guard (Issue #1073, schema 3): a *hold* is an episode where the settling guard declined to
   flip heat/cool because the house was only slightly past an edge shortly after the opposite side ran.
   An episode is counted in a window when it overlaps it. ``hold_minutes_total`` is the overlap with the
   window (an open episode runs to ``now``); ``median_hold_minutes`` is over completed episodes only.
   ``outcomes``: ``recovered`` (indoor came back inside the band, no opposite run needed), ``switched``
   (the guard gave way and the mode flipped), ``lapsed`` (the recency window ran out), ``open`` (still
-  holding). ``recovered_share`` = recovered / completed, ``None`` with no completed episodes. A live
+  holding). ``holds_by_zone`` splits episodes into ``breach`` (indoor strictly past the edge) and
+  ``margin`` (within the margin, depth 0.0); ``max_depth_f`` is reported for breach episodes only.
+  ``recovered_share`` = recovered / completed, ``None`` with no completed episodes. A live
   engine that recorded no holds reports ``hold_episodes`` 0 (a real zero); no hold data at all (the
   attribute is absent) makes the hold fields ``None``. ``mode_writes.by_reason`` counts ring-buffer
   records in the window per reason (free-text reasons are bucketed as ``other`` so nothing identifying

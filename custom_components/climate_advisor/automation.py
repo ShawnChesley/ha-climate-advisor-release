@@ -10794,6 +10794,10 @@ class AutomationEngine:
             del holds[: max(0, len(holds) - COMFORT_HOLD_LOG_CAP)]
             self._comfort_hold_episode = episode
             return False
+        prior_depth = episode.get("max_depth_f")
+        if episode.get("zone") not in ("breach", "margin") and isinstance(prior_depth, int | float) and prior_depth > 0:
+            # Restored from before zones existed: a margin hold always has depth 0.0, so depth > 0 means breach.
+            episode["zone"] = "breach"
         if isinstance(depth, int | float):
             prev_depth = episode.get("max_depth_f")
             episode["max_depth_f"] = (
@@ -10845,8 +10849,9 @@ class AutomationEngine:
             reason = "lapsed"
         self._close_comfort_hold_episode(now, reason)
         _LOGGER.info(
-            "Comfort edge hold ended: zone=%s candidate=%s end_reason=%s max_depth=%s indoor=%s",
+            "Comfort edge hold ended: zone=%s hold_zone=%s candidate=%s end_reason=%s max_depth=%s indoor=%s",
             self.climate_entity,
+            episode.get("zone"),
             episode.get("candidate_family"),
             reason,
             episode.get("max_depth_f"),
