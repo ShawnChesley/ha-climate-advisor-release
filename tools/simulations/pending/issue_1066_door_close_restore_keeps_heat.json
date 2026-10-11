@@ -1,0 +1,120 @@
+{
+  "name": "issue_1066_door_close_restore_keeps_heat",
+  "description": "Heat is armed on a cold mild-day morning (indoor 67F, floor 68F). A window opens (door/window pause) and closes again (restore). After the restore and at the next evaluation the thermostat must still be on heat. Before Issue #1066 the restore path re-armed the mild day's default edge (cool at the ceiling), putting the AC on a house that was below its comfort floor.",
+  "source": "Issue #1066 plan, section on restore paths (door/window close, nat-vent exit, WHF stop, startup coalesce) re-arming a day-type default",
+  "issue": 1066,
+  "notes": [
+    "Occupant impact: closing a window must never turn the heating off and the AC on in a cold house.",
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: docs/08 section 6f 'Before / after' states that before #1066 restore paths 're-arm a day-type default without asking where indoor is'. On origin/main a mild day's default family is cooling, so the restore would re-arm cool at the ceiling and the hvac_mode_never_commanded(cool) and final comfort_family=heating assertions would fail; only a breach + deadband + sustain sequence could bring heat back. With nearest-edge arming the next evaluation (indoor 67 < 68) selects heat.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f 'Restore paths' paragraph and rule row 'indoor < floor -> heating'.",
+    "(c) Occupant outcome if this test fails to catch a regression: after airing the room the occupant gets AC (or nothing) in a house that is already below its comfort floor.",
+    "Modeled in engine-only mode (tracker-driven sensor_open / sensor_close, the same events existing door/window goldens use). Coordinator debounce and state-listener timing is a track=integration concern and is not exercised here.",
+    "Classification fields: day_type=mild, hvac_mode=off, windows_recommended=true with 10:00/17:00 window times match classifier.py for DAY_TYPE_MILD."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "initial_thermostat_mode": "heat",
+    "fan_mode": "disabled",
+    "door_window_sensors": [
+      "binary_sensor.living_room_window"
+    ]
+  },
+  "events": [
+    {
+      "time": "2026-10-11T06:30:00",
+      "type": "temp_update",
+      "indoor_f": 67.0,
+      "outdoor_f": 48.0,
+      "note": "Indoor 67F, 1F below the floor: heat armed (thermostat starts in heat)."
+    },
+    {
+      "time": "2026-10-11T06:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: Indoor 67F, 1F below the floor: heat armed (thermostat starts in heat)."
+    },
+    {
+      "time": "2026-10-11T07:00:00",
+      "type": "sensor_open",
+      "entity": "binary_sensor.living_room_window",
+      "note": "Occupant opens a window: door/window pause takes over the HVAC (heat is saved as the pre-pause mode)."
+    },
+    {
+      "time": "2026-10-11T07:05:00",
+      "type": "temp_update",
+      "indoor_f": 67.0,
+      "outdoor_f": 48.0,
+      "note": "Still 67F while paused."
+    },
+    {
+      "time": "2026-10-11T07:10:00",
+      "type": "sensor_close",
+      "entity": "binary_sensor.living_room_window",
+      "note": "Window closed: pause ends, the pre-pause mode is restored."
+    },
+    {
+      "time": "2026-10-11T07:12:00",
+      "type": "temp_update",
+      "indoor_f": 67.0,
+      "outdoor_f": 48.0,
+      "note": "Indoor still 67F after the restore."
+    },
+    {
+      "time": "2026-10-11T07:15:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Next scheduled evaluation after the restore: nearest-edge selector sees indoor 67 < floor 68 and keeps heat. Must not re-arm the mild day's default edge (cool)."
+    },
+    {
+      "time": "2026-10-11T07:20:00",
+      "type": "temp_update",
+      "indoor_f": 67.0,
+      "outdoor_f": 48.0,
+      "note": "Reactive reading after the evaluation: still heat."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-10-11T07:20:00",
+      "expect": "hvac_mode_never_commanded",
+      "forbidden_modes": [
+        "cool"
+      ],
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Across the whole pause/restore cycle the AC is never commanded: indoor is below the floor throughout, so the only correct armed edge is heat."
+    },
+    {
+      "at": "2026-10-11T07:20:00",
+      "expect": "comfort_family",
+      "family": "heating",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "After the restore and the next evaluation the armed family is heating, not the mild day's default cooling."
+    },
+    {
+      "at": "2026-10-11T07:20:00",
+      "expect": "last_hvac_mode",
+      "mode": "heat",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The last commanded mode after the restore is heat."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "After a door/window pause and restore on a cold mild-day morning, the thermostat stays on heat and cool is never commanded.",
+    "observed_behavior": "Pause at 07:00, restore at 07:10, evaluation at 07:15: heat remains the armed and last commanded mode.",
+    "expected_behavior": "Restore paths no longer re-arm a day-type default; the nearest-edge selector picks the edge from indoor (docs/08 section 6f)."
+  }
+}

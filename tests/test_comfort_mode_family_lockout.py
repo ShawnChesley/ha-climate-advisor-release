@@ -24,33 +24,26 @@ reassertion. This makes the #823 failure class (a reassertion resetting a clock 
 should only move on real change) structurally unrepresentable rather than patched
 around — see `comfort_family_fsm.py`'s own module docstring for the full mechanism.
 
-What moved where:
+What moved where (Issue #1066 re-pointed these at the Design D test classes):
 - `TestFamilySwitchLockedOut` (direct `_family_switch_locked_out()` unit tests,
   cold-start/same-family/window-boundary/configurable-interval cases) → superseded by
-  `tests/test_comfort_family_fsm.py::TestColdStart` and `::TestMinDwellAntiFlap`, which
-  test the equivalent guarantees (cold start never locked out, reassertion never resets
-  the dwell clock, locked-out-within-window / unlocked-once-elapsed) against the real
-  FSM `transition()` entry point instead of the retired method.
+  `tests/test_comfort_family_fsm.py::TestSwitchDwell` (first switch always allowed,
+  non-breach switch inside the window locked out, allowed and clock advanced once the
+  window elapsed) and `::TestUnknownCurrent` (cold start / unknown family never locked
+  out), which test the guarantees against the real FSM `transition()` entry point
+  instead of the retired method.
 - `TestFamilySwitchLockoutPreventsHunting` (the family-flap negative-control
   integration test) → superseded by `tests/test_comfort_family_decision.py::
-  TestRecoveryMarginHysteresis` (the mechanism that now prevents this class of
-  hunting — `test_instant_de_escalation_does_not_happen_at_bare_threshold` is the
-  direct equivalent negative control) plus `TestAgainstGrainDeadbandHeld`/
-  `TestAgainstGrainDeadbandCleared` (the deadband gate that also contributes to
-  hunting prevention on the entry side). The old dwell-timer lockout guarded the
-  ENTRY direction only and did nothing for exit — the FSM's recovery-margin
-  hysteresis on REVERT is what actually closes the saw-tooth gap the old mechanism
-  never addressed; see `tools/simulations/pending/
-  issue_827_recovery_margin_prevents_sawtooth.json` for the real-engine, end-to-end
-  proof of the same guarantee.
-- `TestPermanentLockoutFixIssue823` (the live-incident reassertion-cadence
-  regression test and its own negative control) → superseded by
-  `tests/test_comfort_family_fsm.py::TestMinDwellAntiFlap::
-  test_what_would_happen_if_dwell_reset_on_every_call_regression_control` — the
-  direct #823-regression-class negative control against the real FSM, proving the
-  bug class is now structurally unrepresentable (only one place the dwell clock can
-  move, and it only moves on a genuine transition) rather than patched around by a
-  reassertion-aware `only_if_changed` flag.
+  TestFlickerAndWalk` (a one-degree flicker never flips the family; the hysteresis gap
+  holds the current family) plus `::TestArming::test_strict_gap_keeps_current`. The
+  nearest-edge rule needs no recency or recovery-margin machinery: the arming margin and
+  its hysteresis gap are what prevent hunting, and `tests/test_comfort_family_fsm.py::
+  TestSwitchDwell` covers the dwell backstop.
+- `TestPermanentLockoutFixIssue823` (the live-incident reassertion-cadence regression
+  test) → superseded by `tests/test_comfort_family_fsm.py::TestHold::
+  test_hold_leaves_dwell_unchanged` and `::TestSwitchDwell` — the dwell clock only ever
+  moves on a genuine transition, never on reassertion, so the bug class is structurally
+  unrepresentable rather than patched around by a reassertion-aware flag.
 
 `TestArmComfortFamily`/`TestArmComfortFamilyOnlyIfChanged` below are UNCHANGED and
 still pass as-is — `_arm_comfort_family()` survives Issue #827, narrowed to a thin
@@ -240,21 +233,16 @@ class TestArmComfortFamilyOnlyIfChanged:
 # cadence. The consolidated FSM makes both guarantees structural rather than
 # timer-patched:
 #
-# - Hunting prevention (was TestFamilySwitchLockoutPreventsHunting): now the
-#   deadband gate (entry) + recovery-margin hysteresis (exit) in
-#   comfort_family_decision.py — see tests/test_comfort_family_decision.py::
-#   TestRecoveryMarginHysteresis (test_instant_de_escalation_does_not_happen_at_
-#   bare_threshold is the direct negative-control equivalent) and
-#   ::TestAgainstGrainDeadbandHeld/::TestAgainstGrainDeadbandCleared. End-to-end,
-#   real-engine proof: tools/simulations/pending/
-#   issue_827_recovery_margin_prevents_sawtooth.json.
+# - Hunting prevention (was TestFamilySwitchLockoutPreventsHunting): now the arming
+#   margin + hysteresis gap in comfort_family_decision.py — see
+#   tests/test_comfort_family_decision.py::TestFlickerAndWalk and
+#   ::TestArming::test_strict_gap_keeps_current. End-to-end, real-engine proof:
+#   tools/simulations/pending/issue_1066_mixed_day_heat_then_cool_then_heat.json.
 # - Eventually-clears-despite-cadence (was TestPermanentLockoutFixIssue823): now
 #   comfort_family_fsm.transition()'s dwell_since only ever advances on a genuine
 #   transition (never on reassertion), so the bug class is structurally
-#   unrepresentable rather than patched around — see
-#   tests/test_comfort_family_fsm.py::TestMinDwellAntiFlap, especially
-#   test_what_would_happen_if_dwell_reset_on_every_call_regression_control (the
-#   direct #823-regression-class negative control).
+#   unrepresentable — see tests/test_comfort_family_fsm.py::TestHold and
+#   ::TestSwitchDwell.
 #
 # See this file's module docstring for the full "what moved where" mapping.
 # ---------------------------------------------------------------------------

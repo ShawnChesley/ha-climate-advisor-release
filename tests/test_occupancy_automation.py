@@ -151,6 +151,9 @@ class TestApplyClassificationOccupancy:
         engine._current_classification = c
         engine.set_occupancy_mode("away")
         engine.hass.states.get.return_value = _make_thermostat_state("heat")
+        # Issue #1066 (nearest-edge arming): indoor above the away ceiling (80) arms cool even
+        # though the thermostat is currently in heat.
+        engine.hass.states.get.return_value.attributes["current_temperature"] = 81
 
         asyncio.run(engine.apply_classification(c))
 
@@ -449,6 +452,8 @@ class TestSetTemperatureForModeOccupancy:
         engine._current_classification = c
         engine.set_occupancy_mode("vacation")
         engine.hass.states.get.return_value = _make_thermostat_state("heat")
+        # Issue #1066: indoor above the vacation ceiling (83) arms cool despite the heat-mode thermostat.
+        engine.hass.states.get.return_value.attributes["current_temperature"] = 84
 
         asyncio.run(engine._set_temperature_for_mode(c, reason="test"))
 

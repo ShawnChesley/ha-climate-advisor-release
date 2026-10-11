@@ -63,7 +63,9 @@ def _make_engine(
     attrs = {
         "hvac_modes": hvac_modes,
         "supported_features": supported_features,
-        "current_temperature": 72.0,  # default above comfort_heat so comfort-gap guard doesn't fire
+        # Mid-band (comfort 70/76): outside both Issue #1066 arming zones (heat <= 72, cool >= 74),
+        # so the day's default edge (ceiling on a warm day) is armed rather than the nearest edge.
+        "current_temperature": 73.0,
     }
     climate_state = MagicMock()
     climate_state.state = current_mode
@@ -357,11 +359,11 @@ class TestWarmDayBandArming:
         assert len(_temp_calls(engine)) == 0
 
     def test_indoor_below_comfort_floor_band_arms_normally(self):
-        """Indoor (65°F) < comfort_heat (70°F): P3 arms the ceiling band unconditionally.
+        """Indoor (65°F) < comfort_heat (70°F): the nearest-edge selector arms HEAT at the floor.
 
-        Old model: comfort-gap guard fired first, setting hvac_mode='heat' to reach comfort floor.
-        P3: the comfort-gap guard is gone; the band arms directly via a single cool call.
-        Issue #301: single set_temperature call; temperature=comfort_cool (ceiling).
+        Issue #1066 (Design D): P3 used to arm the ceiling here unconditionally, leaving the
+        thermostat in cool below the comfort floor on warm/mild days. A floor breach now arms
+        heat immediately. Issue #301: still a single set_temperature call (temperature=comfort_heat).
         """
         engine = _make_engine(comfort_heat=70.0, current_mode="heat_cool")
 
@@ -382,8 +384,8 @@ class TestWarmDayBandArming:
         # Single call (Issue #301)
         assert len(temp) == 1
         data = temp[0].args[2]
-        assert data.get("hvac_mode") == "cool"
-        assert "temperature" in data  # single-setpoint key
+        assert data.get("hvac_mode") == "heat"
+        assert data["temperature"] == 70.0  # comfort_heat floor
         assert "target_temp_low" not in data  # no dual-setpoint keys
         assert "target_temp_high" not in data
 

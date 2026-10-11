@@ -368,12 +368,12 @@
           "max_setback_depth_f": "Maximum Setback Depth",
           "comfort_mode_switch_min_interval_s": "Heat/Cool Switch Interval",
           "aggressive_savings": "Prefer savings over comfort",
-          "comfort_deadband_hot_f": "Hot Day Deadband",
-          "comfort_deadband_warm_f": "Warm Day Deadband",
-          "comfort_deadband_mild_f": "Mild Day Deadband",
-          "comfort_deadband_cool_f": "Cool Day Deadband",
-          "comfort_deadband_cold_f": "Cold Day Deadband",
-          "comfort_family_recency_window_min": "Deadband Activity Window"
+          "comfort_deadband_hot_f": "Hot Day Switch Margin",
+          "comfort_deadband_warm_f": "Warm Day Switch Margin",
+          "comfort_deadband_mild_f": "Mild Day Switch Margin",
+          "comfort_deadband_cool_f": "Cool Day Switch Margin",
+          "comfort_deadband_cold_f": "Cold Day Switch Margin",
+          "comfort_family_recency_window_min": "Recently Heated Window"
         },
         "data_description": {
           "learning_enabled": "When enabled, Climate Advisor learns from your manual adjustments and suggests improvements over time.",
@@ -386,14 +386,14 @@
           "default_tou_lead_minutes": "How long before a scheduled high-cost period TOU pre-conditioning starts, used until enough heat/cool cycles are observed to compute your home's actual rate.",
           "preheat_safety_margin": "Multiplier applied to model-computed pre-heat time as a buffer (e.g. 1.2 = 20% extra).",
           "max_setback_depth_f": "Largest overnight setback the adaptive engine may compute.",
-          "comfort_mode_switch_min_interval_s": "How long to wait after commanding heat, active cooling, or a whole-house-fan session before switching between the heating and cooling families again — prevents rapid heat/cool hunting right after free cooling rides the house down to the comfort floor.",
+          "comfort_mode_switch_min_interval_s": "Minimum wait between routine heat/cool switches, to prevent rapid back-and-forth. A real breach (indoor temp actually past a comfort edge) ignores this wait and switches immediately.",
           "aggressive_savings": "When enabled, Climate Advisor favors energy savings over comfort — for example, tolerating wider temperature swings before heating or cooling runs.",
-          "comfort_deadband_hot_f": "On a hot day, how far indoor temp must drop below the comfort floor before the comfort-family FSM escalates to heat (the against-grain direction on a hot day).",
-          "comfort_deadband_warm_f": "On a warm day, how far indoor temp must drop below the comfort floor before the comfort-family FSM escalates to heat.",
-          "comfort_deadband_mild_f": "On a mild or off-classified day, how far indoor temp must move past a comfort edge before the comfort-family FSM escalates against the day's native direction.",
-          "comfort_deadband_cool_f": "On a cool day, how far indoor temp must rise above the comfort ceiling before the comfort-family FSM escalates to cooling.",
-          "comfort_deadband_cold_f": "On a cold day, how far indoor temp must rise above the comfort ceiling before the comfort-family FSM escalates to cooling (the against-grain direction on a cold day).",
-          "comfort_family_recency_window_min": "How long HVAC-cool, WHF, HVAC-fan, or nat-vent activity is remembered as \"recent\" for the comfort-family deadband above. An against-grain switch (e.g. to heat on a warm day) only waits for the full deadband when the opposite family ran within this window; otherwise it switches immediately at the comfort boundary, since there's nothing recent to short-cycle away from."
+          "comfort_deadband_hot_f": "On a hot day: The thermostat switches to protect the nearer comfort edge once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed.",
+          "comfort_deadband_warm_f": "On a warm day: The thermostat switches to protect the nearer comfort edge once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed.",
+          "comfort_deadband_mild_f": "On a mild or off-classified day: The thermostat switches to protect the nearer comfort edge once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed.",
+          "comfort_deadband_cool_f": "On a cool day: The thermostat switches to protect the nearer comfort edge once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed.",
+          "comfort_deadband_cold_f": "On a cold day: The thermostat switches to protect the nearer comfort edge once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed.",
+          "comfort_family_recency_window_min": "Used only by the predicted-temperature ceiling guard: how long heating counts as \"recently heated\", during which the guard waits instead of acting on a predicted overshoot. It no longer affects when the thermostat switches between heat and cool."
         }
       },
       "classification_thresholds": {

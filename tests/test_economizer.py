@@ -109,6 +109,15 @@ def _make_warm_classification() -> DayClassification:
     return c
 
 
+def _paused_off_thermostat(engine) -> None:
+    """Issue #1066 (F4): the restore no longer sends a blind set_hvac_mode first; the setpoint write performs
+    the explicit mode switch (#1049) when the thermostat is in a readable, different mode -- here: Off."""
+    state = MagicMock()
+    state.state = "off"
+    state.attributes = {"hvac_modes": ["off", "heat", "cool"], "supported_features": 1}
+    engine.hass.states.get.return_value = state
+
+
 def _get_hvac_mode_calls(engine):
     """Extract set_hvac_mode calls from the mock."""
     return [c for c in engine.hass.services.async_call.call_args_list if c[0][1] == "set_hvac_mode"]
@@ -518,6 +527,7 @@ class TestEconomizerDeactivation:
 
     def test_deactivates_when_temp_rises(self):
         engine = _make_automation_engine()
+        _paused_off_thermostat(engine)
         engine._current_classification = _make_hot_classification()
         engine._economizer_active = True
         engine._economizer_phase = "maintain"
@@ -664,6 +674,7 @@ class TestEconomizerDeactivationRateLimitGuard:
         branch, which always resumes HVAC independent of the fan command's
         outcome; only the session bookkeeping flags are gated."""
         engine = _make_automation_engine()
+        _paused_off_thermostat(engine)
         engine._economizer_active = True
         engine._economizer_phase = "cool-down"
         engine._current_classification = _make_hot_classification()

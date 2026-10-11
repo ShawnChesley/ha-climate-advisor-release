@@ -403,6 +403,9 @@ class TestVacationSetback:
         engine._current_classification = c
         # Provide cool capability so the band can arm the ceiling edge.
         engine.hass.states.get.return_value = _make_state("heat", hvac_modes=["off", "heat", "cool"])
+        # Issue #1066 (nearest-edge arming): indoor above the vacation ceiling (83) arms cool even
+        # though the thermostat is currently in heat.
+        engine.hass.states.get.return_value.attributes["current_temperature"] = 84
 
         asyncio.run(engine.handle_occupancy_vacation())
 

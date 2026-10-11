@@ -2043,7 +2043,14 @@ def _make_nat_vent_engine(indoor_temp: float) -> AutomationEngine:
     engine._nat_vent_exit_candidate_since = datetime(2026, 3, 19, 14, 0, 0)
 
     mock_cs = MagicMock()
-    mock_cs.attributes = {"current_temperature": indoor_temp, "fan_modes": ["auto", "on"]}
+    # Issue #1066 (F4): the exit's mode restore is now the setpoint write's explicit mode switch, which
+    # needs the thermostat's advertised modes (a real climate entity always has them).
+    mock_cs.attributes = {
+        "current_temperature": indoor_temp,
+        "fan_modes": ["auto", "on"],
+        "hvac_modes": ["off", "heat", "cool"],
+        "supported_features": 1,
+    }
     mock_cs.state = "off"
     engine.hass.states.get.return_value = mock_cs
 

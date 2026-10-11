@@ -17,8 +17,7 @@ display pair (Issue #940 — previously it passed through fresh while the cutoff
 stayed held/stale, which could invert their order in the rendered briefing). Every
 OTHER key in the raw plan dict (``comfort_floor_crossing_time``, ``ceiling_breach_time``,
 etc.) must still pass through fresh every cycle regardless — freezing those too would
-silently stall ``ode_floor_guard.py``'s safety-relevant heating-escalation
-input.
+silently stall the live floor-crossing display input.
 
 Per this project's CLAUDE.md testing doctrine, these tests invoke the real
 ``_stabilize_nat_vent_cutoff_reason()`` method directly (via
@@ -238,8 +237,8 @@ class TestKnifeEdgeFlipNotYetConfirmed:
 
 class TestReasonHeldPendingDoesNotAffectOtherFields:
     """Explicit dedicated test (separate from the blast-radius assertion above,
-    per the task): comfort_floor_crossing_time — the field ode_floor_guard.py
-    depends on for a real safety-relevant decision — keeps updating fresh every
+    per the task): comfort_floor_crossing_time — the field the status cards and
+    nat-vent plan display — keeps updating fresh every
     single cycle even while nat_vent_cutoff_reason sits unconfirmed for several
     consecutive cycles in a row."""
 

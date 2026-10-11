@@ -1055,7 +1055,9 @@ class ClimateAdvisorActivityRecordView(HomeAssistantView):
                     render_diagnostic_snapshot_compact,
                 )
 
-                footer = render_diagnostic_snapshot_compact(build_diagnostic_snapshot(hass, coordinator))
+                footer = render_diagnostic_snapshot_compact(
+                    build_diagnostic_snapshot(hass, coordinator, include_control_quality=False)
+                )
                 table = table + "\n\n" + footer
             except Exception:
                 _LOGGER.warning("activity_record: diagnostic footer failed — skipping", exc_info=True)

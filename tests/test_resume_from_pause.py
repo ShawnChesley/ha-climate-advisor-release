@@ -66,6 +66,15 @@ def _make_automation_engine(config_overrides: dict | None = None) -> AutomationE
     )
 
 
+def _paused_off_thermostat(engine) -> None:
+    """Issue #1066 (F4): the restore no longer sends a blind set_hvac_mode first; the setpoint write performs
+    the explicit mode switch (#1049) when the thermostat is in a readable, different mode -- here: Off."""
+    state = MagicMock()
+    state.state = "off"
+    state.attributes = {"hvac_modes": ["off", "heat", "cool"], "supported_features": 1}
+    engine.hass.states.get.return_value = state
+
+
 def _make_classification(
     day_type: str = "warm",
     hvac_mode: str = "cool",
@@ -261,6 +270,7 @@ class TestResumeFromPause:
                 CONF_MANUAL_GRACE_NOTIFY: False,
             }
         )
+        _paused_off_thermostat(engine)
         engine._paused_by_door = True
         engine._pre_pause_mode = "cool"
         engine._current_classification = _make_classification(hvac_mode="cool")
@@ -289,6 +299,7 @@ class TestResumeFromPause:
                 CONF_MANUAL_GRACE_NOTIFY: False,
             }
         )
+        _paused_off_thermostat(engine)
         engine._paused_by_door = True
         engine._pre_pause_mode = "cool"  # stale pre-pause mode
         # Classification changed to heat since the pause was set
@@ -375,6 +386,7 @@ class TestResumeFromPauseFsmAuthoritative:
                 CONF_MANUAL_GRACE_NOTIFY: False,
             }
         )
+        _paused_off_thermostat(engine)
         engine._doorwindow_fsm_authoritative = True
         engine._paused_by_door = True
         engine._pre_pause_mode = "cool"

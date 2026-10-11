@@ -3,6 +3,12 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.97] — 2026-10-11
+
+- Fix #1066: on a cool morning the thermostat now heats as soon as the house is near the bottom of your comfort range, instead of sitting in cool mode below it. The system now guards whichever side of the comfort range the house is closer to and switches in the middle of the range, so a restart, a door or window closing, or a fan stopping no longer flips a working heater to cool (or the reverse on a hot day).
+- Fix #1066: the downloaded logs and diagnostics now include a short control-quality summary (time the thermostat was on the wrong side of your comfort range, how often it switched, heating and cooling run times, and how accurate the temperature predictions are) so we can see how well this works in every home.
+- Fix #1066: away and vacation homes that fall below their setback floor now heat instead of staying in cool, and hot and cold days no longer carry the old 5 degree extra tolerance before the thermostat switches sides (the switch margin is now at most one third of your comfort range, 2 degrees on a 68-74 range). Time-of-use pre-cooling or pre-heating is left alone while it is banking.
+
 ## [0.7.96] — 2026-10-11
 
 - Fix #1062: the diagnostics download and the diagnostics log dump no longer contain your GitHub token. If you shared either from an earlier version, revoke and recreate the token.

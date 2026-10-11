@@ -1,0 +1,116 @@
+{
+  "name": "issue_827_sleep_window_interior_keeps_sleep_mode",
+  "description": "Issue #827 GAP-5 / #1066 companion to issue_827_sleep_window_floor_mismatch. In the sleep window (sleep_heat 60F, sleep_cool 72F) a warm-day reading of 64F is 4F below the DAYTIME comfort floor (68F) but strictly between sleep floor + m (62F) and sleep ceiling - m (70F). Nearest-edge arming keeps the sleep-window mode (cool at the sleep ceiling) and never commands heat; a selector using the daytime floor would see a breach and heat at 68F.",
+  "source": "Issue #827 GAP-5 audit; split out during the Issue #1066 review so the interior case can be asserted with whole-run hvac_mode_never_commanded.",
+  "issue": 827,
+  "notes": [
+    "Occupant impact: overnight at 64F with a 60F sleep setback the occupant is fine; the furnace must not start at the daytime 68F target.",
+    "Three-exercise protocol (CLAUDE.md section 10):",
+    "(a) Scenario effectiveness: with the daytime floor in the selector, 64F < 68F is a floor breach, heat is armed immediately, and hvac_mode_never_commanded(heat) and comfort_family=cooling both fail. With nearest-edge arming deleted (origin/main) a warm day is natively cooling and 64F would also be held, so this scenario guards the floor INPUT (band.floor) and the interior-holds-mode rule, not the old-vs-new difference.",
+    "(b) Docs<->production alignment: docs/08 section 6f ('strictly between floor + m and ceiling - m: the thermostat's actual current mode').",
+    "(c) Occupant outcome if this test fails to catch a regression: the furnace heats a sleeping household to 68F against their chosen 60F overnight setback."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "sleep_heat": 60,
+    "sleep_cool": 72,
+    "sleep_time": "22:30",
+    "wake_time": "07:00",
+    "setback_heat": 55,
+    "setback_cool": 82,
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-08-31T22:35:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 55.0,
+      "note": "Sleep window, indoor 70F: cooling zone (>= 72 - 2), cool armed at the sleep ceiling 72."
+    },
+    {
+      "time": "2026-08-31T22:35:00",
+      "type": "classification",
+      "day_type": "warm",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "note": "Warm-day classification (classifier hvac_mode=off); sleep band [60, 72] armed."
+    },
+    {
+      "time": "2026-08-31T22:50:00",
+      "type": "temp_update",
+      "indoor_f": 64.0,
+      "outdoor_f": 50.0,
+      "note": "64F: below the daytime floor (68) but strictly between 62 and 70 of the sleep band. Mode is kept."
+    },
+    {
+      "time": "2026-08-31T22:50:00",
+      "type": "classification",
+      "day_type": "warm",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "note": "Re-evaluation at 64F: still cooling at the sleep ceiling, no heat."
+    },
+    {
+      "time": "2026-08-31T23:20:00",
+      "type": "temp_update",
+      "indoor_f": 64.0,
+      "outdoor_f": 48.0,
+      "note": "Another reading at 64F: still no heat."
+    },
+    {
+      "time": "2026-08-31T23:20:00",
+      "type": "classification",
+      "day_type": "warm",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "note": "Second re-evaluation at 64F: still no heat."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-08-31T22:35:00",
+      "expect": "expect_band",
+      "expect_band": {
+        "floor": 60.0,
+        "ceiling": 72.0
+      },
+      "track": "logic",
+      "simulator_support": true,
+      "reason": "Baseline: sleep band armed, not the daytime band."
+    },
+    {
+      "at": "2026-08-31T23:20:00",
+      "expect": "hvac_mode_never_commanded",
+      "forbidden_modes": [
+        "heat"
+      ],
+      "track": "logic",
+      "simulator_support": true,
+      "reason": "Heat is never commanded anywhere in the run: 64F is above the sleep floor + margin, so neither a 60F nor a 68F heat setpoint is sent."
+    },
+    {
+      "at": "2026-08-31T23:20:00",
+      "expect": "comfort_family",
+      "family": "cooling",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Final engine state: the sleep-window cooling family is kept in the interior; a daytime-floor selector would have switched to heating at the 64F reading."
+    },
+    {
+      "at": "2026-08-31T23:20:00",
+      "expect": "last_hvac_mode",
+      "mode": "cool",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The last climate command is the cool setpoint at the sleep ceiling (72F)."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "A 64F overnight reading (below the daytime floor, inside the sleep band's interior) keeps the sleep-window mode and never starts heat.",
+    "observed_behavior": "Cool at 72F is armed at 70F and re-affirmed at 64F with no heat command.",
+    "expected_behavior": "The selector uses the resolved sleep band and holds the current mode strictly between the arming margins."
+  }
+}

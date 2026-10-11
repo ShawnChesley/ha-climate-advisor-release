@@ -1,0 +1,79 @@
+{
+  "name": "issue_1066_cold_morning_mild_day_arms_heat_immediately",
+  "description": "Cold morning on a mild day, thermostat still left in cool from yesterday afternoon. Indoor is 66F, 2F below comfort_heat (68F). Nearest-edge arming (Issue #1066, docs/08 section 6f) must switch the thermostat to heat on the FIRST evaluation, with no recency window, deadband, sustain wait or dwell lock. Before #1066 a mild day defaulted to the ceiling edge and the house sat below the floor in cool mode for roughly 11 minutes (live incident 2026-10-11).",
+  "source": "Issue #1066 live incident 2026-10-11 (seventh recurrence of the mild/warm-day wrong-edge class: #821, #823, #827, #843, #858, #867, #1048 comment)",
+  "issue": 1066,
+  "notes": [
+    "Occupant impact: the person wakes up in a 66F house and the thermostat is in cool mode. They must get heat immediately, not after a breach/deadband/sustain/lock sequence.",
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: if nearest-edge arming were deleted, the mild-day classification would arm the day-type default edge (ceiling, cool). On origin/main comfort_family_decision.py, a mild day is natively 'cooling' and heat is the against-grain direction, which needs a floor breach beyond the mild deadband (and, under #843, a recency check) PLUS a 90 s sustain confirmation before escalating; on the first evaluation the FSM only arms a candidate and stays cooling. The comfort_family_switch_by(heating, 06:00:00), comfort_family=heating and last_hvac_mode=heat assertions would therefore all fail on the old behavior, because nothing is evaluated a second time in this event list.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f, rule row 'indoor < floor -> heating, breach: immediate' and the 'Before / after' row 'Mild/warm day, indoor falls below the floor'.",
+    "(c) Occupant outcome if this test fails to catch a regression: the household wakes to a cold house with the furnace idle and the AC armed until a multi-minute confirmation sequence completes, repeating the incident that was reported seven times.",
+    "Classification fields: day_type=mild with hvac_mode=off and windows_recommended=true match what classifier.py derives for DAY_TYPE_MILD (not hand-overridden)."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "initial_thermostat_mode": "cool",
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-10-11T06:00:00",
+      "type": "temp_update",
+      "indoor_f": 66.0,
+      "outdoor_f": 45.0,
+      "note": "Wake-up: indoor 66F, 2F below comfort_heat(68). Thermostat is still in cool from the previous afternoon."
+    },
+    {
+      "time": "2026-10-11T06:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "note": "Mild-day classification, first evaluation of the morning. indoor(66) < floor(68) is a breach: heat must be armed now, regardless of the day-type default (ceiling)."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-10-11T06:00:00",
+      "expect": "comfort_family_switch_by",
+      "family": "heating",
+      "by": "2026-10-11T06:00:00",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Floor breach arms heat on the very first evaluation (no sustain wait, no recency window): the comfort_family_switch event carries resolved_family=heating at the classification timestamp."
+    },
+    {
+      "at": "2026-10-11T06:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": { "resolved_family": "heating", "breach": true },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The switch is flagged as a breach (indoor already below the floor), which is what lets it bypass the 600 s anti-chatter dwell lock."
+    },
+    {
+      "at": "2026-10-11T06:00:00",
+      "expect": "comfort_family",
+      "family": "heating",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Engine state confirms the heating family is armed, not merely an emitted event."
+    },
+    {
+      "at": "2026-10-11T06:00:00",
+      "expect": "last_hvac_mode",
+      "mode": "heat",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The commanded thermostat mode is heat (a real climate service call at comfort_heat), replacing the leftover cool mode."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "A cold morning on a mild day arms heat on the first evaluation instead of waiting out breach, deadband, sustain and dwell gates.",
+    "observed_behavior": "Indoor 66F below the 68F floor with the thermostat in cool: the selector emits comfort_family_switch(heating, breach=true) at the first classification and commands heat.",
+    "expected_behavior": "Below the floor always means heat, immediately, on every day type (docs/08 section 6f)."
+  }
+}

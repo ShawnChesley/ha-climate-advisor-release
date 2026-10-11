@@ -1,0 +1,83 @@
+{
+  "name": "issue_827_hot_day_dawn_dip_arms_heat",
+  "description": "Issue #827 / #843 / #1066 (Design D nearest-edge arming, docs/08-COMPUTATION-REFERENCE.md section 6f). On a hot-classified day a dawn dip below comfort_heat (65F vs 68F) arms heat on the first reading below the floor and commands heat at comfort_heat. There is no tolerated dawn dip: the original #827 premise (a sub-deadband dip on a hot day never escalates because the sun will correct it) was reversed by #843 and is gone under #1066. Renamed from issue_827_hot_day_dawn_dip_within_deadband_no_escalate, whose 'no escalate within deadband' claim is false.",
+  "source": "Issue #827 Design #1 (original no-escalate premise), reversed by Issue #843 and Issue #1066 (nearest-edge arming; no deadband tolerance for a breach).",
+  "issue": 827,
+  "notes": [
+    "Occupant impact: a 65F house at dawn (3F below the 68F floor) must be heated within the first reading. The old energy-saving bet that the day would warm the house meant coasting below comfort; the cost of the new rule is a few minutes of furnace time.",
+    "Design D rule exercised: indoor < floor -> heating immediately on any day type, ignoring the dwell lock. Hot-day classification (hvac_mode=cool, windows_recommended=true, as classifier.py derives for DAY_TYPE_HOT) does not make heat 'against grain' any more. Duplicate note: this scenario and issue_827_missing_forecast_fallback_escalates.json differ only by day type and the (now irrelevant) thermal_model block.",
+    "Assertion time bounds are the first breach reading (06:15).",
+    "Three-exercise protocol (CLAUDE.md section 10):",
+    "(a) Scenario effectiveness: with nearest-edge arming deleted (origin/main) the hot-day deadband (5F, comfort_deadband_hot_f) holds a 3F breach indefinitely under the #827 rule, and even under the #843 recency rule heat needs a 90 s sustain across two evaluations, so at 06:15 comfort_family=heating and last_hvac_mode=heat fail.",
+    "(b) Docs<->production alignment: docs/08 section 6f ('Mild/warm/hot day, indoor falls below the floor -> heat armed on the first reading'; 'Hot/cold 5F default becomes 2F, their old extra tolerance is gone').",
+    "(c) Occupant outcome if this test fails to catch a regression: the household wakes in a house below its comfort floor while the thermostat sits in cool for the 'hot' day, as in the live incidents behind #843 and #1066."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-09-01T06:00:00",
+      "type": "classification",
+      "day_type": "hot",
+      "hvac_mode": "cool",
+      "windows_recommended": true,
+      "note": "Hot-day classification at dawn (classifier derives hvac_mode=cool, windows recommended). Indoor 71F is inside the band, no breach."
+    },
+    {
+      "time": "2026-09-01T06:00:00",
+      "type": "temp_update",
+      "indoor_f": 71.0,
+      "outdoor_f": 55.0,
+      "note": "Indoor 71F, within band [68F, 74F]."
+    },
+    {
+      "time": "2026-09-01T06:15:00",
+      "type": "temp_update",
+      "indoor_f": 65.0,
+      "outdoor_f": 50.0,
+      "note": "Dawn dip: indoor 65F, 3F below comfort_heat(68). Floor breach: heat is armed on this very reading regardless of the hot-day classification."
+    },
+    {
+      "time": "2026-09-01T06:15:00",
+      "type": "classification",
+      "day_type": "hot",
+      "hvac_mode": "cool",
+      "windows_recommended": true,
+      "note": "Periodic re-evaluation with indoor 65F: below the floor, so heat is armed and commanded at comfort_heat(68)."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-09-01T06:00:00",
+      "expect": "comfort_band_armed",
+      "track": "logic",
+      "simulator_support": true,
+      "reason": "Baseline: hot day, indoor within band -- comfort band arms normally at the ceiling."
+    },
+    {
+      "at": "2026-09-01T06:15:00",
+      "expect": "comfort_family",
+      "family": "heating",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "A dawn dip below the floor arms heat on the first reading, regardless of day type; no deadband tolerance remains."
+    },
+    {
+      "at": "2026-09-01T06:15:00",
+      "expect": "last_hvac_mode",
+      "mode": "heat",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The commanded mode is a real climate service call at comfort_heat, not merely an internal flag."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "A dawn dip below comfort_heat on a hot-classified day arms heat on the first reading below the floor.",
+    "observed_behavior": "Indoor drops to 65F (3F below the 68F floor) at 06:15; the family switches to heating and heat is commanded at comfort_heat.",
+    "expected_behavior": "Below the floor always means heat, immediately, on every day type (docs/08 section 6f); the old forecast-based dawn-dip tolerance is retired."
+  }
+}

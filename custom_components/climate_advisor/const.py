@@ -6,7 +6,7 @@ DOMAIN = "climate_advisor"
 
 # Integration version — MUST match manifest.json "version" field.
 # A test in tests/test_version_sync.py enforces this.
-VERSION = "0.7.96"
+VERSION = "0.7.97"
 
 GITHUB_REPO = "gunkl/ClimateAdvisor"
 GITHUB_REPO_URL = "https://github.com/gunkl/ClimateAdvisor"
@@ -386,57 +386,47 @@ INDOOR_BLIND_EPISODE_GAP_S = 900.0
 # paired recovery push are debounced; log lines, Activity Log events and the stop push never are.
 INDOOR_BLIND_PUSH_DEBOUNCE_S = 1800.0
 
-# Issue #821: comfort-floor fallback path sustain window (confidence_k_passive ==
-# "none" case — the actual condition the reported live incident, Zone "Simulated 2",
-# occurred under). Same duration and same rationale as NAT_VENT_EXIT_SUSTAIN_S above —
-# avoids reacting to a single noisy indoor reading before committing a family switch.
-COMFORT_FALLBACK_CONFIRM_S = 90.0
-
 # Issue #869: nat-vent cutoff *reason* sustain window. compute_nat_vent_plan() races two
 # independent crossing scans (outdoor rising above indoor vs. indoor falling to the
 # comfort floor) — on a knife-edge day where both crossings land minutes apart, small
 # sensor-reading shifts between the coordinator's frequent recomputes (event-driven, not
 # just the 30-min timer) flip which scan wins, flapping the reported reason/wording shown
-# to the occupant. Same duration and rationale as NAT_VENT_EXIT_SUSTAIN_S/
-# COMFORT_FALLBACK_CONFIRM_S above — this is the third confirmed_transition.py consumer,
-# not a new hand-rolled debounce.
+# to the occupant. Same duration and rationale as NAT_VENT_EXIT_SUSTAIN_S above — this is
+# a confirmed_transition.py consumer, not a new hand-rolled debounce.
 NAT_VENT_CUTOFF_REASON_SUSTAIN_S = 90.0
 
-# Minimum dwell before the comfort-family switch (heating <-> cooling) may commit,
-# per the project owner's explicit request (Issue #821 Design §4). User-configurable —
-# unlike the two constants above, sizing this too short risks switching while
-# equipment/thermal readings are still settling from the PRIOR family's own command;
-# too long risks a genuine breach going uncorrected. Default 600s (10 minutes),
-# matching min_preheat_minutes/max_setback_depth_f-style advanced numeric settings.
+# Minimum dwell between comfort-edge (heating <-> cooling) switches, per the project owner's
+# explicit request (Issue #821 Design §4; kept by Issue #1066). A breach of the comfort band
+# (indoor outside [floor, ceiling]) always switches regardless of the dwell. User-configurable:
+# too short risks switching while equipment/thermal readings are still settling from the PRIOR
+# family's own command; too long delays an interior (margin-zone) switch. Default 600s (10 minutes).
 CONF_COMFORT_MODE_SWITCH_MIN_INTERVAL_S = "comfort_mode_switch_min_interval_s"
 COMFORT_MODE_SWITCH_MIN_INTERVAL_S = 600.0
 
+# Issue #1066 (F2): after the comfort-edge selector writes a family the thermostat has not yet
+# followed (a device that ignores commands, observe-only mode, a slow cloud API), the REACTIVE
+# per-reading check does not re-trigger a full classification for the same wanted family within
+# this many seconds. The regular 30-minute cycle, a different wanted family and a breach on the
+# opposite side are never rate-limited.
+COMFORT_REACTIVE_RETRY_S = 120.0
+
+# Issue #1066: cap on the commanded-HVAC-mode change ring buffer (AutomationEngine.comfort_mode_changes),
+# persisted in the existing state file and read by the control-quality report.
+COMFORT_MODE_CHANGE_LOG_CAP = 200
+
 # ---------------------------------------------------------------------------
-# Comfort-family FSM deadbands (Issue #827)
+# Comfort-edge arming margins (Issue #827 deadbands, repurposed by Issue #1066)
 # ---------------------------------------------------------------------------
-# Named "deadband", deliberately NOT unified with NAT_VENT_HYSTERESIS_F (line 246
-# above): NAT_VENT_HYSTERESIS_F is a symmetric, day-type-independent, override-blind
-# noise filter. These 5 values are asymmetric (native-direction family switches at a
-# near-zero deadband; only the against-grain direction is gated by these), day-type-
-# scaled (a different tolerance per classified day), and override-surviving (a manual
-# override suppresses the tight native-direction defense but never suppresses the
-# against-grain safety escalation once the deadband is cleared) — genuinely different
-# vocabulary for a genuinely different concept, not the same idea under two names.
-# Measured from the already-resolved band.floor/band.ceiling (post aggressive_savings
-# margin), not raw comfort_heat/comfort_cool, so the two tolerance mechanisms compose
-# from one anchor point instead of silently disagreeing.
+# Under Design D (nearest-edge arming, comfort_family_decision.py) these five per-day-type
+# values are the configured ARMING MARGIN: within this many degrees of the comfort floor the
+# thermostat guards the floor (heat), within this many of the ceiling it guards the ceiling
+# (cool). The leaf clamps the value to [2 F, band width / 3]; a breach (indoor outside the
+# band) switches immediately regardless. The config keys keep their historical "deadband"
+# names so existing config entries and the options flow keep working.
 #
-# Issue #843: the against-grain gate itself is now CONDITIONAL, not unconditional.
-# It only applies when the opposite family (HVAC run, WHF, HVAC-fan, or nat-vent)
-# has actually run within CONF_COMFORT_FAMILY_RECENCY_WINDOW_MIN — see
-# comfort_family_decision.py's _against_grain_deadband(). Nothing recorded, or
-# nothing within the window, means the against-grain direction behaves like the
-# native direction (near-zero deadband): the deadband exists to prevent
-# short-cycling, and there's nothing to short-cycle away from if the opposite
-# family hasn't run in hours. Fixes the overnight-drift bug where the house sat
-# several degrees below the comfort floor for hours after nat-vent ended, because
-# the static deadband made no distinction between "just finished cooling" and
-# "nothing has run in 3 hours".
+# Named "deadband", deliberately NOT unified with NAT_VENT_HYSTERESIS_F (line 246 above):
+# that one is a symmetric, day-type-independent, override-blind noise filter, while these
+# are day-type-scaled arming margins.
 CONF_COMFORT_DEADBAND_HOT_F = "comfort_deadband_hot_f"
 CONF_COMFORT_DEADBAND_WARM_F = "comfort_deadband_warm_f"
 CONF_COMFORT_DEADBAND_MILD_F = "comfort_deadband_mild_f"
@@ -462,11 +452,10 @@ COMFORT_DEADBAND_COOL_MAX_F = 5.0
 COMFORT_DEADBAND_COLD_MIN_F = 2.0
 COMFORT_DEADBAND_COLD_MAX_F = 8.0
 
-# Issue #843: how long a "recent opposite-family activity" memory lasts before the
-# against-grain deadband above stops applying and the FSM behaves like the native
-# direction. Default 2 hours — long enough to cover a normal short-cycling risk
-# window, short enough that a genuinely idle house isn't held below/above comfort
-# indefinitely waiting for a large breach that was never coming.
+# Issue #843: how long a "recent heating activity" memory lasts. Since Issue #1066 the
+# comfort-edge selector no longer uses it; its only remaining consumer is the ODE ceiling
+# guard, which defers a predictive cool write when heating ran within this window.
+# Default 2 hours.
 CONF_COMFORT_FAMILY_RECENCY_WINDOW_MIN = "comfort_family_recency_window_min"
 DEFAULT_COMFORT_FAMILY_RECENCY_WINDOW_MIN = 120.0
 COMFORT_FAMILY_RECENCY_WINDOW_MIN_MIN = 15.0
@@ -998,65 +987,73 @@ CONFIG_METADATA = {
     "comfort_mode_switch_min_interval_s": {
         "label": "Minimum Time Between Heat/Cool Switches (sec)",
         "description": (
-            "How long to wait after commanding heat, active cooling, or a whole-house-fan session"
-            " before switching between the heating and cooling families again — prevents rapid"
-            " heat/cool hunting right after free cooling rides the house down to the comfort floor."
+            "Minimum wait between routine heat/cool switches, to prevent rapid back-and-forth. A real breach"
+            " (indoor temp actually past a comfort edge) ignores this wait and switches immediately."
         ),
         "category": "advanced",
     },
     "comfort_deadband_hot_f": {
-        "label": "Comfort Deadband — Hot Days",
+        "label": "Comfort Edge Switch Margin — Hot Days",
         "description": (
-            "On a hot day, how far indoor temp must drop below the comfort floor before the"
-            " comfort-family FSM escalates to heat (the against-grain direction on a hot day)."
+            "On a hot day: The thermostat switches to protect the nearer comfort edge once indoor temp is"
+            " within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never"
+            " exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range"
+            " is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed."
         ),
         "category": "advanced",
         "display_transform": "temp_delta",
     },
     "comfort_deadband_warm_f": {
-        "label": "Comfort Deadband — Warm Days",
+        "label": "Comfort Edge Switch Margin — Warm Days",
         "description": (
-            "On a warm day, how far indoor temp must drop below the comfort floor before the"
-            " comfort-family FSM escalates to heat."
+            "On a warm day: The thermostat switches to protect the nearer comfort edge once indoor temp is"
+            " within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never"
+            " exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range"
+            " is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed."
         ),
         "category": "advanced",
         "display_transform": "temp_delta",
     },
     "comfort_deadband_mild_f": {
-        "label": "Comfort Deadband — Mild/Off Days",
+        "label": "Comfort Edge Switch Margin — Mild Days",
         "description": (
-            "On a mild or off-classified day, how far indoor temp must move past a comfort edge"
-            " before the comfort-family FSM escalates against the day's native direction."
+            "On a mild or off-classified day: The thermostat switches to protect the nearer comfort edge"
+            " once indoor temp is within this many degrees of it. Values below 2 degrees are raised to 2, and"
+            " the margin never exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If"
+            " the comfort range is narrower than 3 degrees, the thermostat only switches after an edge is"
+            " actually crossed."
         ),
         "category": "advanced",
         "display_transform": "temp_delta",
     },
     "comfort_deadband_cool_f": {
-        "label": "Comfort Deadband — Cool Days",
+        "label": "Comfort Edge Switch Margin — Cool Days",
         "description": (
-            "On a cool day, how far indoor temp must rise above the comfort ceiling before the"
-            " comfort-family FSM escalates to cooling."
+            "On a cool day: The thermostat switches to protect the nearer comfort edge once indoor temp is"
+            " within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never"
+            " exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range"
+            " is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed."
         ),
         "category": "advanced",
         "display_transform": "temp_delta",
     },
     "comfort_deadband_cold_f": {
-        "label": "Comfort Deadband — Cold Days",
+        "label": "Comfort Edge Switch Margin — Cold Days",
         "description": (
-            "On a cold day, how far indoor temp must rise above the comfort ceiling before the"
-            " comfort-family FSM escalates to cooling (the against-grain direction on a cold day)."
+            "On a cold day: The thermostat switches to protect the nearer comfort edge once indoor temp is"
+            " within this many degrees of it. Values below 2 degrees are raised to 2, and the margin never"
+            " exceeds one third of your comfort range (so 5 on a 68-74 range acts as 2). If the comfort range"
+            " is narrower than 3 degrees, the thermostat only switches after an edge is actually crossed."
         ),
         "category": "advanced",
         "display_transform": "temp_delta",
     },
     "comfort_family_recency_window_min": {
-        "label": "Recent Activity Window for Deadband (min)",
+        "label": "Recently Heated Window for Ceiling Guard (min)",
         "description": (
-            'How long HVAC-cool, WHF, HVAC-fan, or nat-vent activity is remembered as "recent" for'
-            " the comfort-family deadband above. An against-grain switch (e.g. to heat on a warm day)"
-            " only waits for the full deadband when the opposite family ran within this window;"
-            " otherwise it switches immediately at the comfort boundary, since there's nothing recent"
-            " to short-cycle away from."
+            'Used only by the predicted-temperature ceiling guard: how long heating counts as "recently'
+            ' heated", during which the guard waits instead of acting on a predicted overshoot. It no longer'
+            " affects when the thermostat switches between heat and cool."
         ),
         "category": "advanced",
     },

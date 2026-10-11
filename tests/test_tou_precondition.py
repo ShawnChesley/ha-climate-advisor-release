@@ -119,12 +119,13 @@ class TestApplyComfortBandEdgeOnlyIntervention:
     """
 
     def test_same_edge_and_mode_commanded_whether_banked_or_not(self):
-        """Indoor banked at the far (floor) edge vs. already at the ceiling: identical command.
+        """Banked at the floor vs. already at the ceiling: each yields ONE static threshold command.
 
-        This is the crux of the prerequisite: if indoor sitting at comfort_heat (68°F, freshly
-        banked by TOU pre-conditioning) produced a *different* set_temperature call than indoor
-        already at comfort_cool (76°F), the "coast" behavior would need new code to reconcile
-        the difference. It does not — both produce the exact same single threshold command.
+        Issue #1066 (nearest-edge arming): the command now follows which edge indoor is nearest
+        (banked at comfort_heat guards the floor with heat; sitting at comfort_cool guards the
+        ceiling with cool). What the prerequisite still proves: in BOTH positions the engine issues
+        exactly one set_temperature call whose value is the band edge itself -- no interpolation,
+        no coast-specific code path.
         """
         banked_engine = _make_engine(indoor_temp=68.0, comfort_heat=68.0, comfort_cool=76.0)
         unbanked_engine = _make_engine(indoor_temp=76.0, comfort_heat=68.0, comfort_cool=76.0)
@@ -142,16 +143,17 @@ class TestApplyComfortBandEdgeOnlyIntervention:
         banked_payload = _temp_call(banked_engine)
         unbanked_payload = _temp_call(unbanked_engine)
 
-        assert banked_payload == unbanked_payload
-        assert banked_payload["hvac_mode"] == "cool"
-        assert banked_payload["temperature"] == 76.0
+        assert banked_payload["hvac_mode"] == "heat"
+        assert banked_payload["temperature"] == 68.0
+        assert unbanked_payload["hvac_mode"] == "cool"
+        assert unbanked_payload["temperature"] == 76.0
 
     def test_command_is_a_threshold_not_a_drive_to_target(self):
-        """The single set_temperature call always targets the band's active edge value itself —
-        never a value interpolated toward current indoor temp — confirming it is a static
-        threshold for the real thermostat to act on, not a proactive push computed by CA.
+        """The single set_temperature call always targets the band edge itself -- never a value
+        interpolated toward current indoor temp -- confirming it is a static threshold for the
+        real thermostat to act on, not a proactive push computed by CA.
         """
-        engine = _make_engine(indoor_temp=69.0, comfort_heat=68.0, comfort_cool=76.0)
+        engine = _make_engine(indoor_temp=74.0, comfort_heat=68.0, comfort_cool=76.0)
         classification = _make_cool_day_classification()
 
         asyncio.run(engine.apply_classification(classification))
@@ -160,7 +162,8 @@ class TestApplyComfortBandEdgeOnlyIntervention:
         temp_calls = [c for c in calls if c.args[1] == "set_temperature"]
         assert len(temp_calls) == 1
         payload = temp_calls[0].args[2]
-        # Must equal comfort_cool exactly (76.0), not some value between 69.0 and 76.0.
+        # Indoor 74 is inside the cool arming margin (ceiling 76 - 2.67). Must equal comfort_cool
+        # exactly (76.0), not some value between 74.0 and 76.0.
         assert payload["temperature"] == 76.0
         assert payload["hvac_mode"] == "cool"
 
@@ -403,30 +406,15 @@ class TestTouPreconditionResolverBypass:
     """
 
     def _engine_with_sustained_fallback_candidate(self, *, indoor_temp: float, comfort_heat: float) -> AutomationEngine:
-        """Indoor below comfort_heat, with the comfort-family FSM's heat sustain-confirm
-        candidate pre-armed as already sustained — if _set_temperature_for_mode()
-        consulted the FSM for this call, it would immediately escalate to "heat".
+        """Indoor below comfort_heat: a floor breach, so the nearest-edge selector (Issue #1066)
+        arms heat immediately (no sustain wait any more). If ``_set_temperature_for_mode()``
+        consulted the selector for a TOU ``target_override`` call it would command heat at the
+        below-floor cool banking target; the bypass must prevent that.
 
-        Issue #827: the resolver this test traps is now
-        _resolve_comfort_family_via_fsm(), whose sustain-confirm bookkeeping lives in
-        comfort_family_fsm.ComfortFamilyDwellState (self._comfort_family_dwell_state),
-        not the retired _resolve_comfort_family_mode()'s flat
-        self._comfort_floor_fallback_since datetime. Seeding heat_candidate_since (with
-        heat_candidate_raw=True so the FSM's own bookkeeping update doesn't reset the
-        clock on this same call) reproduces the same "already sustained" trap against
-        the new mechanism.
+        (Name kept for history: before Issue #1066 this seeded an already-sustained heat
+        fallback candidate in the retired against-grain FSM bookkeeping.)
         """
-        from datetime import datetime, timedelta
-
-        from custom_components.climate_advisor.comfort_family_fsm import ComfortFamilyDwellState
-
-        engine = _make_engine(indoor_temp=indoor_temp, comfort_heat=comfort_heat, comfort_cool=76.0)
-        _now = datetime(2026, 1, 1, 12, 0, 0)
-        engine._comfort_family_dwell_state = ComfortFamilyDwellState(
-            heat_candidate_since=_now - timedelta(hours=1),
-            heat_candidate_raw=True,
-        )
-        return engine
+        return _make_engine(indoor_temp=indoor_temp, comfort_heat=comfort_heat, comfort_cool=76.0)
 
     def test_target_override_bypasses_resolver_even_when_escalation_would_fire(self):
         """The trap: indoor (60F) is well below comfort_heat (68F), and the resolver's

@@ -21,7 +21,7 @@ For temperature formulas and threshold values see [docs/08-COMPUTATION-REFERENCE
 | How does occupancy priority resolve when multiple toggles are active? | Guest > Vacation > Home/Away > default (home). `_compute_occupancy_mode()` in the coordinator reads all three toggle states and dispatches to the matching handler. | [§9. Occupancy State Machine](07-AUTOMATION-FLOWCHART.md#9-occupancy-state-machine) |
 | Where is the full Tier 3 spec for grace periods — state transitions, timer lifecycle, invariants, HA-restart behavior? | The Territory spec covers both grace types, the 12-row transition table, pre-pause mode storage/restoration, occupancy interaction, and error conditions including sensor-unavailable-during-pause. | [Grace Period State Machine — Territory Spec](grace-periods-spec.md) |
 | Where is the full Tier 3 spec for the occupancy dispatch state machine — priority, handlers, setback formulas, persistence? | The Territory spec covers priority resolution (GUEST > VACATION > HOME/AWAY), all four toggle-entity handlers, the 7-row state transition table, setback formula derivation, and the interaction with manual override and grace periods. | [Occupancy Dispatch State Machine — Territory Spec](occupancy-dispatch-spec.md) |
-| What is the decision sequence inside apply_classification() for a warm or mild day, and when does the ODE ceiling guard fire? | Two sequential guards run before the HVAC-off action: (1) comfort-floor guard fires if indoor < comfort_heat; (2) ODE ceiling guard fires if a predicted breach is within the computed lead time and outdoor > indoor. Stateless — re-evaluated every 30-min cycle. | [§13. Warm-Day apply_classification() Guard Sequence](07-AUTOMATION-FLOWCHART.md#13-warm-day-apply_classification-guard-sequence) |
+| What is the decision sequence inside apply_classification() for a warm or mild day, and when does the ODE ceiling guard fire? | The occupied comfort band is always armed (Issue #249); which edge the thermostat guards is chosen by the nearest-edge selector (Issue #1066, 08 §6f), not by the day type. The comfort-floor guard (§6b) and ODE ceiling guard (§6c) are dormant safety nets: the ceiling guard fires if a predicted breach is within the computed lead time and outdoor > indoor, but its cool write is skipped while the selector is guarding the floor. Stateless — re-evaluated every 30-min cycle. | [§13. Warm-Day apply_classification() Guard Sequence](07-AUTOMATION-FLOWCHART.md#13-warm-day-apply_classification-guard-sequence) |
 | What are the early-return gates inside apply_classification() and in what order do they run? | Five gates run before comfort-band logic: (1) manual_override_active, (2) override_confirm_pending, (3) first-run HVAC running, (4) occupancy AWAY/VACATION redirect, (5) _paused_by_door — forces HVAC off and returns without applying the comfort band. | [§4c. apply_classification() Gate Sequence](07-AUTOMATION-FLOWCHART.md#4c-apply_classification-gate-sequence) |
 | What decision does the startup coalesce make for a physically running fan, and what triggers the thermostatic fast loop? | Coalesce reads live thermostat `fan_mode`/`hvac_action` and chooses adopt-on (nat-vent eligible), turn-off, or no-fan. The thermostatic loop fires on every indoor or outdoor temp change (two new listeners + backstop timer), not only on 30-min polls. | [§14. Fan Startup Reconciliation and Thermostatic Loop (Issue #327)](07-AUTOMATION-FLOWCHART.md#14-fan-startup-reconciliation-and-thermostatic-loop-issue-327) |
 | Can the `no-fan` reconcile branch strand `_pre_fan_hvac_mode` even though it's specifically the fix for that stranding (Issue #405)? | Yes, under one condition fixed by Issue #618: when `_paused_by_door=True` (window still open) at the moment it fires, the old code's `restore_hvac=False` also skipped releasing the snapshot, silently re-stranding it. Fixed by decoupling release from restore — `release_suppression=True` now always fires at this genuine session-end point regardless of whether the mode write is deferred (for a door pause, or because the trigger was a normal `cooling`/`heating`→`fan` blower-phase transition). | [§14 key invariant (D)](07-AUTOMATION-FLOWCHART.md#14-fan-startup-reconciliation-and-thermostatic-loop-issue-327) |
@@ -574,6 +574,30 @@ flowchart TD
 ---
 
 ## 13. Warm-Day `apply_classification()` Guard Sequence
+
+> **Current behavior (Issues #249 and #1066).** The diagram below shows the guard conditions as designed in Issue #136 and is kept for the ODE ceiling guard's conditions. Two parts of it are superseded: (1) warm/mild days no longer take a `hvac_mode = off` branch, they arm the occupied comfort band `[comfort_heat, comfort_cool]` (see 08 §6e), so the "Set HVAC off" box and the `warm_day_comfort_gap` event no longer occur; the floor guard in box B is only a dormant safety net. (2) Which edge the thermostat guards is decided by the nearest-edge selector, shown below. The ODE floor guard no longer exists. The ODE ceiling guard's `cool` write (box J) is skipped when the selector is guarding the floor (indoor at or below `floor + m`).
+
+```mermaid
+flowchart TD
+    S["Evaluation: every apply_classification() and every thermostat temperature change"] --> N{"Nat-vent/WHF owns HVAC,
+indoor or band missing?"}
+    N -->|Yes| X["Selector defers: no change"]
+    N -->|No| T{"Heat-only or cool-only thermostat?"}
+    T -->|Yes| O["Arm its one mode"]
+    T -->|No| B1{"indoor < floor?"}
+    B1 -->|Yes| H["Arm HEAT now (ignores 600 s dwell)"]
+    B1 -->|No| B2{"indoor > ceiling?"}
+    B2 -->|Yes| C["Arm COOL now (ignores 600 s dwell)"]
+    B2 -->|No| M1{"indoor <= floor + m?"}
+    M1 -->|Yes| H2["Arm HEAT (subject to dwell)"]
+    M1 -->|No| M2{"indoor >= ceiling - m?"}
+    M2 -->|Yes| C2["Arm COOL (subject to dwell)"]
+    M2 -->|No| K["Keep the thermostat's actual current mode
+(day-type default only if mode unknown)"]
+```
+
+`m` = `comfort_deadband_{day_type}_f`, at least 2 F, at most one third of the band width; if under 1 F the band is too narrow and only breaches switch. Pause, manual override, occupancy redirect and TOU pre-conditioning run before this and keep their priority. Details: [08 §6f](08-COMPUTATION-REFERENCE.md#6f-comfort-family-nearest-edge-arming-issue-1066--supersedes-827843858867).
+
 
 On every 30-minute coordinator update, `apply_classification()` runs two sequential guards before executing the `warm` or `mild` classification's default HVAC-off action. The guards run in order; the second guard only evaluates if the first does not fire.
 

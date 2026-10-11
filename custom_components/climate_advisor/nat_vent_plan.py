@@ -308,12 +308,11 @@ def compute_nat_vent_plan(
       comfort_floor_crossing_time: datetime | None — Issue #821: the comfort-floor
           crossing, populated whenever the scan finds one, REGARDLESS of whether it
           also won nat_vent_cutoff (unlike nat_vent_cutoff/nat_vent_cutoff_reason above,
-          which only surface it when it's the earlier of the two crossings). Consumed
-          by ``ode_floor_guard.py`` — a heat-day-agnostic floor-crossing scan is needed
-          for the comfort-floor defense fix independent of which crossing wins the
-          nat-vent-specific cutoff race. Still computed exactly once, here, per Issue
-          #817's single-source-of-truth architecture — ``ode_floor_guard.py`` reads this
-          cached field rather than re-scanning ``predicted_indoor`` itself.
+          which only surface it when it's the earlier of the two crossings). Used for
+          display and nat-vent planning, independent of which crossing wins the
+          nat-vent-specific cutoff race (the ODE floor guard that once consumed it was
+          removed by Issue #1066). Still computed exactly once, here, per Issue
+          #817's single-source-of-truth architecture.
       ceiling_breach_time: datetime | None — first hour indoor > comfort_cool
       precool_start_time: datetime | None — ceiling_breach_time minus computed lead
       any_nat_vent_window: bool — True if outdoor < indoor at any point

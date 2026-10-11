@@ -289,8 +289,8 @@
     "issue": 371
   },
   "cold_day_heat_all_day_with_override": {
-    "sha256": "b1b08e9449852285f5afd2995ba0d20331ed80f90e8d98dc28e4668580a414e3",
-    "signed": "2026-07-12",
+    "sha256": "60782d3add69ac7279b146ce27b1b626d4271e74f6492d5e2f342a0e87239872",
+    "signed": "2026-10-11",
     "issue": 229
   },
   "fan_fast_stop_on_outdoor_rise": {

@@ -2918,25 +2918,27 @@ def _render_comfort_family_switch_locked_out(p: dict, unit: str) -> tuple[str, s
 
 
 def _render_comfort_family_switch(p: dict, unit: str) -> tuple[str, str]:
-    # Issue #843 follow-up: the actual heat/cool family switch was previously
-    # logged only to HA core logs, invisible to the briefing/investigator — this
-    # renderer is what makes "did the recency-gated deadband fire?" observable
-    # without reading raw logs. deadband_applied_f == 0 means nothing recent was
-    # found to protect against (the new behavior this issue introduced);
-    # nonzero means a real breach cleared the day-type deadband (unchanged
-    # pre-#843 behavior).
+    # Issue #1066 (nearest-edge arming): the thermostat's guarded edge flipped. The detail shows where
+    # indoor sat against the comfort range at that moment so "why did it switch now?" is answerable
+    # without raw logs. "breach" means indoor was already outside the range (switched immediately).
+    # Events persisted by v0.7.96 and earlier carry the retired deadband/recency keys; they still render.
     resolved_family = p.get("resolved_family", "")
-    deadband = p.get("deadband_applied_f")
     label = f"Switched to {resolved_family}" if resolved_family else "Comfort family switched"
     detail_parts = [p.get("reason", "")]
-    if deadband is not None:
-        detail_parts.append(f"deadband applied: {format_temp_delta(deadband, unit, 1)}")
-    mins_cool = p.get("minutes_since_cooling_ended")
-    mins_heat = p.get("minutes_since_heating_ended")
-    if mins_cool is not None:
-        detail_parts.append(f"cooling last active {mins_cool:.0f}min ago")
-    if mins_heat is not None:
-        detail_parts.append(f"heating last active {mins_heat:.0f}min ago")
+    indoor, floor, ceiling = p.get("indoor_f"), p.get("floor_f"), p.get("ceiling_f")
+    if all(isinstance(v, (int, float)) for v in (indoor, floor, ceiling)):
+        detail_parts.append(
+            f"indoor {format_temp(indoor, unit, 0)}, comfort range {format_temp(floor, unit, 0)}-"
+            f"{format_temp(ceiling, unit, 0)}"
+        )
+    margin = p.get("margin_applied_f")
+    if isinstance(margin, (int, float)):
+        detail_parts.append(f"arming margin: {format_temp_delta(margin, unit, 1)}")
+    if p.get("breach"):
+        detail_parts.append("outside the comfort range")
+    legacy_deadband = p.get("deadband_applied_f")
+    if legacy_deadband is not None:
+        detail_parts.append(f"deadband applied: {format_temp_delta(legacy_deadband, unit, 1)}")
     return label, " — ".join(part for part in detail_parts if part)
 
 

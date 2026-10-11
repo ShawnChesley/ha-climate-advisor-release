@@ -1975,6 +1975,48 @@ class TestIssue913PlainLanguageLabels:
         )
         assert "lockout" not in ev.lower() and "blocked" not in ev.lower()
 
+    # -- comfort_family_switch: Issue #1066 payload (nearest-edge arming) --
+
+    def test_comfort_family_switch_new_payload_shows_range_and_margin(self):
+        ev, st = self._render(
+            "comfort_family_switch",
+            {
+                "resolved_family": "heating",
+                "reason": "within heat arming margin",
+                "margin_applied_f": 2.0,
+                "indoor_f": 70.0,
+                "floor_f": 68.0,
+                "ceiling_f": 74.0,
+                "breach": False,
+            },
+        )
+        assert ev == "Switched to heating"
+        assert "indoor 70" in st and "68" in st and "74" in st
+        assert "arming margin" in st
+        assert "outside the comfort range" not in st
+
+    def test_comfort_family_switch_breach_is_called_out(self):
+        _ev, st = self._render(
+            "comfort_family_switch",
+            {
+                "resolved_family": "heating",
+                "reason": "floor breach",
+                "indoor_f": 66.0,
+                "floor_f": 68.0,
+                "ceiling_f": 74.0,
+                "breach": True,
+            },
+        )
+        assert "outside the comfort range" in st
+
+    def test_comfort_family_switch_legacy_payload_still_renders(self):
+        ev, st = self._render(
+            "comfort_family_switch",
+            {"resolved_family": "cooling", "reason": "sustain-confirmed", "deadband_applied_f": 0.0},
+        )
+        assert ev == "Switched to cooling"
+        assert "deadband applied" in st
+
 
 # ---------------------------------------------------------------------------
 # TestUnprotectedGraceStartedHidden

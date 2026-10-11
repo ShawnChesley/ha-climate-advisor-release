@@ -1,16 +1,18 @@
 {
   "name": "issue_821_comfort_floor_fallback_no_confidence",
-  "description": "Reproduces the reported live incident (Zone \"Simulated 2\"): a day classified for cooling, no nat-vent session, indoor decays below comfort_heat with NO thermal-model confidence (confidence_k_passive == \"none\" — the exact condition Zone 2 had during the incident window). The ODE floor guard cannot help here (MODEL_INELIGIBLE) — this scenario proves the confidence-none FALLBACK path is what actually fixes the reported bug: a simple, sustain-confirmed indoor-vs-comfort_heat check that switches the comfort family to heating.",
+  "description": "Issue #821 / #1066 (Design D nearest-edge arming, docs/08-COMPUTATION-REFERENCE.md section 6f). Reproduces the reported live incident (Zone 'Simulated 2'): a warm day with no nat-vent session and NO thermal model, indoor decays below comfort_heat (70F) and the thermostat sat in cool confirming a cooling setpoint every cycle for 2+ hours. Under Design D thermal-model confidence is not an input at all: the first evaluation with indoor below the floor (08:30, 67F vs 70F, from a 73F cooling-zone baseline) arms heat, and later cycles (08:35, 08:41) simply re-affirm it. File name kept for traceability.",
   "source": "Issue #821 investigation — live incident, Zone \"Simulated 2\" (climate.simulated_thermostat), indoor held at 57F for 2+ hours while CA repeatedly confirmed a 74F cool setpoint every cycle with zero corrective heating.",
   "issue": 821,
   "notes": [
-    "Three-exercise protocol (CLAUDE.md §10):",
-    "(a) Scenario effectiveness: reverting Issue #821's fallback path (removing the confidence-none branch from _resolve_comfort_family_mode(), or removing its wiring into _apply_comfort_band()) causes the final assertion (comfort_family=heating at 08:41) to FAIL — the engine would keep affirming the cool-mode ceiling forever, exactly reproducing the reported incident.",
-    "(b) Docs<->production alignment: docs/08-COMPUTATION-REFERENCE.md's automation logic table now documents the comfort-floor-defense fallback row alongside this scenario as its test reference.",
-    "(c) Occupant experience: without this fix, a zone with no thermal-model history yet (a freshly-added zone, or one that hasn't accumulated enough HVAC cycles) never gets its comfort floor actively defended on a cool-classified day — the home can drift arbitrarily cold with the thermostat still confirming a cooling setpoint every cycle. With the fix, the engine switches to heat once the below-floor reading has genuinely held for COMFORT_FALLBACK_CONFIRM_S (90s), not on a single noisy tick.",
-    "The 08:30:00 assertion (family still 'cooling') proves the sustain-confirmation gate is genuinely load-bearing here — the first evaluation after crossing below the floor does NOT escalate immediately, matching the project owner's explicit concern about avoiding a naive instant-flip design.",
-    "CORRECTED per Issue #823 (this scenario's own commentary previously endorsed the bug it should have caught): _arm_comfort_family() must NOT reset the family-switch lockout's dwell clock on every routine reassertion of an unchanged family (_apply_comfort_band()/_set_temperature_for_mode() now pass only_if_changed=True). The dwell clock measures continuous time since the 'cooling' family GENUINELY started (08:00:00, the scenario's baseline classification tick, the first real arm), not time since the most recent reassertion. The added 08:35:00 classification tick (below the floor, day still cool-classified, matching the ~5-minute cadence observed in the live incident) exists specifically to distinguish the fixed behavior from the pre-#823 bug: under the bug, that tick would reset entry_time to 08:35:00, leaving only 360s of headroom by 08:41:00 (< 600s comfort_mode_switch_min_interval_s) — the final assertion would FAIL, reproducing the live incident. Under the fix, entry_time stays pinned at 08:00:00 through every reassertion (08:30:00, 08:35:00), so by 08:41:00 elapsed is ~2460s, and the only real gate remaining is COMFORT_FALLBACK_CONFIRM_S (90s) from the 08:30:00 below-floor crossing — comfortably satisfied.",
-    "Negative-control equivalent for this scenario lives in tests/test_comfort_mode_family_lockout.py::TestPermanentLockoutFixIssue823 (unit-level, exercises 15 closely-spaced cycles rather than this scenario's 2) — that test's own negative control (reverting only_if_changed to a no-op) was manually confirmed to fail, i.e. the lockout never clears. This JSON scenario is the end-to-end/production-shaped counterpart, not a duplicate: it exercises the real event/classification harness path, not just the two engine methods directly."
+    "Occupant impact: a zone with no thermal-model history (new zone, or too few HVAC cycles) must still have its comfort floor defended. The house must get heat on the first evaluation below 70F instead of sitting at 57F with the AC armed.",
+    "Design D rule exercised (docs/08 section 6f): indoor < floor -> heating immediately; thermal confidence, day type, recency and sustain are not inputs. The 08:35 and 08:41 evaluations are redundant re-affirmations of the already-armed family (they model the ~5-minute cadence of the live incident) and are kept because they prove heating stays armed across repeated cycles instead of being reset or re-escalated. See issue_827_off_day_floor_breach_escalates.json and issue_827_missing_forecast_fallback_escalates.json for near-duplicates of this event shape.",
+    "Baseline fix (Issue #1066 review): the original baseline sat inside the heat zone (indoor <= floor + m), so heat was already armed before the breach and the final-state assertions passed vacuously. The baseline is now inside the cooling zone so the breach reading is the first thing that can arm heat. (Band [70F, 74F] is only 4F wide, so the arming margin is clamped to one third of it, 1.33F: heat zone <= 71.33F, cool zone >= 72.67F. The old 71F baseline armed heat at 08:00.)",
+    "Classification fields: day_type=warm with hvac_mode=off, as classifier.py derives for DAY_TYPE_WARM (the original hand-set hvac_mode=cool diverged from the classifier and was corrected during the #1066 review).",
+    "Harness limit: comfort_family reads the engine's FINAL state, so it is placed on the last event; it cannot prove WHEN heating was armed. The tighter timing evidence for this rule is in issue_1066_cold_morning_mild_day_arms_heat_immediately.json (comfort_family_switch_by at the first evaluation).",
+    "Three-exercise protocol (CLAUDE.md section 10):",
+    "(a) Scenario effectiveness: with nearest-edge arming deleted (origin/main), a warm day is natively cooling and heat is against-grain: the first below-floor evaluation only arms a candidate, escalation needs a 90 s sustain across two evaluations and the 600 s dwell clock, and the dwell clock (see Issue #823) must not be reset by reassertions. A regression that re-introduced a cooling default with no thermal model would leave comfort_family=cooling and fail the final assertion.",
+    "(b) Docs<->production alignment: docs/08 section 6f ('thermal confidence is not an input'; 'indoor < floor -> heating').",
+    "(c) Occupant outcome if this test fails to catch a regression: a newly added zone drifts arbitrarily cold with the thermostat confirming a cooling setpoint every cycle and zero corrective heating, as in the live incident."
   ],
   "config": {
     "comfort_heat": 70,
@@ -25,47 +27,47 @@
       "time": "2026-08-31T08:00:00",
       "type": "classification",
       "day_type": "warm",
-      "hvac_mode": "cool",
+      "hvac_mode": "off",
       "windows_recommended": false,
-      "note": "Warm-day classification: HVAC in cool mode. No nat-vent (fan_mode disabled) — mirrors the reported Zone 2 incident, a dev-sim zone with no WHF configured."
+      "note": "Warm-day classification (classifier derives hvac_mode=off). No nat-vent (fan_mode disabled)."
     },
     {
       "time": "2026-08-31T08:00:00",
       "type": "temp_update",
-      "indoor_f": 71.0,
+      "indoor_f": 73.0,
       "outdoor_f": 60.0,
-      "note": "Baseline: indoor 71F within band [70F, 74F] — comfort band arms normally at the ceiling (cool)."
+      "note": "Baseline: indoor 73F in the cooling zone of the narrow band [70F, 74F] (margin 1.33F, cool zone >= 72.67F): cool is armed at 74. No breach."
     },
     {
       "time": "2026-08-31T08:30:00",
       "type": "temp_update",
       "indoor_f": 67.0,
       "outdoor_f": 55.0,
-      "note": "Indoor has decayed to 67F, below comfort_heat=70F — no thermal model has ever been set on this engine, so confidence_k_passive defaults to \"none\" (the exact confidence-none condition Zone 2 had during the real incident)."
+      "note": "Indoor has decayed to 67F, below comfort_heat=70F. No thermal model was ever set on this engine (confidence none), which is irrelevant to the selector."
     },
     {
       "time": "2026-08-31T08:30:00",
       "type": "classification",
       "day_type": "warm",
-      "hvac_mode": "cool",
+      "hvac_mode": "off",
       "windows_recommended": false,
-      "note": "Re-evaluation with indoor now below the floor. First tick the fallback candidate becomes true — armed, not yet confirmed (elapsed 0s < 90s COMFORT_FALLBACK_CONFIRM_S), so the band still commands cool this cycle. Per the Issue #823 fix, this reassertion does NOT reset the family-switch lockout's entry_time (only_if_changed=True) — it stays pinned at 08:00:00, when 'cooling' genuinely became the active family."
+      "note": "First evaluation with indoor below the floor: floor breach, heat is armed immediately (no sustain, no recency window, no confidence gate)."
     },
     {
       "time": "2026-08-31T08:35:00",
       "type": "classification",
       "day_type": "warm",
-      "hvac_mode": "cool",
+      "hvac_mode": "off",
       "windows_recommended": false,
-      "note": "Issue #823: a third, realistically-spaced re-evaluation (5 minutes after 08:30:00, matching the live incident's observed classification cadence) — indoor is still below the floor, and the fallback candidate is already sustain-confirmed (300s elapsed since the 08:30:00 crossing, past the 90s COMFORT_FALLBACK_CONFIRM_S gate). This is the tick that discriminates the Issue #823 fix from the bug it replaces. Under the FIX, entry_time has stayed pinned at 08:00:00 (the true start of the 'cooling' family) since the 08:30:00 reassertion was a no-op — elapsed is already ~2100s, past the 600s lockout, so the switch to heating actually fires HERE, at 08:35:00, not at the final 08:41:00 checkpoint. Under the pre-fix BUG, the 08:30:00 reassertion would have reset entry_time to 08:30:00, so at 08:35:00 elapsed is only 300s (< 600s) — still locked out; this tick's own reassertion then resets entry_time again to 08:35:00, so by 08:41:00 elapsed is only 360s (< 600s) — still locked out, reproducing the live incident's permanent lockout. Either way, the scenario's only assertion type here reads the engine's FINAL state (see the 08:41:00 assertion's own note), so this tick's effect is only visible indirectly via whether the final snapshot shows 'heating' or 'cooling'."
+      "note": "Realistically spaced re-evaluation (5 minutes later, matching the live incident cadence). Indoor is still below the floor; heating is already armed, so this is a re-affirmation, not a second escalation."
     },
     {
       "time": "2026-08-31T08:41:00",
       "type": "classification",
       "day_type": "warm",
-      "hvac_mode": "cool",
+      "hvac_mode": "off",
       "windows_recommended": false,
-      "note": "Final re-evaluation. Elapsed since the TRUE cooling-family start (08:00:00) is ~2460s, comfortably past comfort_mode_switch_min_interval_s (600s); COMFORT_FALLBACK_CONFIRM_S (90s from the 08:30:00 below-floor crossing) was already satisfied by 08:35:00. Fallback escalates: comfort family switches to heating, engine commands heat at comfort_heat."
+      "note": "Final re-evaluation: still below the floor, heating remains armed and heat is commanded at comfort_heat."
     }
   ],
   "assertions": [
@@ -82,13 +84,13 @@
       "family": "heating",
       "track": "logic",
       "simulator_support": false,
-      "reason": "By 08:41:00, elapsed since the TRUE cooling-family start (08:00:00, per the Issue #823 fix — routine reassertions at 08:30:00 and 08:35:00 are no-ops for the dwell clock) is ~2460s, comfortably past comfort_mode_switch_min_interval_s (600s), and COMFORT_FALLBACK_CONFIRM_S (90s from the 08:30:00 below-floor crossing) was satisfied by 08:31:30. In practice the fallback actually escalates at the 08:35:00 tick (the first re-evaluation after both gates clear) and 'heating' is already the recorded family by the time this assertion checks — this checkpoint just confirms it holds. This is the actual fix for the reported live incident (Zone \"Simulated 2\", confidence_k_passive == \"none\" throughout the 2+ hour incident window). NOTE: the 'comfort_family' assertion type reads the engine's FINAL state snapshot (matching the existing nat_vent_still_active/paused_by_door convention documented in outcomes.py) — it cannot verify an intermediate mid-run value, only the state at scenario end, which is why this is the only assertion of this type in the scenario and is placed on the LAST event."
+      "reason": "By the final evaluation the engine is in the heating family. Placed on the last event because comfort_family reads the engine's final state. Heating was actually armed at the first below-floor evaluation (08:30); this checkpoint confirms it holds across repeated re-evaluations. This is the fix for the reported live incident (confidence_k_passive == 'none' throughout)."
     }
   ],
   "verdict": {
     "type": "positive",
-    "summary": "On a cool-classified day with no thermal-model confidence, the comfort floor is actively defended via the sustain-confirmed fallback path once indoor genuinely holds below comfort_heat for 90s.",
-    "observed_behavior": "comfort family stays 'cooling' on the tick indoor first crosses below comfort_heat, then switches to 'heating' once the below-floor reading has been sustained for COMFORT_FALLBACK_CONFIRM_S.",
-    "expected_behavior": "The comfort floor is never silently left undefended on a cool-classified day, and the switch is debounced against a single noisy reading — directly fixing the reported live incident without reintroducing heat/cool hunting."
+    "summary": "On a warm day with no thermal-model confidence, indoor below the comfort floor arms heat on the first evaluation and stays armed.",
+    "observed_behavior": "Family is cooling/ceiling at 71F; the 08:30 reading of 67F (below the 70F floor) arms heating and commands heat; later cycles re-affirm it.",
+    "expected_behavior": "The comfort floor is never left undefended because the thermal model has no confidence yet: below the floor means heat, immediately (docs/08 section 6f)."
   }
 }

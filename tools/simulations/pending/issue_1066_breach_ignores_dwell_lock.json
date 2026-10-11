@@ -1,0 +1,202 @@
+{
+  "name": "issue_1066_breach_ignores_dwell_lock",
+  "description": "The 600 s anti-chatter dwell lock applies only to NON-breach switches. Mild day, band 68F/74F, margin 2F. A non-breach switch to cool at 08:00 starts the clock; a non-breach flip back to heat 300 s later is held; a breach below the floor (67F) 360 s after the switch is commanded immediately (heat) because comfort protection overrides anti-chatter; a following non-breach flip to cool 240 s later is held again (the breach restarted the clock), and is applied only once 600 s have elapsed (08:17).",
+  "source": "Issue #1066 plan, dwell-lock semantics (docs/08 section 6f 'Reactive evaluation, dwell lock, decision memory')",
+  "issue": 1066,
+  "notes": [
+    "Occupant impact: the house is never left below its comfort floor (or above the ceiling) just because the HVAC switched modes a few minutes ago, yet it also does not flip modes every few minutes while hovering at the boundaries.",
+    "The locked_out events come from the scheduled classification cycle (the reactive temperature path stays silent while the lock would block the switch), so each non-breach step also carries a classification event at the same timestamp.",
+    "Three-exercise protocol (CLAUDE.md #10):",
+    "(a) Scenario effectiveness: on origin/main the family switch required breach + deadband + 90 s sustain, and cool-to-heat at 70F (no breach) was impossible, so the 08:05 locked_out(heating) assertion could never be met; the 08:06 breach switch landing without waiting for the sustain window (event at 08:06 with breach=true) would also fail. If the new FSM did not let breaches bypass the lock, the 08:06 switch would be locked_out instead and the breach assertion would fail; if the lock were removed, the 08:05 and 08:10 locked_out assertions would fail.",
+    "(b) Docs vs production: docs/08-COMPUTATION-REFERENCE.md section 6f 'A non-breach switch within comfort_mode_switch_min_interval_s ... is held; a breach switch always proceeds and restarts the clock. The clock moves only on a genuine transition.'",
+    "(c) Occupant outcome if this test fails to catch a regression: either the house stays below its floor for up to ten minutes after a recent mode switch, or the HVAC short-cycles between heat and cool at the band boundaries.",
+    "Classification fields: day_type=mild, hvac_mode=off, windows_recommended=true with 10:00/17:00 window times match classifier.py for DAY_TYPE_MILD."
+  ],
+  "config": {
+    "comfort_heat": 68,
+    "comfort_cool": 74,
+    "initial_thermostat_mode": "heat",
+    "fan_mode": "disabled"
+  },
+  "events": [
+    {
+      "time": "2026-10-11T07:30:00",
+      "type": "temp_update",
+      "indoor_f": 69.0,
+      "outdoor_f": 50.0,
+      "note": "Indoor 69F in the heat zone; thermostat in heat. Baseline."
+    },
+    {
+      "time": "2026-10-11T07:30:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: Indoor 69F in the heat zone; thermostat in heat. Baseline."
+    },
+    {
+      "time": "2026-10-11T08:00:00",
+      "type": "temp_update",
+      "indoor_f": 72.5,
+      "outdoor_f": 58.0,
+      "note": "72.5F reaches ceiling-m: non-breach switch to cool (the transition that starts the 600 s dwell clock)."
+    },
+    {
+      "time": "2026-10-11T08:00:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 72.5F reaches ceiling-m: non-breach switch to cool (the transition that starts the 600 s dwell clock)."
+    },
+    {
+      "time": "2026-10-11T08:05:00",
+      "type": "temp_update",
+      "indoor_f": 70.0,
+      "outdoor_f": 58.0,
+      "note": "70F reaches floor+m only 300 s after the switch: a NON-breach flip back to heat is held by the dwell lock (comfort_family_switch_locked_out)."
+    },
+    {
+      "time": "2026-10-11T08:05:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 70F reaches floor+m only 300 s after the switch: a NON-breach flip back to heat is held by the dwell lock (comfort_family_switch_locked_out)."
+    },
+    {
+      "time": "2026-10-11T08:06:00",
+      "type": "temp_update",
+      "indoor_f": 67.0,
+      "outdoor_f": 57.0,
+      "note": "67F is below the 68F floor: a BREACH. Heat is armed immediately even though only 360 s have passed since the cool switch."
+    },
+    {
+      "time": "2026-10-11T08:06:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 67F is below the 68F floor: a BREACH. Heat is armed immediately even though only 360 s have passed since the cool switch."
+    },
+    {
+      "time": "2026-10-11T08:10:00",
+      "type": "temp_update",
+      "indoor_f": 73.0,
+      "outdoor_f": 60.0,
+      "note": "73F wants cool, but this is a non-breach flip 240 s after the 08:06 breach transition (which restarted the clock): held again."
+    },
+    {
+      "time": "2026-10-11T08:10:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 73F wants cool, but this is a non-breach flip 240 s after the 08:06 breach transition (which restarted the clock): held again."
+    },
+    {
+      "time": "2026-10-11T08:17:00",
+      "type": "temp_update",
+      "indoor_f": 72.0,
+      "outdoor_f": 60.0,
+      "note": "72F: 660 s after the 08:06 transition the lock has expired, so the non-breach flip to cool is finally applied."
+    },
+    {
+      "time": "2026-10-11T08:17:00",
+      "type": "classification",
+      "day_type": "mild",
+      "hvac_mode": "off",
+      "windows_recommended": true,
+      "window_open_time": "10:00",
+      "window_close_time": "17:00",
+      "note": "Evaluation cycle at the same reading: 72F: 660 s after the 08:06 transition the lock has expired, so the non-breach flip to cool is finally applied."
+    }
+  ],
+  "assertions": [
+    {
+      "at": "2026-10-11T08:00:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "cooling",
+        "indoor_f": 72.5,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Non-breach switch to cool at ceiling-m starts the dwell clock."
+    },
+    {
+      "at": "2026-10-11T08:05:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch_locked_out",
+      "payload_subset": {
+        "candidate_family": "heating"
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "A non-breach flip back to heat 300 s after the switch is delayed: the FSM emits locked_out (candidate heating) instead of switching."
+    },
+    {
+      "at": "2026-10-11T08:06:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "heating",
+        "indoor_f": 67.0,
+        "breach": true
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "A breach below the floor is commanded immediately, ignoring the 600 s lock (only 360 s since the cool switch)."
+    },
+    {
+      "at": "2026-10-11T08:10:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch_locked_out",
+      "payload_subset": {
+        "candidate_family": "cooling"
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "The breach restarted the dwell clock, so a non-breach flip to cool 240 s later is locked out (candidate cooling)."
+    },
+    {
+      "at": "2026-10-11T08:17:00",
+      "expect": "event_emitted",
+      "event": "comfort_family_switch",
+      "payload_subset": {
+        "resolved_family": "cooling",
+        "indoor_f": 72.0,
+        "breach": false
+      },
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Once 660 s have passed since the last genuine transition the delayed non-breach flip to cool is applied."
+    },
+    {
+      "at": "2026-10-11T08:17:00",
+      "expect": "comfort_family",
+      "family": "cooling",
+      "track": "logic",
+      "simulator_support": false,
+      "reason": "Final family cooling after the lock expired."
+    }
+  ],
+  "verdict": {
+    "type": "positive",
+    "summary": "Breaches bypass the 600 s dwell lock; non-breach flips inside it are delayed until it expires.",
+    "observed_behavior": "Locked out at 08:05 and 08:10, breach heat at 08:06, delayed cool applied at 08:17.",
+    "expected_behavior": "docs/08 section 6f dwell-lock semantics."
+  }
+}
