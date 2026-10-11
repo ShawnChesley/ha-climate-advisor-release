@@ -366,7 +366,7 @@ class TestPredictionError:
 class TestRobustness:
     def test_empty_inputs_give_structure_with_none_fields(self):
         r = build([], [])
-        assert r["schema"] == CONTROL_QUALITY_SCHEMA == 2
+        assert r["schema"] == CONTROL_QUALITY_SCHEMA == 3
         assert set(r["windows"]) == {"24h", "7d"}
         w = w24(r)
         assert w["samples"] == {"mode_changes": 0, "chart_entries": 0, "coverage_hours": None}
@@ -488,7 +488,7 @@ class TestSnapshotIntegration:
         ]
         snap = build_diagnostic_snapshot(_hass(), _snapshot_coordinator(log, changes))
         cq = snap["control_quality"]
-        assert cq["schema"] == 2
+        assert cq["schema"] == 3
         assert cq["windows"]["24h"]["mode_changes"]["count"] == 1
         assert cq["windows"]["24h"]["runtime"]["cooling"]["minutes"] == 30.0
         assert cq["windows"]["24h"]["samples"]["chart_entries"] == 2

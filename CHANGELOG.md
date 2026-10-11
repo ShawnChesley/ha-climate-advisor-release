@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.102] — 2026-10-11
+
+- Fix #1077: the downloaded control-quality summary now separates holds near a comfort edge from real overshoots, so the deepest-overshoot figure is no longer diluted by edge-margin holds. (Holds recorded before this update show no figure for up to a week.)
+
 ## [0.7.101] — 2026-10-11
 
 - Fix #1067: on a cool morning the chart's predicted indoor temperature now rises toward your comfort floor (as the thermostat will) instead of drifting below it. On a mild day that starts cold, the later afternoon prediction is correspondingly a little warmer, so the ceiling guard may start cooling sooner.
