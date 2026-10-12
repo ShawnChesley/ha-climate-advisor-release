@@ -573,8 +573,9 @@ def select_comfort_band(
     ``aggressive_savings`` widens BOTH comfort edges by ``CEILING_ESCALATION_SAVINGS_MARGIN_F``
     (floor down, ceiling up) so the system runs less; setback/sleep bands are unaffected.
 
-    ``tou_expansion_f`` (Issue #899, default ``0.0`` — a no-op for every caller except the
-    single away/vacation live-commit site, ``_apply_occupancy_away_vacation_decision()``):
+    ``tou_expansion_f`` (Issue #899, default ``0.0`` — a no-op for home/guest; the away/vacation
+    live-commit site ``_apply_occupancy_away_vacation_decision()`` and, since Issue #1080, the
+    read-only ``resolve_active_band()`` readers pass it):
     while a TOU high-cost window is active for an away/vacation occupancy, widens the ONE
     edge matching the day's anticipated HVAC direction — the ceiling on a cooling day, the
     floor on a heating day (``classification.hvac_mode``) — by this many degrees. Half of
@@ -4661,7 +4662,8 @@ class AutomationEngine:
     def _resolved_comfort_band(self, c: DayClassification) -> ComfortBand:
         """The comfort band in force right now for ``c`` (Issue #1073, S6): the SAME
         ``select_comfort_band()`` inputs ``apply_classification()`` feeds ``_apply_comfort_band()``
-        (occupancy, sleep window, aggressive savings). Falls back to the flat
+        (occupancy, sleep window, aggressive savings) plus, since Issue #1080, the TOU away/vacation
+        expansion ``handle_occupancy_away/vacation`` arm. Falls back to the flat
         ``comfort_heat``/``comfort_cool`` band if the resolver cannot run, so a restore is never
         skipped by a resolver fault (graceful degradation)."""
         try:
@@ -4672,7 +4674,7 @@ class AutomationEngine:
                 now=dt_util.now(),
                 # Issue #1080: handle_occupancy_away/vacation arm the TOU-expanded band, so the
                 # read-only readers (status, incidents, override matching) must resolve it too.
-                tou_expansion_f=self._tou_av_expansion_f,
+                tou_expansion_f=getattr(self, "_tou_av_expansion_f", 0.0),
             )
         except Exception:  # noqa: BLE001 - a resolver fault must not strand a restore
             _LOGGER.warning(

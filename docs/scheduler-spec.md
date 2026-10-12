@@ -136,7 +136,7 @@ below/above the away/vacation setback edge (commanded directly by
 safety net that would otherwise redirect the command back to the plain setback — this call
 site already IS the occupancy-aware path), half becomes a temporary widening of that same
 edge for the window's duration (`select_comfort_band()`'s new `tou_expansion_f` parameter,
-default `0.0`/no-op for every other of its 10 call sites).
+default `0.0`/no-op for home/guest; since Issue #1080 the read-only readers pass it too, see below).
 
 **Worked example** (the reporting user's own numbers from Issue #892): away setpoint 76°F,
 ~6°F predicted drift over a 4.4hr window → precool to 73°F before the window starts, ceiling
