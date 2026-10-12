@@ -16,7 +16,7 @@ import platform
 from collections.abc import Callable
 from datetime import datetime, time
 
-from .automation import _in_sleep_window, compute_pre_cool_target, resolve_pre_cool_modifier
+from .automation import _in_sleep_window, compute_pre_cool_target, resolve_pre_cool_modifier, select_comfort_band
 from .classifier import DayClassification
 from .const import (
     COLD_DAY_SETBACK_DEPTH_F,
@@ -28,10 +28,8 @@ from .const import (
     DEFAULT_AUTOMATION_GRACE_SECONDS,
     DEFAULT_MANUAL_GRACE_SECONDS,
     DEFAULT_SENSOR_DEBOUNCE_SECONDS,
-    DEFAULT_SETBACK_COOL,
     DEFAULT_SETBACK_DEPTH_COOL_F,
     DEFAULT_SETBACK_DEPTH_F,
-    DEFAULT_SETBACK_HEAT,
     ECONOMIZER_TEMP_DELTA,
     FAN_MODE_DISABLED,
     OCCUPANCY_SETBACK_MINUTES,
@@ -458,19 +456,29 @@ def _generate_tldr_table(
     day_type_val = f"{c.day_type.title()} ({format_temp(c.today_high, temp_unit)})"
 
     # --- HVAC Mode row (Issue #85: show setback temps when away/vacation) ---
-    setback_heat = config.get("setback_heat", DEFAULT_SETBACK_HEAT)
-    setback_cool = config.get("setback_cool", DEFAULT_SETBACK_COOL)
+    # Issue #1088: print the edge the thermostat is actually armed with -- vacation's extra setback
+    # included -- by reading the engine's band selector, not the raw config keys. A morning snapshot: the
+    # TOU away/vacation widening is not threaded in. aggressive_savings is deliberately False: the briefing
+    # body quotes the plain comfort range throughout, so widening only this row would make the briefing
+    # contradict itself (tracked separately).
+    _band = select_comfort_band(
+        c,
+        config,
+        occupancy_mode=occupancy_mode,
+        in_sleep_window=False,
+        aggressive_savings=False,
+    )
     if occupancy_mode in ("away", "vacation"):
         if c.hvac_mode == "cool":
-            hvac_val = f"Cool at {format_temp(setback_cool, temp_unit)}"
+            hvac_val = f"Cool at {format_temp(_band.ceiling, temp_unit)}"
         elif c.hvac_mode == "heat":
-            hvac_val = f"Heat at {format_temp(setback_heat, temp_unit)}"
+            hvac_val = f"Heat at {format_temp(_band.floor, temp_unit)}"
         else:
             hvac_val = f"Off — {occupancy_mode}"
     elif c.hvac_mode == "cool":
-        hvac_val = f"Cool at {format_temp(comfort_cool, temp_unit)}"
+        hvac_val = f"Cool at {format_temp(_band.ceiling, temp_unit)}"
     elif c.hvac_mode == "heat":
-        hvac_val = f"Heat at {format_temp(comfort_heat, temp_unit)}"
+        hvac_val = f"Heat at {format_temp(_band.floor, temp_unit)}"
     else:
         hvac_val = "Off — windows day"
 

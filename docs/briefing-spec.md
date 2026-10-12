@@ -194,6 +194,10 @@ Two changes keep this from recurring:
    both proportional-font, not monospace). The HVAC Mode row also no longer repeats
    `"(setback — away/vacation)"` when the Occupancy row directly below it already states
    the same fact. This keeps the documented worst case comfortably under 250 chars.
+   Since Issue #1088 the row prints the edge the thermostat is armed with, read from
+   `select_comfort_band()` (vacation's extra setback included) instead of the raw config
+   keys. It is a morning snapshot, so the time-of-use away/vacation widening is not
+   shown, and the aggressive-savings margin is not shown anywhere in the briefing yet.
 2. **Truncation remains a safety net**, not the primary fix: `ClimateAdvisorBaseSensor._capped_state()`
    (`sensor.py`) caps any sensor state at 250 chars (`text[:247] + "..."`), logging a
    one-time `WARNING` if it ever actually fires, so a future regression degrades to a

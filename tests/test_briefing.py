@@ -2753,3 +2753,34 @@ class TestWarmDayBriefWithPrediction:
         outdoor = _make_outdoor_curve([65.0, 73.0, 75.0, 77.0], start_hour_utc=8)
         result = _generate(c, predicted_indoor_future=indoor, predicted_outdoor_future=outdoor)
         assert "**" not in result, f"Bold markers found in enriched warm-day brief: {result}"
+
+
+class TestTldrShowsTheArmedBand:
+    """Issue #1088/#1087: the HVAC Mode row must print the edge the thermostat is armed with."""
+
+    def _row(self, day_type, high, occupancy_mode, config=None, temp_unit="fahrenheit"):
+        c = _make_classification(day_type, today_high=high, today_low=50)
+        rows = _generate_tldr_table(c, config or _make_config(), temp_unit=temp_unit, occupancy_mode=occupancy_mode)
+        return "\n".join(rows)
+
+    def test_vacation_cool_day_includes_the_extra_setback(self):
+        # setback_cool 80 + VACATION_SETBACK_EXTRA 3
+        assert "Cool at 83" in self._row("hot", 92, "vacation")
+
+    def test_vacation_heat_day_includes_the_extra_setback(self):
+        # setback_heat 60 - VACATION_SETBACK_EXTRA 3
+        assert "Heat at 57" in self._row("cold", 30, "vacation")
+
+    def test_away_keeps_the_plain_setback(self):
+        assert "Cool at 80" in self._row("hot", 92, "away")
+        assert "Heat at 60" in self._row("cold", 30, "away")
+
+    def test_home_without_savings_unchanged(self):
+        assert "Cool at 75" in self._row("hot", 92, "home")
+        assert "Heat at 70" in self._row("cold", 30, "home")
+
+    def test_vacation_in_celsius_converts_the_widened_edge(self):
+        from custom_components.climate_advisor.temperature import format_temp
+
+        row = self._row("cold", 30, "vacation", temp_unit="celsius")
+        assert f"Heat at {format_temp(57.0, 'celsius')}" in row

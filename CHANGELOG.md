@@ -3,6 +3,11 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.104] — 2026-10-11
+
+- Fix #1087: with Prefer savings on, the chart's target band (and the predicted indoor line built on it) now shows the wider comfort range the thermostat is actually holding.
+- Fix #1088: on vacation, the daily briefing's HVAC line now shows the temperature the thermostat is really set to, including the extra vacation setback.
+
 ## [0.7.103] — 2026-10-11
 
 - Fix #1080: while you are Away or on Vacation during a time-of-use window, the dashboard's "CA target" note, incident records, comfort-violation checks and manual-override matching now use the same widened comfort range the thermostat is actually holding, instead of the narrower normal setback.

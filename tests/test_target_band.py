@@ -591,3 +591,49 @@ class TestPreCoolTriggerTimePureExtraction:
         assert method_result is None
         assert pure_result is None
         assert method_result == pure_result
+
+
+# ---------------------------------------------------------------------------
+# Issue #1087 -- aggressive savings widens the awake band the thermostat is armed with
+# ---------------------------------------------------------------------------
+class TestAggressiveSavingsWidensAwakeBand:
+    """Occupant view: with "Prefer savings" on, the thermostat holds the awake band wider; the chart
+    (and the predicted-indoor curve built on it) must show that band, not the plain comfort range."""
+
+    _SAVINGS = {**_BASE_CONFIG, "aggressive_savings": True}
+
+    def test_awake_band_includes_margin(self):
+        from custom_components.climate_advisor.const import CEILING_ESCALATION_SAVINGS_MARGIN_F as margin
+
+        entry = _compute_target_band_schedule([_ts(12)], self._SAVINGS, "home", _NOW)[0]
+        assert entry["lower"] == 70.0 - margin
+        assert entry["upper"] == 75.0 + margin
+
+    def test_wake_ramp_interpolates_to_the_widened_edges(self):
+        # 1h into the 2h ramp: lower = 66 + 0.5*(68-66) = 67.0, upper = 78 + 0.5*(77-78) = 77.5
+        entry = _compute_target_band_schedule([_ts(8)], self._SAVINGS, "home", _NOW)[0]
+        assert (entry["lower"], entry["upper"]) == (67.0, 77.5)
+
+    def test_sleep_ramp_interpolates_from_the_widened_edges(self):
+        # 30min into the 1h sleep ramp (sleep 22:00): lower = 68 + 0.5*(66-68) = 67.0, upper = 77 + 0.5*(78-77) = 77.5
+        entry = _compute_target_band_schedule([_ts(22, 30)], self._SAVINGS, "home", _NOW)[0]
+        assert (entry["lower"], entry["upper"]) == (67.0, 77.5)
+
+    def test_setback_and_sleep_bands_are_not_widened(self):
+        away = _compute_target_band_schedule([_ts(12)], self._SAVINGS, "away", _NOW)[0]
+        assert (away["lower"], away["upper"]) == (60.0, 80.0)
+        sleep = _compute_target_band_schedule([_ts(3)], self._SAVINGS, "home", _NOW)[0]
+        assert (sleep["lower"], sleep["upper"]) == (66.0, 78.0)
+
+    @pytest.mark.parametrize("hvac_mode", ["heat", "cool"])
+    @pytest.mark.parametrize("aggressive", [True, False])
+    def test_awake_chart_edges_equal_what_the_engine_arms(self, hvac_mode, aggressive):
+        from custom_components.climate_advisor.automation import select_comfort_band
+
+        config = {**_BASE_CONFIG, "aggressive_savings": aggressive}
+        classification = SimpleNamespace(hvac_mode=hvac_mode, day_type="warm")
+        band = select_comfort_band(
+            classification, config, occupancy_mode="home", in_sleep_window=False, aggressive_savings=aggressive
+        )
+        entry = _compute_target_band_schedule([_ts(12)], config, "home", _NOW)[0]
+        assert (entry["lower"], entry["upper"]) == (band.floor, band.ceiling)

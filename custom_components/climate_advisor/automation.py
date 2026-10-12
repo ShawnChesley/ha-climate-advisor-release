@@ -543,6 +543,20 @@ def _band_num(value_f: float, unit: str) -> str:
     return f"{display_temp(value_f, unit, 0):.0f}"
 
 
+def awake_comfort_edges(config: dict, *, aggressive_savings: bool) -> tuple[float, float]:
+    """The occupied-and-awake (home/guest) ``(floor, ceiling)`` the thermostat is armed with (Issue #1087).
+
+    ``[comfort_heat, comfort_cool]``, widened on BOTH sides by ``CEILING_ESCALATION_SAVINGS_MARGIN_F``
+    when aggressive savings is on. The ONE place the awake edges are derived: ``select_comfort_band()``
+    arms them, and the chart's target band (which ramps to and from them) reads them here too, so
+    neither can drift from the other.
+    """
+    margin = CEILING_ESCALATION_SAVINGS_MARGIN_F if aggressive_savings else 0.0
+    comfort_heat = float(config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
+    comfort_cool = float(config.get("comfort_cool", DEFAULT_COMFORT_COOL))
+    return comfort_heat - margin, comfort_cool + margin
+
+
 def select_comfort_band(
     classification: DayClassification,
     config: dict,
@@ -586,13 +600,10 @@ def select_comfort_band(
     occupancy mode — Home/Guest's comfort band and the sleep band are untouched by this
     parameter regardless of its value.
     """
-    comfort_heat = float(config.get("comfort_heat", DEFAULT_COMFORT_HEAT))
-    comfort_cool = float(config.get("comfort_cool", DEFAULT_COMFORT_COOL))
     setback_heat = float(config.get("setback_heat", DEFAULT_SETBACK_HEAT))
     setback_cool = float(config.get("setback_cool", DEFAULT_SETBACK_COOL))
     sleep_heat = float(config.get(CONF_SLEEP_HEAT, DEFAULT_SLEEP_HEAT))
     sleep_cool = float(config.get(CONF_SLEEP_COOL, DEFAULT_SLEEP_COOL))
-    margin = CEILING_ESCALATION_SAVINGS_MARGIN_F if aggressive_savings else 0.0
 
     if occupancy_mode == OCCUPANCY_VACATION:
         floor = setback_heat - VACATION_SETBACK_EXTRA
@@ -610,8 +621,7 @@ def select_comfort_band(
         # (Suppression to a setback edge happens only away/asleep.) `active` is the day's dominant
         # edge for single-mode devices: floor on a heat day, ceiling otherwise.
         active = "floor" if classification.hvac_mode == "heat" else "ceiling"
-        floor = comfort_heat - margin
-        ceiling = comfort_cool + margin
+        floor, ceiling = awake_comfort_edges(config, aggressive_savings=aggressive_savings)
         ctx = "comfort"
 
     # Issue #899: TOU away/vacation window expansion — widens only the edge matching the
