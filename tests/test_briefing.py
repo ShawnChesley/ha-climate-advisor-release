@@ -2784,3 +2784,109 @@ class TestTldrShowsTheArmedBand:
 
         row = self._row("cold", 30, "vacation", temp_unit="celsius")
         assert f"Heat at {format_temp(57.0, 'celsius')}" in row
+
+
+class TestBriefingShowsSavingsBand:
+    """Issue #1091: under Prefer savings the briefing quotes the awake band the thermostat is armed with."""
+
+    SAVINGS = {**DEFAULT_CONFIG, "aggressive_savings": True}
+
+    def _body(self, day_type, high, savings=True, **kwargs):
+        c = _make_classification(day_type, today_high=high, today_low=50)
+        cfg = self.SAVINGS if savings else DEFAULT_CONFIG
+        return _generate(c, runtime_config=cfg, **kwargs)
+
+    def _row(self, day_type, high, savings=True, occupancy_mode="home", temp_unit="fahrenheit"):
+        c = _make_classification(day_type, today_high=high, today_low=50)
+        cfg = _make_config()
+        cfg["aggressive_savings"] = savings
+        rows = _generate_tldr_table(c, cfg, temp_unit=temp_unit, occupancy_mode=occupancy_mode)
+        return "\n".join(rows)
+
+    def test_tldr_home_rows_quote_the_widened_band(self):
+        assert "Cool at 77" in self._row("hot", 92)
+        assert "Heat at 68" in self._row("cold", 30)
+
+    def test_generate_briefing_quotes_the_widened_band_in_tldr(self):
+        c = _make_classification("hot", today_high=92)
+        text = _generate(c, runtime_config=self.SAVINGS)
+        assert "Cool at 77" in text
+
+    def test_hot_day_hold_sentence_quotes_ceiling(self):
+        body = self._body("hot", 92)
+        assert "I'll hold things at 77" in body
+        assert "hold things at 75" not in body
+        assert "pull back down to 77" in body
+
+    def test_cool_day_hold_sentence_quotes_floor(self):
+        body = self._body("cool", 52)
+        assert "I'll hold 68" in body
+        assert "return to 68" in body
+        assert "I'll hold 70" not in body
+
+    def test_mild_day_opener_quotes_floor(self):
+        body = self._body("mild", 68)
+        assert "held at or above 68" in body
+        assert "held at or above 70" not in body
+
+    def test_mild_day_unengaged_opener_quotes_floor(self):
+        from custom_components.climate_advisor.briefing import _mild_day_plan
+
+        c = _make_classification("mild", today_high=68)
+        lines = _mild_day_plan(c, 70.0, DEFAULT_WAKE, DEFAULT_SLEEP, overnight_heat_engaged=False, armed_heat=68.0)
+        assert "held at or above 68" in " ".join(lines)
+
+    def test_celsius_quotes_converted_widened_edges(self):
+        from custom_components.climate_advisor.temperature import format_temp
+
+        assert f"Cool at {format_temp(77.0, 'celsius')}" in self._row("hot", 92, temp_unit="celsius")
+        assert f"Heat at {format_temp(68.0, 'celsius')}" in self._row("cold", 30, temp_unit="celsius")
+
+    @pytest.mark.parametrize("savings", [False, True])
+    @pytest.mark.parametrize(("day_type", "high", "edge"), [("hot", 92, "ceiling"), ("cold", 30, "floor")])
+    def test_home_row_matches_select_comfort_band(self, savings, day_type, high, edge):
+        from custom_components.climate_advisor.automation import select_comfort_band
+        from custom_components.climate_advisor.temperature import format_temp
+
+        c = _make_classification(day_type, today_high=high, today_low=50)
+        band = select_comfort_band(
+            c,
+            {**_make_config(), "aggressive_savings": savings},
+            occupancy_mode="home",
+            in_sleep_window=False,
+            aggressive_savings=savings,
+        )
+        expected = format_temp(band.ceiling if edge == "ceiling" else band.floor, "fahrenheit")
+        verb = "Cool at" if edge == "ceiling" else "Heat at"
+        assert f"{verb} {expected}" in self._row(day_type, high, savings=savings)
+
+    def test_away_and_vacation_rows_unchanged_under_savings(self):
+        assert "Cool at 80" in self._row("hot", 92, occupancy_mode="away")
+        assert "Heat at 60" in self._row("cold", 30, occupancy_mode="away")
+        assert "Cool at 83" in self._row("hot", 92, occupancy_mode="vacation")
+        assert "Heat at 57" in self._row("cold", 30, occupancy_mode="vacation")
+
+    def test_hot_day_window_threshold_stays_raw(self):
+        # window threshold = comfort_cool 75 + ECONOMIZER_TEMP_DELTA 3, regardless of savings
+        c = _make_classification("hot", today_high=92)
+        c.window_opportunity_morning = True
+        c.window_opportunity_morning_end = time(10, 0)
+        on = _generate(c, runtime_config=self.SAVINGS)
+        off = _generate(c, runtime_config=DEFAULT_CONFIG)
+        assert "above 78" in on
+        assert "above 78" in off
+
+    def test_warm_day_ac_step_in_stays_raw(self):
+        on = self._body("warm", 80)
+        off = self._body("warm", 80, savings=False)
+        on_ac = [ln for ln in on.splitlines() if "AC" in ln]
+        off_ac = [ln for ln in off.splitlines() if "AC" in ln]
+        assert on_ac
+        assert on_ac == off_ac
+
+    @pytest.mark.parametrize(("day_type", "high"), [("hot", 92), ("cool", 52), ("mild", 68), ("cold", 30)])
+    def test_savings_off_is_identical_to_flag_absent(self, day_type, high):
+        c = _make_classification(day_type, today_high=high)
+        explicit_off = _generate(c, runtime_config={**DEFAULT_CONFIG, "aggressive_savings": False})
+        absent = _generate(c, runtime_config=DEFAULT_CONFIG)
+        assert explicit_off == absent

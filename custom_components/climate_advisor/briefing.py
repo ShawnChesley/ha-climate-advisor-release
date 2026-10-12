@@ -16,7 +16,13 @@ import platform
 from collections.abc import Callable
 from datetime import datetime, time
 
-from .automation import _in_sleep_window, compute_pre_cool_target, resolve_pre_cool_modifier, select_comfort_band
+from .automation import (
+    _in_sleep_window,
+    awake_comfort_edges,
+    compute_pre_cool_target,
+    resolve_pre_cool_modifier,
+    select_comfort_band,
+)
 from .classifier import DayClassification
 from .const import (
     COLD_DAY_SETBACK_DEPTH_F,
@@ -155,6 +161,9 @@ def generate_briefing(
     )
 
     # TLDR table — used standalone for push notifications, embedded in full briefing
+    # Issue #1091: Prefer savings widens the awake home band the thermostat is armed with;
+    # derive the flag once and the awake edges once so every display site quotes the same band.
+    _savings = bool((runtime_config or {}).get("aggressive_savings", False))
     config = {
         "comfort_heat": comfort_heat,
         "comfort_cool": comfort_cool,
@@ -162,7 +171,9 @@ def generate_briefing(
         "setback_cool": setback_cool,
         "sleep_time": sleep_time,
         "wake_time": wake_time,
+        "aggressive_savings": _savings,
     }
+    awake_heat, awake_cool = awake_comfort_edges(config, aggressive_savings=_savings)
     # Issue #535: comfort-floor awareness for the nat-vent cutoff prediction — the real
     # activation gate (decide_nat_vent_gate()) requires indoor > comfort_heat as one of
     # its four conditions, but this predictive curve scan historically only modeled the
@@ -285,6 +296,7 @@ def generate_briefing(
                 temp_unit=temp_unit,
                 runtime_config=runtime_config,
                 hot_events=hot_events,
+                armed_cool=awake_cool,
             )
         )
     elif c.day_type == DAY_TYPE_WARM:
@@ -315,6 +327,7 @@ def generate_briefing(
                 current_indoor_temp=current_indoor_temp,
                 current_outdoor_temp=current_outdoor_temp,
                 overnight_heat_engaged=overnight_heat_engaged,
+                armed_heat=awake_heat,
             )
         )
     elif c.day_type == DAY_TYPE_COOL:
@@ -327,6 +340,7 @@ def generate_briefing(
                 sleep_time,
                 temp_unit=temp_unit,
                 bedtime_setback_heat=bedtime_setback_heat,
+                armed_heat=awake_heat,
             )
         )
     elif c.day_type == DAY_TYPE_COLD:
@@ -356,7 +370,7 @@ def generate_briefing(
         )
     )
     lines.append("")
-    lines.extend(_fresh_air_section(c, comfort_heat, comfort_cool, debounce_seconds, temp_unit=temp_unit))
+    lines.extend(_fresh_air_section(c, awake_heat, awake_cool, debounce_seconds, temp_unit=temp_unit))
 
     # Grace period status — only shown when a grace period is currently active,
     # or when grace periods are configured to a non-default value worth explaining
@@ -458,15 +472,15 @@ def _generate_tldr_table(
     # --- HVAC Mode row (Issue #85: show setback temps when away/vacation) ---
     # Issue #1088: print the edge the thermostat is actually armed with -- vacation's extra setback
     # included -- by reading the engine's band selector, not the raw config keys. A morning snapshot: the
-    # TOU away/vacation widening is not threaded in. aggressive_savings is deliberately False: the briefing
-    # body quotes the plain comfort range throughout, so widening only this row would make the briefing
-    # contradict itself (tracked separately).
+    # TOU away/vacation widening is not threaded in (the briefing is a morning snapshot). Issue #1091:
+    # aggressive_savings now reflects the real Prefer savings flag, so the row quotes the awake band the
+    # thermostat is armed with (the body sentences quote the same band via awake_comfort_edges).
     _band = select_comfort_band(
         c,
         config,
         occupancy_mode=occupancy_mode,
         in_sleep_window=False,
-        aggressive_savings=False,
+        aggressive_savings=bool(config.get("aggressive_savings", False)),
     )
     if occupancy_mode in ("away", "vacation"):
         if c.hvac_mode == "cool":
@@ -606,9 +620,12 @@ def _hot_day_plan(
     temp_unit: str = FAHRENHEIT,
     runtime_config: dict | None = None,
     hot_events: dict | None = None,
+    armed_cool: float | None = None,
 ) -> list[str]:
     """Conversational plan for hot days (85\u00b0F+)."""
     threshold = comfort_cool + ECONOMIZER_TEMP_DELTA
+    # Issue #1091: display-only armed ceiling (Prefer savings widens it); thresholds stay on raw comfort_cool.
+    _hold = comfort_cool if armed_cool is None else armed_cool
 
     # Issue #876: morning-close and evening-open times are derived from the same
     # ODE-crossing mechanism WARM/MILD already use (nat_vent_plan.compute_nat_vent_plan()),
@@ -662,7 +679,7 @@ def _hot_day_plan(
     else:
         opener = (
             f"Today's forecast calls for a high near {format_temp(c.today_high, temp_unit)} \u2014"
-            f" I'll hold things at {format_temp(comfort_cool, temp_unit)} through the day."
+            f" I'll hold things at {format_temp(_hold, temp_unit)} through the day."
         )
     lines = [opener]
 
@@ -685,7 +702,7 @@ def _hot_day_plan(
         lines.append(
             f"Once closed, keep blinds drawn on sun-facing windows"
             f" (especially west-facing after noon). I'll hold things at"
-            f" {format_temp(comfort_cool, temp_unit)}."
+            f" {format_temp(_hold, temp_unit)}."
         )
         lines.append("")
         lines.append(describe_reopen_clause(e_start, reopening_from_closed_all_day=False))
@@ -707,7 +724,7 @@ def _hot_day_plan(
         lines.append(
             f"Once closed, keep blinds drawn on sun-facing windows"
             f" (especially west-facing after noon). I'll hold things at"
-            f" {format_temp(comfort_cool, temp_unit)} for the rest of the day."
+            f" {format_temp(_hold, temp_unit)} for the rest of the day."
         )
     elif has_evening:
         e_start = _evening_open_time.strftime(_FMT_HOUR)
@@ -715,7 +732,7 @@ def _hot_day_plan(
         lines.append(
             f"Today's a keep-it-sealed kind of day. Close the blinds on sun-facing"
             f" windows (especially west-facing ones after noon) and I'll hold things"
-            f" at {format_temp(comfort_cool, temp_unit)}."
+            f" at {format_temp(_hold, temp_unit)}."
         )
         lines.append("")
         lines.append(describe_reopen_clause(e_start, reopening_from_closed_all_day=True))
@@ -724,7 +741,7 @@ def _hot_day_plan(
         lines.append(
             f"Today's a keep-it-sealed kind of day. Close the blinds on sun-facing"
             f" windows (especially west-facing ones after noon) and I'll handle"
-            f" the rest at {format_temp(comfort_cool, temp_unit)}."
+            f" the rest at {format_temp(_hold, temp_unit)}."
         )
 
     if fan_mode != FAN_MODE_DISABLED and (has_morning or has_evening):
@@ -918,6 +935,7 @@ def _mild_day_plan(
     current_indoor_temp: float | None = None,
     current_outdoor_temp: float | None = None,
     overnight_heat_engaged: bool = True,
+    armed_heat: float | None = None,
 ) -> list[str]:
     """Conversational plan for mild days (60-74\u00b0F).
 
@@ -937,16 +955,18 @@ def _mild_day_plan(
     line renders. Default True preserves prior behavior for callers that don't
     pass the signal (e.g. direct/standalone calls, older tests).
     """
+    # Issue #1091: display-only armed floor (Prefer savings widens it).
+    _shown_heat = comfort_heat if armed_heat is None else armed_heat
     if overnight_heat_engaged:
         lines = [
             f"A day where the house practically takes care of itself. I warmed to"
-            f" {format_temp(comfort_heat, temp_unit)} before sunrise \u2014 now HVAC is off and the weather"
+            f" {format_temp(_shown_heat, temp_unit)} before sunrise \u2014 now HVAC is off and the weather"
             f" does the rest.",
         ]
     else:
         lines = [
             f"A day where the house practically takes care of itself \u2014 it held at or above"
-            f" {format_temp(comfort_heat, temp_unit)} on its own overnight, so HVAC stayed off"
+            f" {format_temp(_shown_heat, temp_unit)} on its own overnight, so HVAC stayed off"
             f" and the weather did the rest.",
         ]
 
@@ -1035,15 +1055,18 @@ def _cool_day_plan(
     sleep_time,
     temp_unit: str = FAHRENHEIT,
     bedtime_setback_heat: float | None = None,
+    armed_heat: float | None = None,
 ) -> list[str]:
     """Conversational plan for cool days (45-59\u00b0F)."""
     setback_display = (
         bedtime_setback_heat if bedtime_setback_heat is not None else comfort_heat - DEFAULT_SETBACK_DEPTH_F
     )
+    # Issue #1091: display-only armed floor (Prefer savings widens it); the bedtime fallback stays raw.
+    _shown_heat = comfort_heat if armed_heat is None else armed_heat
     return [
-        f"Heater day \u2014 too cool outside for windows. I'll hold {format_temp(comfort_heat, temp_unit)}"
+        f"Heater day \u2014 too cool outside for windows. I'll hold {format_temp(_shown_heat, temp_unit)}"
         f" through the morning, ease back a couple degrees midday to ride any solar"
-        f" gain, then return to {format_temp(comfort_heat, temp_unit)} as the sun drops.",
+        f" gain, then return to {format_temp(_shown_heat, temp_unit)} as the sun drops.",
         "",
         f"At bedtime I'll set back to {format_temp(setback_display, temp_unit)}"
         " \u2014 most people sleep better a little cooler.",

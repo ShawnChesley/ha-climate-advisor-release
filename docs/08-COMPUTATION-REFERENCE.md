@@ -317,7 +317,7 @@ From Issue #119, the chart's "Target Band" overlay is no longer two static scala
 
 **Vacation scope:** Vacation mode applies deep setback to **all** forecast days (today and future), not just today. This reflects that a vacationing household is away for the entire forecast window. Away mode applies setback to today only (assumes a return by tomorrow).
 
-`awake_heat`/`awake_cool` = `automation.awake_comfort_edges()`: `comfort_heat`/`comfort_cool`, widened by `CEILING_ESCALATION_SAVINGS_MARGIN_F` on both sides when `aggressive_savings` is on (Issue #1087) -- the same helper `select_comfort_band()` arms, so the chart, the predicted-indoor curve and the thermostat agree. Away/vacation/sleep bands are never widened by it.
+`awake_heat`/`awake_cool` = `automation.awake_comfort_edges()`: `comfort_heat`/`comfort_cool`, widened by `CEILING_ESCALATION_SAVINGS_MARGIN_F` on both sides when `aggressive_savings` is on (Issue #1087) -- the same helper `select_comfort_band()` arms, so the chart, the predicted-indoor curve and the thermostat agree. Away/vacation/sleep bands are never widened by it. The daily briefing is also a consumer of this helper (Issue #1091), so the temperatures it quotes for the awake home band match the chart and the thermostat.
 
 **Night-owl schedule normalization:** When `sleep_time < wake_time` (e.g., sleep=01:00, wake=09:00), the schedule wraps past midnight. The function normalises by adding 24 to `sleep_h` (making it e.g. 25) and computing `h_n = h + 24 if night_owl and h < wake_h else h` for each timestamp's local hour. This maps all timestamps onto a continuous `[wake_h, sleep_h]` number line regardless of the midnight boundary.
 

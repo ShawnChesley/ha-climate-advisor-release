@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.105] — 2026-10-11
+
+- Fix #1091: with Prefer savings on, the daily briefing now quotes the wider comfort range the thermostat actually holds (for example Cool at 77 instead of 75) instead of the plain range.
+
 ## [0.7.104] — 2026-10-11
 
 - Fix #1087: with Prefer savings on, the chart's target band (and the predicted indoor line built on it) now shows the wider comfort range the thermostat is actually holding.
