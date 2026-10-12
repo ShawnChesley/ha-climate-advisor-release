@@ -197,7 +197,13 @@ Two changes keep this from recurring:
    Since Issue #1088 the row prints the edge the thermostat is armed with, read from
    `select_comfort_band()` (vacation's extra setback included) instead of the raw config
    keys. It is a morning snapshot, so the time-of-use away/vacation widening is not
-   shown, and the aggressive-savings margin is not shown anywhere in the briefing yet.
+   shown. Since Issue #1091 the row and the day-plan sentences that state the held
+   temperature (hot-day "hold things at", cool-day "hold X", mild-day "warmed to" / "held at or
+   above", cooling-day fresh-air "pull back down to") read `awake_comfort_edges()`, so they
+   include the Prefer savings margin. These deliberately stay raw: the economizer/window
+   thresholds (`comfort_cool` + delta; that gate does not widen), the bedtime/setback fallbacks,
+   the warm-day "AC will step in above X" (the ODE ceiling guard cools at the raw
+   `comfort_cool`), and the away/vacation rows.
 2. **Truncation remains a safety net**, not the primary fix: `ClimateAdvisorBaseSensor._capped_state()`
    (`sensor.py`) caps any sensor state at 250 chars (`text[:247] + "..."`), logging a
    one-time `WARNING` if it ever actually fires, so a future regression degrades to a
