@@ -218,6 +218,7 @@ from .nat_vent_gate import (
     NatVentSoftStartGateInputs,
     decide_nat_vent_gate,
     decide_nat_vent_soft_start_gate,
+    explain_nat_vent_gate,
 )
 from .nat_vent_lifecycle import (
     NatVentLifecycleInputs,
@@ -1124,6 +1125,9 @@ class AutomationEngine:
         # #504) must keep running every cycle in the former case, since nothing else will
         # ever re-trigger it otherwise. Only _pause_for_door_window() sets this True.
         self._paused_with_hvac_already_off = False
+        # Issue #1095: last (outcome, reasons) _log_nat_vent_eval() emitted — INFO only when it
+        # changes so a steady "skipped" state logs once per change, not every 30-min cycle.
+        self._last_nat_vent_eval_key: tuple[str, str] | None = None
         # Issue #592: which entity triggered the current door/window pause, and when it
         # started — threaded into classification_suppressed_paused so the Activity Record
         # can say *which* sensor and *how long*, not just that a pause is in effect.
@@ -3194,6 +3198,10 @@ class AutomationEngine:
             finally:
                 try:
                     _nat_vent_after = bool(self._natural_vent_active)
+                    if _nat_vent_after != _nat_vent_before:
+                        # Issue #1095: a session start/end ends the previous "not engaged" streak;
+                        # the next block after it is a NEW event and must log at INFO again.
+                        self._last_nat_vent_eval_key = None
                     if _nat_vent_after and not _nat_vent_before:
                         self._lifecycle_dispatcher.emit(
                             LifecycleEvent(
@@ -5778,20 +5786,53 @@ class AutomationEngine:
                 # away_natvent_activates_free_cooling's own regression-proof notes); this is a
                 # generic "don't immediately re-enter right after any recent exit" cooldown,
                 # the same protection paused-by-door reactivation already has.
+                _sensor_open_244 = self._any_monitored_sensor_open()
+                _locked_out_244 = is_reactivation_locked_out(
+                    outdoor_exit_time=self._nat_vent_outdoor_exit_time,
+                    now=dt_util.now(),
+                    lockout_seconds=float(
+                        self.config.get(CONF_NAT_VENT_REACTIVATION_LOCKOUT_S, NAT_VENT_REACTIVATION_LOCKOUT_S)
+                    ),
+                )
                 _idle_open = (
-                    self._any_monitored_sensor_open()
+                    _sensor_open_244
                     and _hvac_off_244
                     and not self._sensor_debounce_pending
                     and not self._grace_active
-                    and not is_reactivation_locked_out(
-                        outdoor_exit_time=self._nat_vent_outdoor_exit_time,
-                        now=dt_util.now(),
-                        lockout_seconds=float(
-                            self.config.get(CONF_NAT_VENT_REACTIVATION_LOCKOUT_S, NAT_VENT_REACTIVATION_LOCKOUT_S)
-                        ),
-                    )
+                    and not _locked_out_244
                 )
                 if not ((self._grace_active and _indoor is not None and _indoor > _cool) or _idle_open):
+                    # Issue #1095: this was a silent return. Name every blocker that is true so
+                    # the occupant/developer can see WHY nat-vent was not evaluated (e.g. a
+                    # fan-off grace period holding it back) instead of inferring it.
+                    _blockers = [
+                        name
+                        for name, active in (
+                            ("no_sensor_open", not _sensor_open_244),
+                            ("hvac_calling", not _hvac_off_244),
+                            ("sensor_debounce_pending", self._sensor_debounce_pending),
+                            ("grace_active", self._grace_active),
+                            ("reactivation_lockout", _locked_out_244),
+                        )
+                        if active
+                    ]
+                    self._log_nat_vent_eval(
+                        "skipped",
+                        _blockers or ["precondition_not_met"],
+                        **(
+                            {
+                                "grace": self._grace_log_fields(
+                                    self._last_grace_trigger, self._last_resume_source, self._grace_end_time
+                                )
+                            }
+                            if self._grace_active
+                            else {}
+                        ),
+                        indoor=_indoor,
+                        outdoor=self._last_outdoor_temp,
+                        comfort_cool=_cool,
+                        paused_by_door=self._paused_by_door,
+                    )
                     return
 
             outdoor = self._last_outdoor_temp
@@ -5945,6 +5986,18 @@ class AutomationEngine:
                                 "decline_margin_f": PEAK_DECLINE_MARGIN_F,
                             },
                         )
+                else:
+                    # Issue #1095: the FSM said no — previously silent.
+                    self._log_nat_vent_not_engaged(
+                        _to_state,
+                        indoor=_indoor,
+                        outdoor=outdoor,
+                        comfort_heat=_comfort_heat,
+                        comfort_cool=comfort_cool,
+                        nat_vent_delta=nat_vent_delta,
+                        hysteresis=_hysteresis,
+                        threshold=threshold,
+                    )
                 return
 
             # Issue #540: soft-start → full nat-vent upgrade. Once an active soft-start
@@ -6247,6 +6300,15 @@ class AutomationEngine:
                     )
                     return
 
+            if self._paused_by_door and (outdoor is None or indoor is None):
+                # Issue #1095: used to fall off the end of the method with no trace.
+                self._log_nat_vent_eval(
+                    "skipped",
+                    ["temperature_unavailable"],
+                    paused_by_door=True,
+                    indoor=indoor,
+                    outdoor=outdoor,
+                )
             if self._paused_by_door and outdoor is not None and indoor is not None:
                 hysteresis = float(self.config.get(CONF_NAT_VENT_HYSTERESIS_F, NAT_VENT_HYSTERESIS_F))
                 lockout_s = float(
@@ -6284,6 +6346,17 @@ class AutomationEngine:
                             lockout_s,
                             lockout_s - elapsed,
                         )
+                    # Issue #1095: the DEBUG line above is per-tick detail; this is the INFO-on-change record.
+                    self._log_nat_vent_not_engaged(
+                        _to_state,
+                        indoor=indoor,
+                        outdoor=outdoor,
+                        comfort_heat=comfort_heat,
+                        comfort_cool=float(self.config.get("comfort_cool", DEFAULT_COMFORT_COOL)),
+                        nat_vent_delta=float(self.config.get(CONF_NATURAL_VENT_DELTA, DEFAULT_NATURAL_VENT_DELTA)),
+                        hysteresis=hysteresis,
+                        threshold=threshold,
+                    )
                     return
 
                 if _to_state == NatVentLifecycleState.ACTIVE_SOFT_START and not self.config.get(
@@ -6369,18 +6442,17 @@ class AutomationEngine:
                         )
                     await self._apply_nat_vent_hvac_state()
                 else:
-                    _floor_ok = indoor > comfort_heat
-                    _ceiling_ok = outdoor < threshold
-                    _LOGGER.debug(
-                        "Nat vent paused-by-door: conditions not met — "
-                        "outdoor=%.1f°F indoor=%.1f°F delta=%.1f°F (need>%.1f°F) "
-                        "floor_ok=%s ceiling_ok=%s",
-                        outdoor,
-                        indoor,
-                        indoor - outdoor,
-                        hysteresis,
-                        _floor_ok,
-                        _ceiling_ok,
+                    # Issue #1095: was a DEBUG-only line with hand-computed floor/ceiling flags; now the same
+                    # reasons + INFO-on-change as the idle-open path.
+                    self._log_nat_vent_not_engaged(
+                        _to_state,
+                        indoor=indoor,
+                        outdoor=outdoor,
+                        comfort_heat=comfort_heat,
+                        comfort_cool=float(self.config.get("comfort_cool", DEFAULT_COMFORT_COOL)),
+                        nat_vent_delta=float(self.config.get(CONF_NATURAL_VENT_DELTA, DEFAULT_NATURAL_VENT_DELTA)),
+                        hysteresis=hysteresis,
+                        threshold=threshold,
                     )
                 return
 
@@ -7910,6 +7982,7 @@ class AutomationEngine:
         duration = int((grace.at - now).total_seconds())
         should_notify = grace.should_notify
 
+        self._last_nat_vent_eval_key = None  # Issue #1095: a new grace is a new blocker; log it at INFO
         self._last_resume_source = source
         self._last_grace_trigger = trigger
         self._grace_duration_seconds = duration
@@ -7929,7 +8002,16 @@ class AutomationEngine:
         else:
             self._automation_grace_cancel = cancel
 
-        _LOGGER.info("Started %s grace period (%d seconds)", source, duration)
+        # Issue #1095: mirror "Grace cancelled — reason= trigger= source= remaining_min=" so a
+        # grace's cause and end time are in the log at the moment it begins, not only when it
+        # is cancelled. The "Started <source> grace period (N seconds)" prefix is kept so
+        # existing grep habits still match.
+        _LOGGER.info(
+            "Started %s grace period (%d seconds) — %s",
+            source,
+            duration,
+            self._grace_log_fields(trigger, source, self._grace_end_time),
+        )
         if self._emit_event_callback:
             self._emit_event_callback(
                 "grace_started",
@@ -10204,7 +10286,29 @@ class AutomationEngine:
                 pass 0.0 (the default); the paused-by-door reactivation block passes the
                 configured nat-vent hysteresis.
         """
-        inputs = NatVentGateInputs(
+        return decide_nat_vent_gate(
+            self._nat_vent_gate_inputs(
+                outdoor=outdoor,
+                indoor=indoor,
+                comfort_heat=comfort_heat,
+                comfort_cool=comfort_cool,
+                nat_vent_delta=nat_vent_delta,
+                hysteresis=hysteresis,
+            )
+        )
+
+    def _nat_vent_gate_inputs(
+        self,
+        *,
+        outdoor: float | None,
+        indoor: float | None,
+        comfort_heat: float,
+        comfort_cool: float,
+        nat_vent_delta: float,
+        hysteresis: float = 0.0,
+    ) -> NatVentGateInputs:
+        """Build the gate inputs once for both the decision and its logged explanation (Issue #1095)."""
+        return NatVentGateInputs(
             outdoor=outdoor,
             indoor=indoor,
             comfort_heat_raw=comfort_heat,
@@ -10216,7 +10320,104 @@ class AutomationEngine:
             fan_mode=self.config.get(CONF_FAN_MODE, FAN_MODE_DISABLED),
             aggressive_savings=bool(self.config.get("aggressive_savings", False)),
         )
-        return decide_nat_vent_gate(inputs)
+
+    def _nat_vent_gate_rejections(
+        self,
+        *,
+        outdoor: float | None,
+        indoor: float | None,
+        comfort_heat: float,
+        comfort_cool: float,
+        nat_vent_delta: float,
+        hysteresis: float = 0.0,
+    ) -> list[str]:
+        """Why ``_nat_vent_may_reactivate()`` says no (empty list = it says yes). Issue #1095."""
+        return explain_nat_vent_gate(
+            self._nat_vent_gate_inputs(
+                outdoor=outdoor,
+                indoor=indoor,
+                comfort_heat=comfort_heat,
+                comfort_cool=comfort_cool,
+                nat_vent_delta=nat_vent_delta,
+                hysteresis=hysteresis,
+            )
+        )
+
+    def _grace_log_fields(self, trigger: str | None, source: str | None, end_iso: str | None) -> str:
+        """``trigger=… source=… ends=HH:MM`` fragment shared by every grace log line (Issue #1095).
+
+        One definition so the grace-start line and the nat-vent skip line say the same thing
+        in the same shape as ``_cancel_grace_intentionally()``'s ``trigger= source=`` fields.
+        """
+        ends = None
+        try:
+            _end = dt_util.parse_datetime(end_iso) if end_iso else None
+            if _end is not None:
+                ends = dt_util.as_local(_end).strftime("%H:%M")
+        except (TypeError, ValueError, AttributeError):
+            ends = None
+        return f"trigger={trigger or None} source={source or None} ends={ends}"
+
+    def _log_nat_vent_not_engaged(
+        self,
+        to_state: NatVentLifecycleState,
+        *,
+        indoor: float | None,
+        outdoor: float | None,
+        comfort_heat: float,
+        comfort_cool: float,
+        nat_vent_delta: float,
+        hysteresis: float,
+        threshold: float,
+    ) -> None:
+        """Log why the nat-vent FSM declined to engage, in the order the FSM itself decides (Issue #1095).
+
+        ``nat_vent_fsm._transition_from_inactive()`` checks override/grace FIRST, then the
+        reactivation lockout, then the temperature gate, so reasons are listed in that
+        order. Grace blocks unless indoor exceeds ``comfort_cool`` (Issue #134 overheat
+        exception, ``nat_vent_fsm._grace_blocks_natvent()``); the same predicate is applied
+        here so the log never blames grace for a case the FSM let through. Temperature
+        reasons come from the single gate implementation (``explain_nat_vent_gate``). Only the
+        full gate is explained: a declined soft-start sub-gate is not itemised.
+        """
+        reasons: list[str] = []
+        if self._fan_override_active or self._manual_override_active:
+            reasons.append("override_active")
+        if self._grace_active and not (indoor is not None and indoor > comfort_cool):
+            reasons.append("grace_active")
+        if to_state == NatVentLifecycleState.PAUSED_REACTIVATION_LOCKOUT:
+            reasons.append("reactivation_lockout")
+        reasons.extend(
+            self._nat_vent_gate_rejections(
+                outdoor=outdoor,
+                indoor=indoor,
+                comfort_heat=comfort_heat,
+                comfort_cool=comfort_cool,
+                nat_vent_delta=nat_vent_delta,
+                hysteresis=hysteresis,
+            )
+        )
+        values: dict[str, Any] = {}
+        if self._grace_active:
+            values["grace"] = self._grace_log_fields(
+                self._last_grace_trigger, self._last_resume_source, self._grace_end_time
+            )
+        values.update(indoor=indoor, outdoor=outdoor, comfort_floor=comfort_heat, threshold=threshold)
+        self._log_nat_vent_eval("not engaged", reasons or ["fsm_declined"], **values)
+
+    def _log_nat_vent_eval(self, outcome: str, reasons: list[str], **values: Any) -> None:
+        """Log a nat-vent entry-evaluation outcome with its reason (Issue #1095).
+
+        ``check_natural_vent_conditions()`` used to return silently on every skip. INFO on a
+        change of (outcome, reasons) so the transition is visible; DEBUG when it repeats so a
+        steady state doesn't flood the log every 30-minute cycle.
+        """
+        reason_text = ",".join(reasons) if reasons else "none"
+        key = (outcome, reason_text)
+        level = logging.INFO if key != self._last_nat_vent_eval_key else logging.DEBUG
+        self._last_nat_vent_eval_key = key
+        fields = " ".join(f"{k}={round(v, 1) if isinstance(v, float) else v}" for k, v in values.items())
+        _LOGGER.log(level, "Nat-vent evaluation %s: reason=%s %s", outcome, reason_text, fields)
 
     def _nat_vent_may_soft_start(
         self,

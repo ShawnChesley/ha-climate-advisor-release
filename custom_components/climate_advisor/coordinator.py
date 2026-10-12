@@ -351,6 +351,7 @@ _ENTITY_HEALTH_REMINDER_SECONDS: float = 24 * 60 * 60
 _GRACE_TRIGGER_LABELS: Final[dict[str, str]] = {
     "fan_manual_override": "WHF override",
     "fan_off": "WHF turned off",
+    "dashboard_resume": "resumed from pause",
     "physical_drift_correction": "fan drift correction",
     "override_confirmed": "thermostat override",
     "sensor_closed_resume": "door/window closed",
@@ -10419,11 +10420,22 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 return "nat-vent — soft-start (purge)"
             return "nat-vent"
         if self.automation_engine.is_paused_by_door:
+            # Issue #1095: a grace period can be active while door/window-paused (e.g. a
+            # fan-off grace holding nat-vent back). This branch used to return first and
+            # never mention it, so the one thing blocking free cooling was invisible on the
+            # Status card. Same compact "label — duration (ends HH:MM)" shape as the grace
+            # branch below; `is True` because tests stub the engine as a bare MagicMock.
+            _pae = self.automation_engine
+            _grace_note = (
+                f" · grace ({_pae._last_resume_source or 'automation'}){self._grace_status_detail(_pae)}"
+                if _pae._grace_active is True
+                else ""
+            )
             if self._occupancy_mode == OCCUPANCY_AWAY:
-                return "paused — away (resumes after windows close)"
+                return f"paused — away (resumes after windows close){_grace_note}"
             if self._occupancy_mode == OCCUPANCY_VACATION:
-                return "paused — vacation (resumes after windows close)"
-            return "paused — door/window open"
+                return f"paused — vacation (resumes after windows close){_grace_note}"
+            return f"paused — door/window open{_grace_note}"
         if self.automation_engine._override_confirm_pending:
             return "override pending (confirming...)"
         # Bug 2 (Issue #321): detect stuck grace before the normal grace-active path
@@ -10434,7 +10446,12 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                 return "override (stuck — see Debug tab)"
         if self.automation_engine._grace_active:
             if self.automation_engine._resumed_from_pause:
-                return "resumed — door/window override"
+                # Issue #1095: was a bare string with no timing; the resume starts a real
+                # grace whose end time the occupant needs. The cause is already in the
+                # wording, so only the duration/end clause is appended (same #860 rule).
+                if self.automation_engine._fan_remote_timer_hours is not None:
+                    return "resumed — door/window override"
+                return f"resumed — door/window override{self._format_grace_remaining(self.automation_engine)}"
             source = self.automation_engine._last_resume_source or "automation"
             # Issue #625: previously appended the full _last_action_reason sentence here
             # (Issue #620) — for fan-triggered grace periods that duplicated what the Fan
@@ -10444,8 +10461,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # lookup instead — same compact "cause — duration (ends HH:MM)" shape the Fan
             # (WHF) card already uses. Full detail remains on the Debug tab
             # (_last_action_reason), unaffected by this change.
-            _trigger_label = _GRACE_TRIGGER_LABELS.get(self.automation_engine._last_grace_trigger or "", "")
-            _cause_suffix = f" — {_trigger_label}" if _trigger_label else ""
+            # Issue #1095: the label + #860 duration rule below now live in
+            # _grace_status_detail() so the door/window-paused branch above shares them.
             # Issue #860: when a Fan (WHF)/(HVAC) remote timer is active
             # (_fan_remote_timer_hours is not None), that card already displays this
             # grace's original duration + expiry ("remote timer: Xh (ends HH:MM)") —
@@ -10462,9 +10479,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             # data-driven condition (not a hardcoded trigger-name allowlist) so any future
             # grace-trigger cause that happens to co-occur with an active remote timer is
             # automatically handled correctly with no further maintenance.
-            if self.automation_engine._fan_remote_timer_hours is not None:
-                return f"grace period ({source}){_cause_suffix}"
-            return f"grace period ({source}){_cause_suffix}{self._format_grace_remaining(self.automation_engine)}"
+            return f"grace period ({source}){self._grace_status_detail(self.automation_engine)}"
         # Issue #786: TOU scheduler pre-conditioning — a mechanism reason, per the Status
         # Card Ontology this is the one card it belongs on. Same compact "short label —
         # duration (ends HH:MM)" shape _format_grace_remaining() already established.
@@ -10962,6 +10977,19 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         end_str = dt_util.as_local(schedule_start).strftime("%I:%M %p").lstrip("0")
         return f" (ends {end_str})"
 
+    def _grace_status_detail(self, ae: AutomationEngine) -> str:
+        """Status-card grace detail: ' — <cause>' plus ' — <duration> (ends HH:MM)' (Issues #625/#860/#1095).
+
+        Single definition used by every Status string that mentions a grace period.
+        Issue #860: when a Fan remote timer is active (`_fan_remote_timer_hours` set) the
+        Fan card owns the duration/expiry, so only the cause label is returned here.
+        """
+        _label = _GRACE_TRIGGER_LABELS.get(getattr(ae, "_last_grace_trigger", None) or "", "")
+        _cause = f" — {_label}" if _label else ""
+        if ae._fan_remote_timer_hours is not None:
+            return _cause
+        return f"{_cause}{self._format_grace_remaining(ae)}"
+
     def _format_grace_remaining(self, ae: AutomationEngine) -> str:
         """Format grace duration + end time as ' — 30 min (ends H:MM AM)', matching the
         Fan (WHF) card's 'remote timer: Xh (ends HH:MM)' style (Issue #625).
@@ -11145,13 +11173,33 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         # check_natural_vent_conditions() calls) — not compute_nat_vent_cycling_band(),
         # which describes the fan's cycling band once ALREADY active, a different
         # threshold entirely (see docs/08-COMPUTATION-REFERENCE.md's #528 note).
-        # Gated on a door/window already being open (or grace), mirroring
+        # Gated on a door/window already being open, mirroring
         # check_natural_vent_conditions()'s own precondition — nat-vent cannot start
         # with everything closed, so this never promises a time that depends on the
         # occupant opening a window first.
+        #
+        # Issue #1095: an active grace period blocks that engine precondition's idle-open
+        # re-entry (Issue #620), so the scan starts at the grace END time rather than now —
+        # the card defers the prediction instead of announcing a start the engine will not
+        # honour (it used to keep rolling forward each cycle). Per the Status Card Ontology
+        # mechanism state is "deferred, not different"; the grace itself is on the Status
+        # card. If the end time is unknowable the candidate is withheld. `is True`: tests stub
+        # the engine as a bare MagicMock whose unset attributes are truthy.
+        _nv_after = now
+        _nv_grace_known = True
+        if ae._grace_active is True:
+            _nv_grace_end = dt_util.parse_datetime(ae._grace_end_time) if isinstance(ae._grace_end_time, str) else None
+            if isinstance(_nv_grace_end, datetime):
+                try:
+                    _nv_after = max(now, _nv_grace_end)
+                except TypeError:  # naive vs aware mismatch: cannot order them, so do not guess
+                    _nv_grace_known = False
+            else:
+                _nv_grace_known = False
         if (
             self.config.get(CONF_FAN_MODE, FAN_MODE_DISABLED) != FAN_MODE_DISABLED
             and not ae._natural_vent_active
+            and _nv_grace_known
             and (ae.is_paused_by_door or self._any_sensor_open())
             and _predicted_indoor
         ):
@@ -11181,7 +11229,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
             _nat_vent_outdoor_curve = _build_future_forecast_outdoor(self._hourly_forecast_temps, c)
             _nat_vent_dt = find_temperature_crossing(
-                _predicted_indoor, _nat_vent_outdoor_curve, _nat_vent_gate_comparator, after=now
+                _predicted_indoor, _nat_vent_outdoor_curve, _nat_vent_gate_comparator, after=_nv_after
             )
             if _nat_vent_dt:
                 candidates.append((_nat_vent_dt, "Natural ventilation"))

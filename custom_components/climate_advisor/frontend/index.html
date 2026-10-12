@@ -1220,7 +1220,14 @@
       document.getElementById('status-loading').style.display = 'none';
       grid.style.display = 'grid';
       updateAutomationButton(data.automation_enabled);
-      document.getElementById('cancel-override-btn').disabled = !data.manual_override_active;
+      // Issue #1095: a grace period can be active with no override flag behind it (fan_off,
+      // door/window resume, ...). The engine's cancel_override() already ends grace-only
+      // state; only this enablement was narrower. Label says what the button will do.
+      const cancelBtn = document.getElementById('cancel-override-btn');
+      cancelBtn.disabled = !(data.manual_override_active || data.grace_active);
+      // "End Grace Period" only when nothing else is being cancelled: cancel_override() also clears a
+      // fan override, so a fan override present means the action is still an override cancel.
+      cancelBtn.textContent = (!data.manual_override_active && !data.fan_override_active && data.grace_active) ? 'End Grace Period' : 'Cancel Override';
       document.getElementById('cancel-fan-override-btn').disabled = !data.fan_override_active;
       document.getElementById('resume-pause-btn').disabled = !data.paused_by_door;
     } catch (e) {
