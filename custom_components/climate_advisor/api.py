@@ -407,6 +407,9 @@ class ClimateAdvisorStatusView(HomeAssistantView):
                 "contact_sensors": coordinator._compute_contact_details(),
                 "manual_override_active": ae._manual_override_active or ae._override_confirm_pending,
                 "fan_override_active": ae._fan_override_active,
+                # Issue #1095: lets the dashboard offer "End Grace Period" for a grace that has no
+                # override flag behind it (e.g. fan_off), which "Cancel Override" never enabled for.
+                "grace_active": bool(ae._grace_active),
                 # Issue #486: QuietCool RF remote timer selection, null unless a timer set the
                 # active fan override's grace duration.
                 "fan_remote_timer_hours": data.get("fan_remote_timer_hours"),
@@ -854,17 +857,22 @@ class ClimateAdvisorCancelOverrideView(HomeAssistantView):
 
         with log_capture.zone_scope(coordinator.zone_label):
             ae = coordinator.automation_engine
+            # Issue #1095: snapshot before cancel_override() clears the flags — a grace with no
+            # override behind it (e.g. fan_off) is ended by this same call, but "Override
+            # cancelled" would misdescribe it.
+            had_override = bool(ae._manual_override_active or ae._override_confirm_pending or ae._fan_override_active)
             cancelled = ae.cancel_override(reason="user_cancel_override")
             if not cancelled:
-                return self.json({"status": "ok", "message": "No active override to cancel"})
+                return self.json({"status": "ok", "message": "No active override or grace period to cancel"})
 
             coordinator._feed_override_grace_fsm_cancelled()  # Issue #647
             _schedule_reclassify_after_cancel(hass, coordinator, ae)
 
+            what = "Override cancelled" if had_override else "Grace period ended"
             return self.json(
                 {
                     "status": "ok",
-                    "message": "Override cancelled. Automated control resumes in 10 seconds.",
+                    "message": f"{what}. Automated control resumes in 10 seconds.",
                 }
             )
 

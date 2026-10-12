@@ -105,27 +105,43 @@ def _resolve_ceiling_threshold(inputs: NatVentGateInputs) -> float | None:
     return inputs.comfort_cool
 
 
+def explain_nat_vent_gate(inputs: NatVentGateInputs) -> list[str]:
+    """Return why the reactivation gate rejects these inputs (empty list = gate passes).
+
+    The single implementation of the 4-part gate (Issue #1095): ``decide_nat_vent_gate()``
+    is defined as ``not explain_nat_vent_gate()``, so a logged rejection reason can never
+    drift from the real decision. Reason slugs mirror the exit side's ``NatVentExitReason``
+    style (short snake_case). Same boundary semantics as production (strict '<', '<=' on
+    the ceiling check).
+    """
+    if inputs.outdoor is None or inputs.indoor is None:
+        return ["temperature_unavailable"]
+
+    comfort_heat = _resolve_comfort_heat(inputs)
+    threshold = inputs.comfort_cool + inputs.nat_vent_delta
+    ceiling_threshold = _resolve_ceiling_threshold(inputs)
+
+    failures: list[str] = []
+    if not inputs.outdoor < inputs.indoor - inputs.hysteresis:
+        failures.append("outdoor_not_cooler_than_indoor")
+    if not inputs.indoor > comfort_heat:
+        failures.append("indoor_at_or_below_comfort_floor")
+    if not inputs.outdoor < threshold:
+        failures.append("outdoor_above_threshold")
+    if ceiling_threshold is not None and not inputs.indoor <= ceiling_threshold:
+        failures.append("indoor_above_ceiling")
+    return failures
+
+
 def decide_nat_vent_gate(inputs: NatVentGateInputs) -> bool:
     """Pure reimplementation of _nat_vent_may_reactivate() (Issue #411 Pass 4).
 
     Same 4-part gate, same boundary semantics (strict '<', '<=' on the ceiling
     check) as production — this function exists to be differentially validated
-    against the real method, not to introduce new behavior.
+    against the real method, not to introduce new behavior. Implemented as
+    ``not explain_nat_vent_gate()`` (Issue #1095) so there is one definition.
     """
-    if inputs.outdoor is None or inputs.indoor is None:
-        return False
-
-    comfort_heat = _resolve_comfort_heat(inputs)
-    threshold = inputs.comfort_cool + inputs.nat_vent_delta
-    ceiling_threshold = _resolve_ceiling_threshold(inputs)
-    ceiling_ok = ceiling_threshold is None or inputs.indoor <= ceiling_threshold
-
-    return (
-        inputs.outdoor < inputs.indoor - inputs.hysteresis
-        and inputs.indoor > comfort_heat
-        and inputs.outdoor < threshold
-        and ceiling_ok
-    )
+    return not explain_nat_vent_gate(inputs)
 
 
 # Minimum number of same-day outdoor-temp samples required before trusting
@@ -176,6 +192,36 @@ class NatVentSoftStartGateInputs:
     full_gate_active: bool
 
 
+def explain_nat_vent_soft_start_gate(inputs: NatVentSoftStartGateInputs) -> list[str]:
+    """Return why the soft-start sub-gate rejects these inputs (empty list = passes).
+
+    Single implementation (Issue #1095); ``decide_nat_vent_soft_start_gate()`` is
+    ``not explain_nat_vent_soft_start_gate()``. Early-exit preconditions return one reason,
+    mirroring the original short-circuit order.
+    """
+    if inputs.outdoor is None or inputs.indoor is None:
+        return ["temperature_unavailable"]
+    if inputs.full_gate_active:
+        return ["full_gate_already_applies"]
+    if inputs.fan_mode not in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_BOTH):
+        return ["fan_mode_not_whole_house"]
+    if inputs.outdoor_sample_count < _MIN_PEAK_SAMPLE_COUNT or inputs.outdoor_today_peak is None:
+        return ["insufficient_peak_samples"]
+
+    past_peak = inputs.outdoor < inputs.outdoor_today_peak - inputs.peak_decline_margin
+
+    failures: list[str] = []
+    if not past_peak:
+        failures.append("outdoor_not_past_peak")
+    if not inputs.indoor > inputs.comfort_heat:
+        failures.append("indoor_at_or_below_comfort_floor")
+    if not inputs.indoor > inputs.comfort_cool:
+        failures.append("indoor_at_or_below_comfort_ceiling")
+    if not inputs.outdoor <= inputs.indoor:
+        failures.append("outdoor_warmer_than_indoor")
+    return failures
+
+
 def decide_nat_vent_soft_start_gate(inputs: NatVentSoftStartGateInputs) -> bool:
     """Should nat-vent soft-start (purge/comfort sub-mode) activate right now?
 
@@ -184,20 +230,4 @@ def decide_nat_vent_soft_start_gate(inputs: NatVentSoftStartGateInputs) -> bool:
     indoor, and that today's outdoor temperature is confirmed past its peak and
     declining. See Issue #540 (scoped from #533's soft-start hypothesis).
     """
-    if inputs.outdoor is None or inputs.indoor is None:
-        return False
-    if inputs.full_gate_active:
-        return False
-    if inputs.fan_mode not in (FAN_MODE_WHOLE_HOUSE, FAN_MODE_BOTH):
-        return False
-    if inputs.outdoor_sample_count < _MIN_PEAK_SAMPLE_COUNT or inputs.outdoor_today_peak is None:
-        return False
-
-    past_peak = inputs.outdoor < inputs.outdoor_today_peak - inputs.peak_decline_margin
-
-    return (
-        past_peak
-        and inputs.indoor > inputs.comfort_heat
-        and inputs.indoor > inputs.comfort_cool
-        and inputs.outdoor <= inputs.indoor
-    )
+    return not explain_nat_vent_soft_start_gate(inputs)

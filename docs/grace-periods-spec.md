@@ -323,6 +323,20 @@ cancellation plus reconciliation, only for callers that mean deliberate, immedia
 
 ---
 
+## Grace Observability and Ending a Grace-Only State (Issue #1095)
+
+**Occupant problem:** a 3-hour `fan_off` grace silently held nat-vent back while a window was open and outdoor air was cooler. Nothing in the log or on the Status card said why, and the only enabled dashboard action ("Resume from Pause") cancelled it and started a *new* manual grace.
+
+**Log lines** (all in `automation.py`):
+- `Started <source> grace period (N seconds) — trigger=… source=… ends=HH:MM` (`_start_grace_period_action()`), the mirror of `Grace cancelled — reason= trigger= source= remaining_min=` (`_cancel_grace_intentionally()`). Both fragments come from `_grace_log_fields()` / the same field names.
+- `Nat-vent evaluation skipped: reason=… ` / `Nat-vent evaluation not engaged: reason=…` (`_log_nat_vent_eval()`), emitted from every entry-evaluation exit of `check_natural_vent_conditions()`. Skip reasons: `no_sensor_open`, `hvac_calling`, `sensor_debounce_pending`, `grace_active`, `reactivation_lockout`, `temperature_unavailable`. `not engaged` reasons are listed in the order the nat-vent FSM decides (`override_active`, `grace_active` — which, like the FSM, does not apply when indoor exceeds `comfort_cool` (Issue #134) — `reactivation_lockout`, then gate rejections from `nat_vent_gate.explain_nat_vent_gate()`); `fsm_declined` means no listed cause applied. Only the full gate is itemised, not the soft-start sub-gate. The previous-outcome memory resets when a nat-vent session starts/ends or a new grace starts, so a new blocker always logs at INFO (see `08-COMPUTATION-REFERENCE.md` §nat-vent gate). INFO when the (outcome, reasons) pair changes, DEBUG when it repeats.
+
+**Status card:** every Status string that mentions a grace carries the cause and `— <duration> (ends HH:MM)` via `ClimateAdvisorCoordinator._grace_status_detail()` — including the door/window-paused string (`paused — door/window open · grace (manual) — WHF turned off — 3h (ends 9:45 PM)`) and `resumed — door/window override — 3h (ends …)`. The Issue #860 rule still applies: when `_fan_remote_timer_hours` is set the duration is omitted and the Fan card owns it. `dashboard_resume` is a `_GRACE_TRIGGER_LABELS` entry.
+
+**Next Automation:** while `_grace_active` is true the nat-vent start candidate is *deferred*, not dropped: the crossing scan starts at the grace end time (`max(now, _grace_end_time)`) because the engine's idle-open re-entry is blocked by grace (Issue #620) and the card must not promise a time it will not honour. If the end time is unknown the candidate is withheld.
+
+**Ending a grace without resuming:** `cancel_override()` already ends a grace-only state (`had_grace`). The dashboard button (`index.html`, `cancel-override-btn`) is now enabled on `manual_override_active || grace_active` (status API field `grace_active`) and labelled **End Grace Period** when only a grace is active. `ClimateAdvisorCancelOverrideView` answers `Grace period ended…` instead of `Override cancelled…` in that case. The door/window pause is not affected; "Resume from Pause" still starts a manual grace by design (Issue #47).
+
 ## Orphaned Grace Self-Heal (Issue #508)
 
 **Shape of the problem:** the opposite of the pre-existing Issue #321 stuck-grace check (below).

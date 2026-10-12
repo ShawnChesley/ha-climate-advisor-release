@@ -1294,6 +1294,108 @@ class TestNatVentStartCandidate:
         action, _t = _compute_next_automation_action_with_forecast(c, ae, config, time(12, 0), indoor, outdoor)
         assert action != "Natural ventilation"
 
+    def _grace_candidate(self, grace_end_iso):
+        """Same inputs as test_predicted_when_gate_crosses_and_window_open (crossing at 3:00 PM),
+        differing only by an active grace ending at ``grace_end_iso`` (None = end unknown)."""
+        from custom_components.climate_advisor import coordinator as _coord_mod
+
+        ae = _make_automation_engine(
+            is_paused_by_door=True, grace_active=True, grace_end_time=grace_end_iso, grace_duration_seconds=10800
+        )
+        ae._natural_vent_active = False
+        c = _make_classification(day_type="warm", hvac_mode="off")
+        config = {"fan_mode": "whole_house_fan"}
+        indoor = _curve([80.0, 80.0, 80.0, 80.0], start_hour=13)
+        outdoor = _curve([85.0, 82.0, 70.0, 65.0], start_hour=13, ts_key="datetime", temp_key="temperature")
+        with patch.object(_coord_mod.dt_util, "parse_datetime", side_effect=lambda s: datetime.fromisoformat(s)):
+            return _compute_next_automation_action_with_forecast(c, ae, config, time(12, 0), indoor, outdoor)
+
+    def test_grace_ending_before_the_crossing_does_not_move_it(self):
+        """Issue #1095: grace over by 2:00 PM, gate crosses at 3:00 PM -> the prediction stands."""
+        action, t = self._grace_candidate("2026-07-10T14:00:00")
+        assert action == "Natural ventilation"
+        assert t == "3:00 PM"
+
+    def test_grace_ending_after_the_crossing_defers_the_prediction(self):
+        """Issue #1095: grace holds until 3:30 PM -> the engine cannot start at 3:00 PM, so the
+        card must not announce it; the first honest start is the next hour the gate still holds."""
+        action, t = self._grace_candidate("2026-07-10T15:30:00")
+        assert action == "Natural ventilation"
+        assert t == "4:00 PM"
+
+    def test_absent_while_grace_end_time_is_unknown(self):
+        """No end time -> cannot say when the engine may start, so promise nothing."""
+        action, _t = self._grace_candidate(None)
+        assert action != "Natural ventilation"
+
+
+class TestGraceTimingOnStatus:
+    """Issue #1095: every Status string that mentions a grace carries its cause and end time,
+    including while door/window-paused (the branch that used to hide the grace entirely)."""
+
+    _NOW = datetime(2026, 10, 11, 21, 21, 0)
+    _END = "2026-10-11T21:45:34"
+
+    def test_paused_with_grace_shows_cause_duration_and_end_time(self):
+        ae = _make_automation_engine(
+            is_paused_by_door=True,
+            grace_active=True,
+            last_resume_source="manual",
+            last_grace_trigger="fan_off",
+            grace_end_time=self._END,
+            grace_duration_seconds=10800,
+        )
+        status = _compute_automation_status(True, ae, now_dt=self._NOW)
+        assert status == "paused — door/window open · grace (manual) — WHF turned off — 3h (ends 9:45 PM)"
+
+    def test_paused_without_grace_is_unchanged(self):
+        ae = _make_automation_engine(is_paused_by_door=True, grace_active=False)
+        assert _compute_automation_status(True, ae) == "paused — door/window open"
+
+    def test_paused_away_with_grace_keeps_away_wording_and_adds_grace(self):
+        ae = _make_automation_engine(
+            is_paused_by_door=True,
+            grace_active=True,
+            last_resume_source="manual",
+            last_grace_trigger="fan_off",
+            grace_end_time=self._END,
+            grace_duration_seconds=10800,
+        )
+        status = _compute_automation_status(True, ae, now_dt=self._NOW, occupancy_mode="away")
+        assert status.startswith("paused — away (resumes after windows close) · grace (manual)")
+        assert status.endswith("(ends 9:45 PM)")
+
+    def test_paused_with_remote_timer_grace_defers_duration_to_fan_card(self):
+        """Issue #860 rule preserved: the Fan card owns duration/expiry when a remote timer is set."""
+        ae = _make_automation_engine(
+            is_paused_by_door=True,
+            grace_active=True,
+            last_resume_source="manual",
+            last_grace_trigger="fan_manual_override",
+            grace_end_time=self._END,
+            grace_duration_seconds=10800,
+            fan_remote_timer_hours=3.0,
+        )
+        status = _compute_automation_status(True, ae, now_dt=self._NOW)
+        assert status == "paused — door/window open · grace (manual) — WHF override"
+
+    def test_resumed_from_pause_shows_end_time(self):
+        ae = _make_automation_engine(
+            grace_active=True,
+            last_resume_source="manual",
+            last_grace_trigger="dashboard_resume",
+            grace_end_time="2026-10-12T00:21:11",
+            grace_duration_seconds=10800,
+        )
+        ae._resumed_from_pause = True
+        status = _compute_automation_status(True, ae, now_dt=self._NOW)
+        assert status == "resumed — door/window override — 3h (ends 12:21 AM)"
+
+    def test_resumed_from_pause_without_end_data_degrades_to_bare_string(self):
+        ae = _make_automation_engine(grace_active=True, last_resume_source="manual")
+        ae._resumed_from_pause = True
+        assert _compute_automation_status(True, ae) == "resumed — door/window override"
+
 
 class TestWarmDayForecastEventCandidates:
     """WARM/MILD-day forecast-derived events surfaced as Next Automation candidates (Issue #528)."""

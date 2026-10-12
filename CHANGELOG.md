@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.106] — 2026-10-11
+
+- Fix #1095: when automation holds the whole-house fan back (for example during a grace period after you turned the fan off), the log and Status card now say why and when it ends, and a new End Grace Period button lets you end it without resuming.
+
 ## [0.7.105] — 2026-10-11
 
 - Fix #1091: with Prefer savings on, the daily briefing now quotes the wider comfort range the thermostat actually holds (for example Cool at 77 instead of 75) instead of the plain range.
