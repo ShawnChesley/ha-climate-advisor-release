@@ -51,7 +51,7 @@ def is_climate_validation_error(err: BaseException) -> bool: ...
 
 **Events:** `incident_detected` (emitted by callers, not by this module).
 
-**Band source (Issue #1054):** both emitters fill `comfort_heat`/`comfort_cool` from the band in force (sleep / away / vacation / aggressive savings) via `AutomationEngine._resolved_comfort_band()`; the engine falls back to the flat config values only before the first classification exists.
+**Band source (Issue #1054):** both emitters fill `comfort_heat`/`comfort_cool` from the band in force (sleep / away / vacation / aggressive savings, plus the TOU away/vacation widening since Issue #1080) via `AutomationEngine._resolved_comfort_band()`; the engine falls back to the flat config values only before the first classification exists.
 
 ## Data Structures
 

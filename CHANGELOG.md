@@ -3,6 +3,10 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.103] — 2026-10-11
+
+- Fix #1080: while you are Away or on Vacation during a time-of-use window, the dashboard's "CA target" note, incident records, comfort-violation checks and manual-override matching now use the same widened comfort range the thermostat is actually holding, instead of the narrower normal setback.
+
 ## [0.7.102] — 2026-10-11
 
 - Fix #1077: the downloaded control-quality summary now separates holds near a comfort edge from real overshoots, so the deepest-overshoot figure is no longer diluted by edge-margin holds. (Holds recorded before this update show no figure for up to a week.)

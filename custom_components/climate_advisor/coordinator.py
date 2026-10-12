@@ -45,9 +45,9 @@ from .automation import (
     _in_sleep_window,
     compute_bedtime_setback,
     compute_pre_cool_target,
+    fallback_edges_without_classification,
     hvac_outcome_label,
     resolve_pre_cool_modifier,
-    select_comfort_band,
 )
 from .briefing import generate_briefing
 from .chart_log import ChartStateLog
@@ -9900,25 +9900,11 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         """
         classification = self.current_classification
         if classification is not None:
-            if self.automation_engine is not None:
-                # Issue #1054: one resolver -- the engine's -- for both incident emitters.
-                band = self.automation_engine._resolved_comfort_band(classification)
-            else:
-                band = select_comfort_band(
-                    classification,
-                    self.config,
-                    occupancy_mode=OCCUPANCY_HOME,
-                    in_sleep_window=_in_sleep_window(dt_util.now(), self.config),
-                    aggressive_savings=bool(self.config.get("aggressive_savings", False)),
-                )
+            # Issue #1054/#1080: one resolver -- the engine's -- for every read-only surface (the
+            # engine is built unconditionally in __init__, so there is no engine-less branch).
+            band = self.automation_engine._resolved_comfort_band(classification)
             return band.floor, band.ceiling
-        if _in_sleep_window(dt_util.now(), self.config):
-            comfort_heat = self.config.get("sleep_heat", self.config.get("comfort_heat"))
-            comfort_cool = self.config.get("sleep_cool", self.config.get("comfort_cool"))
-        else:
-            comfort_heat = self.config.get("comfort_heat")
-            comfort_cool = self.config.get("comfort_cool")
-        return comfort_heat, comfort_cool
+        return fallback_edges_without_classification(dt_util.now(), self.config)
 
     def _emit_incident(
         self,
