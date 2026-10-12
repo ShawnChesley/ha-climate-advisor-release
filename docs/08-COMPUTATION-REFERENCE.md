@@ -156,7 +156,7 @@ Default values used in examples (from `const.py`: `DEFAULT_COMFORT_HEAT = 68`, `
 | Pre-heat (cold front, significant) | `comfort_heat + pre_condition_target` | n/a | 71°F | n/a |
 
 **Notes:**
-- Bedtime setback depth is now computed by `compute_bedtime_setback()` in `automation.py` (see §5a). When `sleep_heat` / `sleep_cool` are explicitly configured (#101), those values are used directly as the bedtime setpoint, bypassing the adaptive depth computation. The hardcoded defaults (`DEFAULT_SLEEP_HEAT = 66°F`, `DEFAULT_SLEEP_COOL = 78°F`) apply when neither sleep temps are configured nor thermal model data is available.
+- Bedtime setback depth is now computed by `compute_bedtime_setback()` in `automation.py` (see §5a). When `sleep_heat` / `sleep_cool` are explicitly configured (#101), those values are used directly as the bedtime setpoint, bypassing the adaptive depth computation. The hardcoded defaults (`DEFAULT_SLEEP_HEAT = 64°F`, `DEFAULT_SLEEP_COOL = 72°F`) apply when neither sleep temps are configured nor thermal model data is available.
 - Bedtime cool still applies the same `+3°F` offset logic at default; when the thermal model is active, the depth is scaled to ensure the house warms/cools back to comfort within the overnight recovery window.
 - **`setback_modifier` (verified by grep, Issue #1073):** `automation.py` reads `setback_modifier` only in `compute_pre_cool_target()` / `resolve_pre_cool_modifier()` and as a logged field of the `bedtime_setback` event. The away/vacation/bedtime band edges come from `select_comfort_band()` and `compute_bedtime_setback()`, which do not apply it. Since Issue #1076 the chart's `_compute_target_band_schedule()` no longer applies it either (it used to add it to both away/vacation setback edges, which shifted the chart band 2-3 °F away from what the thermostat held on trend days); chart and `select_comfort_band()` are now identical for away/vacation. Earlier text that said the automation engine applies it to away/vacation/bedtime setbacks was not supported by the code.
 - `VACATION_SETBACK_EXTRA = 3` degrees beyond the normal setback.
@@ -307,9 +307,9 @@ From Issue #119, the chart's "Target Band" overlay is no longer two static scala
 | Away — today only | `setback_heat` | `setback_cool` |
 | Vacation — **all forecast days** | `setback_heat − VACATION_SETBACK_EXTRA` | `setback_cool + VACATION_SETBACK_EXTRA` |
 | Home/guest — pre-wake (`h_n < wake_h`) | `sleep_heat` | `sleep_cool` |
-| Home/guest — wake ramp (2h linear) | Interpolates `sleep_heat → comfort_heat` | Interpolates `sleep_cool → comfort_cool` |
-| Home/guest — awake (`wake_h+2h ≤ h_n < sleep_h`) | `comfort_heat` | `comfort_cool` |
-| Home/guest — sleep ramp (1h linear) | Interpolates `comfort_heat → sleep_heat` | Interpolates `comfort_cool → sleep_cool` |
+| Home/guest — wake ramp (2h linear) | Interpolates `sleep_heat → awake_heat` | Interpolates `sleep_cool → awake_cool` |
+| Home/guest — awake (`wake_h+2h ≤ h_n < sleep_h`) | `awake_heat` | `awake_cool` |
+| Home/guest — sleep ramp (1h linear) | Interpolates `awake_heat → sleep_heat` | Interpolates `awake_cool → sleep_cool` |
 | Home/guest — post-sleep (`h_n ≥ sleep_h+1h`) | `sleep_heat` | `sleep_cool` |
 | Away — **future days** (tomorrow+) | Normal home/guest schedule (assumes return) | Same |
 
@@ -317,9 +317,11 @@ From Issue #119, the chart's "Target Band" overlay is no longer two static scala
 
 **Vacation scope:** Vacation mode applies deep setback to **all** forecast days (today and future), not just today. This reflects that a vacationing household is away for the entire forecast window. Away mode applies setback to today only (assumes a return by tomorrow).
 
+`awake_heat`/`awake_cool` = `automation.awake_comfort_edges()`: `comfort_heat`/`comfort_cool`, widened by `CEILING_ESCALATION_SAVINGS_MARGIN_F` on both sides when `aggressive_savings` is on (Issue #1087) -- the same helper `select_comfort_band()` arms, so the chart, the predicted-indoor curve and the thermostat agree. Away/vacation/sleep bands are never widened by it.
+
 **Night-owl schedule normalization:** When `sleep_time < wake_time` (e.g., sleep=01:00, wake=09:00), the schedule wraps past midnight. The function normalises by adding 24 to `sleep_h` (making it e.g. 25) and computing `h_n = h + 24 if night_owl and h < wake_h else h` for each timestamp's local hour. This maps all timestamps onto a continuous `[wake_h, sleep_h]` number line regardless of the midnight boundary.
 
-**Adaptive sleep temperatures (G1/G2):** When both `thermal_model` and `classification` are provided, `sleep_heat` and `sleep_cool` are derived from `compute_bedtime_setback(config, thermal_model, classification)` — the same function used by `automation.py`. This eliminates the three-implementation gap between chart band, physics prediction, and automation setpoints: all three now derive sleep temps from the same adaptive logic. When `thermal_model` or `classification` is `None`, the fallback values (`comfort_heat − DEFAULT_SETBACK_DEPTH_F`, `comfort_cool + DEFAULT_SETBACK_DEPTH_COOL_F`) are used.
+**Sleep temperatures (G1/G2):** When both `thermal_model` and `classification` are provided, the chart's `sleep_heat`/`sleep_cool` come from `compute_bedtime_setback(config, thermal_model, classification)`. Correction (Issue #1087 review): the engine does NOT call that function -- `select_comfort_band()` arms the raw configured `sleep_heat`/`sleep_cool`. The two only differ when a sleep temperature is set outside the setback limits (`compute_bedtime_setback` limits it to `setback_heat`/`setback_cool`); with the shipped defaults they are identical. Not a planned change (#1089). When `thermal_model` or `classification` is `None`, the fallback values (`comfort_heat − DEFAULT_SETBACK_DEPTH_F`, `comfort_cool + DEFAULT_SETBACK_DEPTH_COOL_F`) are used.
 
 **Notes:**
 - `sleep_heat` and `sleep_cool` base fallbacks are `comfort_heat − 4°F` and `comfort_cool + 3°F` respectively, but are overridden when the user has explicitly configured sleep temperatures (Issue #101). Adaptive `compute_bedtime_setback()` output is used in preference to both when a thermal model is available.
@@ -2948,11 +2950,11 @@ Complete list of all constants from `const.py` that affect runtime behavior.
 | Constant Name | Default Value | Unit | Description |
 |---|---|---|---|
 | `DEFAULT_COMFORT_HEAT` | `70` | °F | Heating target when home/comfort |
-| `DEFAULT_COMFORT_COOL` | `75` | °F | Cooling target when home/comfort |
+| `DEFAULT_COMFORT_COOL` | `74` | °F | Cooling target when home/comfort |
 | `DEFAULT_SETBACK_HEAT` | `60` | °F | Heating target when away |
 | `DEFAULT_SETBACK_COOL` | `80` | °F | Cooling target when away |
-| `DEFAULT_SLEEP_HEAT` | `66` | °F | Bedtime heating target (default: `comfort_heat − 4°F`); overrides adaptive depth when `sleep_heat` is explicitly configured (#101) |
-| `DEFAULT_SLEEP_COOL` | `78` | °F | Bedtime cooling target (default: `comfort_cool + 3°F`); overrides adaptive depth when `sleep_cool` is explicitly configured (#101) |
+| `DEFAULT_SLEEP_HEAT` | `64` | °F | Bedtime heating target (default: `comfort_heat − 4°F`); overrides adaptive depth when `sleep_heat` is explicitly configured (#101) |
+| `DEFAULT_SLEEP_COOL` | `72` | °F | Bedtime cooling target; overrides adaptive depth when `sleep_cool` is explicitly configured (#101) |
 | `THRESHOLD_HOT` | `85` | °F | today_high threshold for `hot` day type |
 | `THRESHOLD_WARM` | `75` | °F | today_high threshold for `warm` day type |
 | `THRESHOLD_MILD` | `60` | °F | today_high threshold for `mild` day type |

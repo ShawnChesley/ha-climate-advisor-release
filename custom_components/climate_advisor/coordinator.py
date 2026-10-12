@@ -43,6 +43,7 @@ from .automation import (
     AutomationEngine,
     AutomationEngineCallbacks,
     _in_sleep_window,
+    awake_comfort_edges,
     compute_bedtime_setback,
     compute_pre_cool_target,
     fallback_edges_without_classification,
@@ -12481,7 +12482,8 @@ def _compute_target_band_schedule(
     in chronological order.
 
     When thermal_model and classification are both provided, sleep_heat is derived
-    via compute_bedtime_setback() — matching automation.py's adaptive setpoint logic.
+    via compute_bedtime_setback() (the briefing's resolver; the engine arms the raw sleep_heat/cool, which
+    only differs when a sleep temp is outside the setback limits -- Issue #1089).
 
     ``tou_precondition_window`` (Issue #786): ``(window_start, window_end, target, mode)``
     — when a timestamp falls in ``[window_start, window_end)``, the resolved TOU banking
@@ -12506,10 +12508,15 @@ def _compute_target_band_schedule(
     setback_cool = float(config.get("setback_cool", DEFAULT_SETBACK_COOL))
     sleep_heat = float(config.get("sleep_heat", comfort_heat - DEFAULT_SETBACK_DEPTH_F))
     sleep_cool = float(config.get("sleep_cool", comfort_cool + DEFAULT_SETBACK_DEPTH_COOL_F))
+    # Issue #1087: the awake edges the thermostat is armed with (widened by aggressive savings) -- the
+    # chart's wake/sleep ramps interpolate to/from THESE, not the plain comfort edges.
+    awake_heat, awake_cool = awake_comfort_edges(
+        config, aggressive_savings=bool(config.get("aggressive_savings", False))
+    )
 
     # G1/G2: use compute_bedtime_setback() when thermal model + classification available —
-    # aligns chart band with the adaptive sleep setpoint used by automation.py for both
-    # heat (sleep_heat raised toward comfort) and cool (sleep_cool lowered toward comfort).
+    # the same sleep value the briefing quotes. NOTE (Issue #1089): the engine's select_comfort_band()
+    # arms the raw sleep_heat/sleep_cool; this only differs when a sleep temp is outside the setback limits.
     if thermal_model is not None and classification is not None:
         _hvac_mode = getattr(classification, "hvac_mode", None)
         if _hvac_mode == "heat":
@@ -12563,17 +12570,17 @@ def _compute_target_band_schedule(
             elif h_n < wake_h + wake_ramp_h:
                 # Wake ramp: interpolate toward comfort
                 frac = (h_n - wake_h) / wake_ramp_h
-                lower = sleep_heat + frac * (comfort_heat - sleep_heat)
-                upper = sleep_cool + frac * (comfort_cool - sleep_cool)
+                lower = sleep_heat + frac * (awake_heat - sleep_heat)
+                upper = sleep_cool + frac * (awake_cool - sleep_cool)
             elif h_n < sleep_h:
-                # Awake: comfort band
-                lower = comfort_heat
-                upper = comfort_cool
+                # Awake: comfort band (Issue #1087: incl. the aggressive-savings margin)
+                lower = awake_heat
+                upper = awake_cool
             elif h_n < sleep_h + sleep_ramp_h:
                 # Sleep ramp: interpolate toward sleep setback
                 frac = (h_n - sleep_h) / sleep_ramp_h
-                lower = comfort_heat + frac * (sleep_heat - comfort_heat)
-                upper = comfort_cool + frac * (sleep_cool - comfort_cool)
+                lower = awake_heat + frac * (sleep_heat - awake_heat)
+                upper = awake_cool + frac * (sleep_cool - awake_cool)
             else:
                 # Post-sleep: sleep band; apply pre-cool ceiling from trigger time onward
                 lower = sleep_heat

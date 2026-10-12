@@ -477,7 +477,7 @@ Called by `learning._commit_event_from_dict()` after parameter extraction. Appen
 `_build_predicted_indoor_future()` in `coordinator.py` accepts a `classification` parameter alongside `thermal_model`. When both are provided:
 
 - The target band schedule is computed once via `_compute_target_band_schedule(hourly_timestamps, config, occupancy_mode, now, thermal_model, classification)` (no `setback_modifier` since Issue #1076) before iterating forecast hours (pre-computed, not per-hour — Issue #119 B3 fix).
-- Sleep temperatures in the band are derived from `compute_bedtime_setback(config, thermal_model, classification)`, the same function used by `automation.py`. Chart band, physics prediction, and automation engine all use identical adaptive sleep setpoints when a model is available.
+- Sleep temperatures in the band are derived from `compute_bedtime_setback(config, thermal_model, classification)`, used by the chart band and the briefing. The automation engine arms the raw configured sleep temperatures instead (`select_comfort_band()`), so the two agree unless a sleep temperature is set outside the setback limits (#1089, not planned).
 - Occupancy mode is propagated: away today → setback setpoints for today's hours only; vacation → deep setback for all forecast days.
 
 When `thermal_model` or `classification` is absent, the band falls back to static sleep-temp defaults and the ramp interpolation path is used for the indoor prediction curve.
