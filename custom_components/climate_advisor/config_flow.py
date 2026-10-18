@@ -395,7 +395,7 @@ def setpoint_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, fl
             "setback_heat": (7, 18.5, _c_default(DEFAULT_SETBACK_HEAT, 7, 18.5), 0.5),
             "setback_cool": (23.5, 32.5, _c_default(DEFAULT_SETBACK_COOL, 23.5, 32.5), 0.5),
             "sleep_heat": (12.5, 26.5, _c_default(DEFAULT_SLEEP_HEAT, 12.5, 26.5), 0.5),
-            "sleep_cool": (20.5, 32, _c_default(DEFAULT_SLEEP_COOL, 20.5, 32), 0.5),
+            "sleep_cool": (12.5, 32, _c_default(DEFAULT_SLEEP_COOL, 12.5, 32), 0.5),
         }
     return {
         "comfort_heat": (55, 80, DEFAULT_COMFORT_HEAT, 1),
@@ -403,7 +403,7 @@ def setpoint_slider_ranges(is_celsius: bool) -> dict[str, tuple[float, float, fl
         "setback_heat": (45, 65, DEFAULT_SETBACK_HEAT, 1),
         "setback_cool": (75, 90, DEFAULT_SETBACK_COOL, 1),
         "sleep_heat": (55, 79, DEFAULT_SLEEP_HEAT, 1),
-        "sleep_cool": (69, 89, DEFAULT_SLEEP_COOL, 1),
+        "sleep_cool": (55, 89, DEFAULT_SLEEP_COOL, 1),
     }
 
 

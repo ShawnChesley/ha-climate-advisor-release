@@ -1,13 +1,21 @@
 {
   "domain": "climate_advisor",
   "name": "Climate Advisor",
-  "codeowners": ["@gunkl"],
+  "codeowners": [
+    "@ShawnChesley"
+  ],
   "config_flow": true,
-  "dependencies": ["weather", "climate", "http"],
-  "documentation": "https://github.com/gunkl/ClimateAdvisor",
+  "dependencies": [
+    "weather",
+    "climate",
+    "http"
+  ],
+  "documentation": "https://github.com/ShawnChesley/ha-climate-advisor-release",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/gunkl/ClimateAdvisor/issues",
-  "requirements": ["anthropic>=0.49.0"],
-  "version": "0.7.106"
+  "issue_tracker": "https://github.com/ShawnChesley/ha-climate-advisor-release/issues",
+  "requirements": [
+    "anthropic>=0.49.0"
+  ],
+  "version": "0.7.106.1"
 }
