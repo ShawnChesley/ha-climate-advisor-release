@@ -1,0 +1,47 @@
+name: MXZ compatibility
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sleep-settings:
+    name: Sleep target and bedtime regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements_test.txt pytest-asyncio 'anthropic>=0.49.0'
+      - run: >-
+          env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest
+          -p pytest_asyncio.plugin -o asyncio_mode=auto -q --tb=short
+          tests/test_sleep_cool_lower_target.py tests/test_config_flow.py
+          tests/test_config_flow_deltas.py tests/test_config_flow_strings.py
+          tests/test_bedtime_setback.py tests/test_bedtime_override.py
+          tests/test_bedtime_recent_write_guard.py tests/test_sleep_indoor_temp_listener.py
+  integration:
+    name: HA 2026.10.2 with MXZ 3.4.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ShawnChesley/ha-mxz-coordinator-release
+          ref: v3.4.1
+          path: mxz-source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: pip install homeassistant==2026.10.2 pytest-homeassistant-custom-component==0.13.373 'anthropic>=0.49.0' ruff==0.16.0
+      - run: pip check
+      - name: MXZ integration suite
+        working-directory: mxz-source
+        run: python -m pytest tests/ -q --tb=short
+      - name: CA fork against MXZ
+        working-directory: mxz-source
+        run: python tools/run_ca_compat.py "$GITHUB_WORKSPACE"
