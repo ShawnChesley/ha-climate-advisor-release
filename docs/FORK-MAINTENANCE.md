@@ -2,7 +2,7 @@
 
 This fork is based on gunkl/ClimateAdvisor v0.7.106, upstream commit cb6d340de82cb6fffc9ff8f7addb03603f7b7b75. The upstream MIT license and attribution are retained.
 
-Version0.7.106.1 widens only the sleep-cooling input range to match the existing sleep-heating lower bound (55°F /12.5°C). Default72°F, scheduling, daytime comfort, and actuation are unchanged. Users must stay within their thermostat's supported bounds.
+Version 0.7.107 widens only the sleep-cooling input range to match the existing sleep-heating lower bound (55°F /12.5°C). Default72°F, scheduling, daytime comfort, and actuation are unchanged. Users must stay within their thermostat's supported bounds.
 
 Release gates: regression tests for64/65°F and Celsius round-trips; bedtime and morning band regressions; upstream configuration and bedtime tests; HACS and hassfest; official HA2026.10.2 integration harness with maintained MXZ3.4.1, its full suite and CA/MXZ compatibility tests. Never publish a new tag until gates pass.
 
