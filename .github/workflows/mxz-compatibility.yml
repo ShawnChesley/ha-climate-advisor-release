@@ -21,6 +21,7 @@ jobs:
           -p pytest_asyncio.plugin -o asyncio_mode=auto -q --tb=short
           tests/test_sleep_cool_lower_target.py tests/test_config_flow.py
           tests/test_config_flow_deltas.py tests/test_config_flow_strings.py
+          tests/test_band_validation.py
           tests/test_bedtime_setback.py tests/test_bedtime_override.py
           tests/test_bedtime_recent_write_guard.py tests/test_sleep_indoor_temp_listener.py
   integration:
