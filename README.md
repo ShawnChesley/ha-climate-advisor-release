@@ -146,6 +146,9 @@ Choose Fahrenheit or Celsius. This setting controls all displayed values and set
 ### Step 3: Setpoints
 Separate comfort and setback temperatures for heating and cooling, plus optional `sleep_heat` / `sleep_cool` bedtime setpoints.
 
+On setup and in options, each comfort, setback, and sleep band must have cooling at or above heating. Targets must also fit the selected thermostat's reported minimum and maximum. Errors stay beside the affected field and nothing is saved until corrected. Bounds are converted correctly when Climate Advisor and Home Assistant use different temperature units; missing or invalid device bounds are skipped.
+
+
 ### Step 4: Temperature Sources
 Choose where indoor and outdoor temperature readings come from:
 - Weather service (recommended for outdoor)

@@ -114,6 +114,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
 )
 from .scheduler import ALL_DAYS, COST_TAG_HIGH, MAX_SCHEDULES, WEEKDAY_ABBREVS, _parse_hhmm
+from .setpoint_validation import validate_setpoints
 from .temperature import CELSIUS, FAHRENHEIT, convert_delta, from_fahrenheit, ha_system_unit, to_fahrenheit
 
 _LOGGER = logging.getLogger(__name__)
@@ -507,6 +508,7 @@ class ClimateAdvisorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["setback_heat"] = "setback_must_be_lower"
             if user_input.get("setback_cool", 999) <= user_input.get("comfort_cool", 0):
                 errors["setback_cool"] = "setback_must_be_higher"
+            errors.update(validate_setpoints(self.hass, self._data.get("climate_entity"), user_input, unit))
             if not errors:
                 # Convert display values → stored °F (canonical internal unit)
                 converted = {**user_input}
@@ -920,6 +922,7 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                 errors["setback_heat"] = "setback_must_be_lower"
             if user_input.get("setback_cool", 999) <= user_input.get("comfort_cool", 0):
                 errors["setback_cool"] = "setback_must_be_higher"
+            errors.update(validate_setpoints(self.hass, current.get("climate_entity"), user_input, unit))
             if not errors:
                 # Convert display values → stored °F
                 for key in ("comfort_heat", "comfort_cool", "setback_heat", "setback_cool", "sleep_heat", "sleep_cool"):

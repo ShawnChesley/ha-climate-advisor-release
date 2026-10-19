@@ -3,6 +3,12 @@
 All notable changes to Climate Advisor are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [0.7.108] — candidate, not released
+
+- Reject inverted comfort, setback and sleep bands in initial setup and options. Equal heat/cool targets remain allowed.
+- Reject targets outside the selected thermostat's reported limits, accounting for Celsius/Fahrenheit. Missing/invalid limits are skipped independently.
+- Show errors beside invalid fields without saving or issuing thermostat commands. Existing saved settings are not rewritten.
+
 ## [0.7.106] — 2026-10-11
 
 - Fix #1095: when automation holds the whole-house fan back (for example during a grace period after you turned the fan off), the log and Status card now say why and when it ends, and a new End Grace Period button lets you end it without resuming.
