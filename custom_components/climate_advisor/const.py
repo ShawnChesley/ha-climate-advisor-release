@@ -227,6 +227,12 @@ CONF_VACATION_TOGGLE = "vacation_toggle_entity"
 CONF_VACATION_TOGGLE_INVERT = "vacation_toggle_invert"
 CONF_GUEST_TOGGLE = "guest_toggle_entity"
 CONF_GUEST_TOGGLE_INVERT = "guest_toggle_invert"
+# Sleep offset: a numeric entity (input_number / number / sensor) whose value, in the
+# user's display unit, is added to both sleep_heat and sleep_cool while it is set.
+# Typical use: an automation sets it to +2 when one sleeper is away so the bedroom
+# runs warmer for the other. Read continuously; clamped to ±SLEEP_OFFSET_MAX_F.
+CONF_SLEEP_OFFSET_ENTITY = "sleep_offset_entity"
+SLEEP_OFFSET_MAX_F = 5.0
 
 # Occupancy mode values
 OCCUPANCY_HOME = "home"
@@ -882,6 +888,19 @@ CONFIG_METADATA = {
     "guest_toggle_invert": {
         "label": "Invert Guest Toggle",
         "description": "Enable if your toggle reports ON when guests are NOT present.",
+        "category": "occupancy",
+    },
+    "sleep_offset_entity": {
+        "label": "Sleep Temperature Offset",
+        "description": (
+            "A numeric entity (input_number, number or sensor) whose value is added to both"
+            " sleep temperatures while it is set — e.g. +2 makes bedtime 2 degrees warmer."
+            " Uses the entity's °F/°C unit if it has one, otherwise this zone's display unit."
+            " Read continuously; limited to ±5°F (±2.8°C) and to the sleep temperature ranges."
+            " While the entity is briefly unavailable the last valid value is kept;"
+            " after a Home Assistant restart it is 0 until the entity reports a value."
+            " Has no effect when sleep temperatures are adaptive (not set explicitly)."
+        ),
         "category": "occupancy",
     },
     "welcome_home_debounce_seconds": {

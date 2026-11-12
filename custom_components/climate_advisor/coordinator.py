@@ -122,6 +122,7 @@ from .const import (
     CONF_SENSOR_DEBOUNCE,
     CONF_SENSOR_POLARITY_INVERTED,
     CONF_SLEEP_HEAT,
+    CONF_SLEEP_OFFSET_ENTITY,
     CONF_THRESHOLD_COOL,
     CONF_THRESHOLD_HOT,
     CONF_THRESHOLD_MILD,
@@ -196,6 +197,7 @@ from .const import (
     REJECT_WINDOW_TOO_SHORT,
     REMOTE_BURST_WINDOW_SECONDS,
     REMOTE_SPEED_SENSOR_OBJECT_ID_HINTS,
+    SLEEP_OFFSET_MAX_F,
     TEMP_SOURCE_CLIMATE_FALLBACK,
     TEMP_SOURCE_INPUT_NUMBER,
     TEMP_SOURCE_SENSOR,
@@ -291,6 +293,7 @@ from .scheduler import (
     resolve_tou_away_vacation_phase,
     resolve_tou_phase,
 )
+from .sleep_offset import bounded_offset, capture_base, read_offset_f, split_base_changes, write_effective
 from .state import StatePersistence
 from .temperature import (
     convert_delta,
@@ -910,6 +913,14 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self._unsub_occupancy_listeners: list[Any] = []
         self._occupancy_away_timer_cancel: Any | None = None
 
+        # Sleep temperature offset (sleep_offset.py): base = un-offset sleep setpoints,
+        # last_valid = offset held through entity outages, applied = current °F offset.
+        # Base values come from the config entry ONCE, here, before any offset is written;
+        # afterwards they change only via apply_runtime_config_changes().
+        self._sleep_offset_base: dict[str, float] = capture_base(config)
+        self._sleep_offset_last_valid_f: float = 0.0  # held through unavailable/unknown
+        self._sleep_offset_applied_f: float = 0.0  # effective (bounded) offset actually in config
+
         # Issue #899: precise T_start guard timer for away/vacation TOU pre-conditioning —
         # stops precool/preheat exactly when the TOU window begins, rather than waiting up
         # to 30 minutes for the next regular cycle. See _sync_tou_away_vacation_state().
@@ -1249,6 +1260,8 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
 
         # Listeners: occupancy toggles
         self._subscribe_occupancy_listeners()
+        self._subscribe_sleep_offset_listener()
+        self._apply_sleep_offset()
         self._occupancy_mode = self._compute_occupancy_mode()
 
         # Listeners: thermostat state (for tracking manual overrides and runtime)
@@ -2278,6 +2291,82 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
                     )
                 )
 
+    # ── Sleep temperature offset ─────────────────────────────────────
+
+    def _subscribe_sleep_offset_listener(self) -> None:
+        """Track the optional sleep-offset entity (shares the occupancy unsub list)."""
+        entity_id = self.config.get(CONF_SLEEP_OFFSET_ENTITY)
+        if entity_id:
+            self._unsub_occupancy_listeners.append(
+                async_track_state_change_event(
+                    self.hass,
+                    entity_id,
+                    self._zone_scoped(self._async_sleep_offset_changed),
+                )
+            )
+
+    def _read_sleep_offset_f(self) -> float:
+        """Requested offset in internal °F.
+
+        Not configured, or the entity no longer exists → 0. Unavailable, unknown or a
+        non-numeric/non-finite state → hold the last valid value, so a brief helper
+        outage (HA restart, integration reload) doesn't drop the warmer setting.
+        """
+        entity_id = self.config.get(CONF_SLEEP_OFFSET_ENTITY)
+        if not entity_id:
+            self._sleep_offset_last_valid_f = 0.0
+            return 0.0
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            self._sleep_offset_last_valid_f = 0.0
+            return 0.0
+        reading = read_offset_f(
+            state.state,
+            (state.attributes or {}).get("unit_of_measurement"),
+            self.config.get("temp_unit", "fahrenheit"),
+            SLEEP_OFFSET_MAX_F,
+        )
+        if reading.value_f is None:
+            return self._sleep_offset_last_valid_f
+        self._sleep_offset_last_valid_f = reading.value_f
+        return reading.value_f
+
+    def _apply_sleep_offset(self) -> bool:
+        """Write base + offset into self.config's sleep setpoints. Returns True on change."""
+        base = getattr(self, "_sleep_offset_base", None)
+        if not isinstance(base, dict):  # partially-instantiated coordinator in tests
+            return False
+        requested_f = self._read_sleep_offset_f()
+        # Adaptive sleep (no explicit sleep setpoints): nothing to shift, report 0.
+        effective_f = bounded_offset(base, requested_f) if base else 0.0
+        prev_f = self._sleep_offset_applied_f
+        changed = write_effective(self.config, base, requested_f)
+        self._sleep_offset_applied_f = effective_f
+        if changed or abs(effective_f - prev_f) > 1e-9:
+            _LOGGER.info(
+                "Sleep offset %+.1f°F applied (requested %+.1f°F, was %+.1f°F):"
+                " sleep_heat=%s sleep_cool=%s (base %s / %s)",
+                effective_f,
+                requested_f,
+                prev_f,
+                self.config.get("sleep_heat"),
+                self.config.get("sleep_cool"),
+                base.get("sleep_heat"),
+                base.get("sleep_cool"),
+            )
+        elif requested_f and not base:
+            _LOGGER.debug("Sleep offset %+.1f°F ignored — no explicit sleep setpoints (adaptive sleep)", requested_f)
+        return changed
+
+    def apply_runtime_config_changes(self, changes: dict[str, Any]) -> None:
+        """Apply a runtime config update — see module-level apply_runtime_config_changes()."""
+        apply_runtime_config_changes(self, changes)
+
+    async def _async_sleep_offset_changed(self, event: Event) -> None:
+        """Offset entity changed — re-apply and refresh so bedtime targets follow immediately."""
+        if self._apply_sleep_offset():
+            await self.async_request_refresh()
+
     def _unsubscribe_occupancy_listeners(self) -> None:
         """Unsubscribe all occupancy toggle listeners."""
         for unsub in self._unsub_occupancy_listeners:
@@ -3056,6 +3145,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         """Fetch forecast and update classification (runs every 30 min)."""
         # Re-resolve group membership in case it changed
         _LOGGER.debug("[coalesce-diag] _async_update_data: enter")
+        self._apply_sleep_offset()
         new_resolved = self._resolve_monitored_sensors()
         if set(new_resolved) != set(self._resolved_sensors):
             _LOGGER.info("Door/window sensor membership changed; updating listeners")
@@ -3806,6 +3896,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             ATTR_NEXT_AUTOMATION_ACTION: next_auto[0],
             ATTR_NEXT_AUTOMATION_TIME: next_auto[1],
             ATTR_OCCUPANCY_MODE: self._occupancy_mode,
+            "sleep_offset_f": getattr(self, "_sleep_offset_applied_f", 0.0),
             ATTR_LAST_ACTION_TIME: self.automation_engine._last_action_time,
             ATTR_LAST_ACTION_REASON: self.automation_engine._last_action_reason,
             ATTR_FAN_STATUS: self._compute_fan_status(),
@@ -14201,3 +14292,18 @@ def _parse_time(time_str: str) -> time:
             time_str,
         )
         return time(6, 0)
+
+
+def apply_runtime_config_changes(coordinator: Any, changes: dict[str, Any]) -> None:
+    """Apply a runtime config update (e.g. an accepted learning suggestion) to a coordinator.
+
+    Sleep setpoints in ``changes`` are BASE values: they go to the sleep-offset base and the
+    effective values are re-derived, so an active offset is never folded into the base.
+    Anything without an offset base (older objects, test doubles) gets a plain config.update().
+    """
+    base = getattr(coordinator, "_sleep_offset_base", None)
+    if isinstance(base, dict):
+        coordinator.config.update(split_base_changes(changes, base))
+        coordinator._apply_sleep_offset()
+    else:
+        coordinator.config.update(changes)
