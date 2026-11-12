@@ -24,6 +24,8 @@ jobs:
           tests/test_bedtime_setback.py tests/test_bedtime_override.py
           tests/test_bedtime_recent_write_guard.py tests/test_sleep_indoor_temp_listener.py
   integration:
+    # The job name is a required status check in branch protection, so it is kept
+    # as-is; the MXZ version actually tested is the ref below.
     name: HA 2026.10.2 with MXZ 3.4.1
     runs-on: ubuntu-latest
     steps:
@@ -31,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ShawnChesley/ha-mxz-coordinator-release
-          ref: v3.4.1
+          ref: v3.5.1
           path: mxz-source
           persist-credentials: false
       - uses: actions/setup-python@v5
