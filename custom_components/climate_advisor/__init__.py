@@ -106,7 +106,7 @@ from .const import (
     TEMP_SOURCE_WEATHER_SERVICE,
     VERSION,
 )
-from .coordinator import ClimateAdvisorCoordinator
+from .coordinator import ClimateAdvisorCoordinator, apply_runtime_config_changes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -644,7 +644,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
                     _LOGGER.info("Suggestion accepted: %s → changes: %s", suggestion_key, changes)
                     # Apply changes to coordinator config
-                    zone_coordinator.config.update(changes)
+                    apply_runtime_config_changes(zone_coordinator, changes)
                 elif action == "dismiss":
                     zone_coordinator.learning.dismiss_suggestion(suggestion_key)
                     await hass.async_add_executor_job(

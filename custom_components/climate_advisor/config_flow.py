@@ -63,6 +63,7 @@ from .const import (
     CONF_PUSH_OCCUPANCY_HOME,
     CONF_SENSOR_DEBOUNCE,
     CONF_SENSOR_POLARITY_INVERTED,
+    CONF_SLEEP_OFFSET_ENTITY,
     CONF_TEMP_UNIT,
     CONF_THRESHOLD_COOL,
     CONF_THRESHOLD_HOT,
@@ -1280,7 +1281,8 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             if CONF_WELCOME_HOME_DEBOUNCE in user_input:
                 user_input[CONF_WELCOME_HOME_DEBOUNCE] = int(user_input[CONF_WELCOME_HOME_DEBOUNCE] * 60)
             await self._commit_section(
-                user_input, clearable_keys=(CONF_HOME_TOGGLE, CONF_VACATION_TOGGLE, CONF_GUEST_TOGGLE)
+                user_input,
+                clearable_keys=(CONF_HOME_TOGGLE, CONF_VACATION_TOGGLE, CONF_GUEST_TOGGLE, CONF_SLEEP_OFFSET_ENTITY),
             )
             return await self.async_step_init()
 
@@ -1320,6 +1322,12 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                         CONF_GUEST_TOGGLE_INVERT,
                         default=current.get(CONF_GUEST_TOGGLE_INVERT, False),
                     ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_SLEEP_OFFSET_ENTITY,
+                        description={"suggested_value": current.get(CONF_SLEEP_OFFSET_ENTITY)},
+                    ): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain=["input_number", "number", "sensor"])
+                    ),
                     vol.Optional(
                         CONF_WELCOME_HOME_DEBOUNCE,
                         default=current.get(CONF_WELCOME_HOME_DEBOUNCE, DEFAULT_WELCOME_HOME_DEBOUNCE_SECONDS) // 60,

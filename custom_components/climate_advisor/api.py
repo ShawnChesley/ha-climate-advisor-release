@@ -400,6 +400,7 @@ class ClimateAdvisorStatusView(HomeAssistantView):
                 "next_automation_time": data.get(ATTR_NEXT_AUTOMATION_TIME, ""),
                 "automation_enabled": coordinator.automation_enabled,
                 "occupancy_mode": coordinator._occupancy_mode,
+                "sleep_offset": display_delta(data.get("sleep_offset_f", 0.0), unit),
                 "fan_status": data.get(ATTR_FAN_STATUS, "disabled"),
                 "whf_status": data.get(ATTR_WHF_STATUS),
                 "hvac_fan_status": data.get(ATTR_HVAC_FAN_STATUS),
@@ -721,7 +722,9 @@ class ClimateAdvisorRespondSuggestionView(HomeAssistantView):
             if action == "accept":
                 changes = coordinator.learning.accept_suggestion(suggestion_key)
                 await hass.async_add_executor_job(coordinator.learning.save_state)
-                coordinator.config.update(changes)
+                from .coordinator import apply_runtime_config_changes  # noqa: PLC0415
+
+                apply_runtime_config_changes(coordinator, changes)
                 # Persist valid config keys to the config entry so changes survive reload
                 valid_keys = set(CONFIG_METADATA.keys())
                 entry_changes = {k: v for k, v in changes.items() if k in valid_keys}
@@ -764,8 +767,13 @@ class ClimateAdvisorConfigView(HomeAssistantView):
             config = coordinator.config
             settings = []
 
+            # Sleep offset: show the user's configured (un-offset) sleep setpoints, not the
+            # temporarily shifted values the coordinator writes into its runtime config.
+            _sleep_base = getattr(coordinator, "_sleep_offset_base", None)
+            if not isinstance(_sleep_base, dict):
+                _sleep_base = {}
             for key, meta in CONFIG_METADATA.items():
-                value = config.get(key)
+                value = _sleep_base.get(key, config.get(key))
                 # Fall back to the metadata default so the UI shows the effective value,
                 # not "not set", when a key was added after the config entry was created.
                 if value is None:

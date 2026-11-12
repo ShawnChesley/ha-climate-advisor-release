@@ -58,6 +58,7 @@ EXPECTED_KEYS = {
     "vacation_toggle_invert",
     "guest_toggle_entity",
     "guest_toggle_invert",
+    "sleep_offset_entity",
     "temp_unit",
     "welcome_home_debounce_seconds",
     "min_preheat_minutes",

@@ -1169,6 +1169,9 @@
         <div class="status-item">
           <div class="label">Occupancy</div>
           <div class="value">${data.occupancy_mode || 'home'}</div>
+          ${data.sleep_offset ? `
+          <div class="value" style="font-size:0.8rem;opacity:0.85">sleep ${data.sleep_offset > 0 ? '+' : ''}${escapeHtml(String(data.sleep_offset))}${unitSym}</div>
+          ` : ''}
         </div>
         <div class="status-item">
           <div class="label">Comfort Score</div>
